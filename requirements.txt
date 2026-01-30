@@ -1,0 +1,20 @@
+# Core
+telethon>=1.36.0
+PySocks>=1.7.1
+
+# Antidetect browser
+camoufox>=0.4.0
+
+# QR decoding
+pyzbar>=0.1.9
+Pillow>=10.0.0
+
+# CLI
+click>=8.0.0
+
+# Utilities
+aiofiles>=23.0.0
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
