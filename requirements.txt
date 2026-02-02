@@ -5,15 +5,26 @@ PySocks>=1.7.1
 # Antidetect browser
 camoufox>=0.4.0
 
+# Browser automation (for extraction/injection)
+playwright>=1.40.0
+
 # QR decoding
 pyzbar>=0.1.9
 Pillow>=10.0.0
+
+# Image processing (opencv-python-headless for NumPy 2.x compatibility)
+opencv-python-headless>=4.10.0
+numpy>=2.0.0
+
+# Proxy relay (SOCKS5 with auth support)
+pproxy>=2.7.0
 
 # CLI
 click>=8.0.0
 
 # Utilities
 aiofiles>=23.0.0
+psutil>=5.9.0
 
 # Testing
 pytest>=7.0.0
