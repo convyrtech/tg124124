@@ -101,10 +101,13 @@ def cli():
 @click.option("--headless", is_flag=True, help="Запуск без GUI")
 @click.option("--cooldown", "-c", default=DEFAULT_COOLDOWN, type=int,
               help=f"Секунды между аккаунтами при --all (default: {DEFAULT_COOLDOWN})")
+@click.option("--parallel", "-j", type=int, default=0,
+              help="Параллельные браузеры (0=последовательно, 10=рекомендуется)")
 def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
-            headless: bool, cooldown: int):
+            headless: bool, cooldown: int, parallel: int):
     """Мигрировать аккаунт(ы) из session в browser profile"""
-    from .telegram_auth import migrate_account, migrate_accounts_batch, AccountConfig
+    import signal
+    from .telegram_auth import migrate_account, migrate_accounts_batch, ParallelMigrationController
 
     if not account and not migrate_all:
         click.echo("Error: Укажите --account или --all")
@@ -144,29 +147,69 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             sys.exit(0)
 
         click.echo(f"Найдено аккаунтов: {len(accounts)}")
-        click.echo(f"Cooldown между аккаунтами: {cooldown}s")
 
         # FIX #8: Безопасное получение пароля
         password_2fa = get_2fa_password("all", password)
 
-        # FIX #6: Используем batch функцию с cooldown
-        results = asyncio.run(migrate_accounts_batch(
-            account_dirs=accounts,
-            password_2fa=password_2fa,
-            headless=headless,
-            cooldown=cooldown
-        ))
+        if parallel > 0:
+            # Параллельный режим
+            click.echo(f"Режим: ПАРАЛЛЕЛЬНЫЙ (max {parallel} браузеров)")
+            click.echo(f"Cooldown между запусками: {cooldown}s")
+
+            controller = ParallelMigrationController(
+                max_concurrent=parallel,
+                cooldown=cooldown
+            )
+
+            # Signal handler для graceful shutdown
+            def handle_signal(signum, frame):
+                click.echo("\nПолучен сигнал прерывания...")
+                controller.request_shutdown()
+
+            signal.signal(signal.SIGINT, handle_signal)
+            if hasattr(signal, 'SIGTERM'):
+                signal.signal(signal.SIGTERM, handle_signal)
+
+            # Progress callback
+            def on_progress(completed, total, result):
+                status = click.style("OK", fg="green") if result and result.success else click.style("FAIL", fg="red")
+                name = result.profile_name if result else "?"
+                click.echo(f"  [{completed}/{total}] {status} {name}")
+
+            results = asyncio.run(controller.run(
+                account_dirs=accounts,
+                password_2fa=password_2fa,
+                headless=headless,
+                on_progress=on_progress
+            ))
+        else:
+            # Последовательный режим (существующий)
+            click.echo(f"Режим: ПОСЛЕДОВАТЕЛЬНЫЙ")
+            click.echo(f"Cooldown между аккаунтами: {cooldown}s")
+
+            # FIX #6: Используем batch функцию с cooldown
+            results = asyncio.run(migrate_accounts_batch(
+                account_dirs=accounts,
+                password_2fa=password_2fa,
+                headless=headless,
+                cooldown=cooldown
+            ))
 
         # Итог
-        success = sum(1 for r in results if r.success)
-        click.echo(f"\n{'='*50}")
-        click.echo(f"ИТОГ: {success}/{len(results)} успешно")
+        success = [r for r in results if r.success]
+        failed = [r for r in results if not r.success]
 
-        for result in results:
-            status = click.style("✓", fg="green") if result.success else click.style("✗", fg="red")
-            click.echo(f"  {status} {result.profile_name}")
-            if result.error:
-                click.echo(f"      Error: {result.error}")
+        click.echo(f"\n{'='*50}")
+        click.echo("ИТОГ МИГРАЦИИ")
+        click.echo(f"{'='*50}")
+        click.echo(f"Всего: {len(results)}")
+        click.echo(f"Успешно: {len(success)}")
+        click.echo(f"Ошибки: {len(failed)}")
+
+        if failed:
+            click.echo("\nНеуспешные аккаунты:")
+            for result in failed:
+                click.echo(f"  - {result.profile_name}: {result.error}")
 
 
 @cli.command(name="open")
