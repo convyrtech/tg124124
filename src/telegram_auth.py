@@ -52,6 +52,9 @@ except ImportError:
 
 from .browser_manager import BrowserManager, BrowserProfile, BrowserContext
 
+# Forward reference for type hints
+ResourceMonitor = "ResourceMonitor"
+
 
 @dataclass
 class DeviceConfig:
@@ -1243,14 +1246,17 @@ class ParallelMigrationController:
     def __init__(
         self,
         max_concurrent: int = 10,
-        cooldown: float = 5.0
+        cooldown: float = 5.0,
+        resource_monitor: Optional["ResourceMonitor"] = None
     ):
         self.max_concurrent = max_concurrent
         self.cooldown = cooldown
+        self.resource_monitor = resource_monitor
         self._shutdown_requested = False
         self._active_tasks: set = set()
         self._completed = 0
         self._total = 0
+        self._paused_for_resources = False
 
     @property
     def is_shutdown_requested(self) -> bool:
@@ -1289,6 +1295,28 @@ class ParallelMigrationController:
             # Check shutdown before acquiring semaphore
             if self._shutdown_requested:
                 return None
+
+            # Wait for resources if monitor provided
+            if self.resource_monitor:
+                wait_count = 0
+                while not self.resource_monitor.can_launch_more():
+                    if self._shutdown_requested:
+                        return None
+                    if wait_count == 0:
+                        self._paused_for_resources = True
+                        print(f"[ParallelMigration] Waiting for resources: {self.resource_monitor.format_status()}")
+                    await asyncio.sleep(5)
+                    wait_count += 1
+                    if wait_count > 60:  # 5 min timeout
+                        async with lock:
+                            results[index] = AuthResult(
+                                success=False,
+                                profile_name=account_dir.name,
+                                error="Timeout waiting for resources"
+                            )
+                            self._completed += 1
+                        return results[index]
+                self._paused_for_resources = False
 
             async with semaphore:
                 # Check again after acquiring

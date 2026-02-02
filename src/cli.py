@@ -103,8 +103,10 @@ def cli():
               help=f"Секунды между аккаунтами при --all (default: {DEFAULT_COOLDOWN})")
 @click.option("--parallel", "-j", type=int, default=0,
               help="Параллельные браузеры (0=последовательно, 10=рекомендуется)")
+@click.option("--auto-scale", is_flag=True,
+              help="Автоматически подбирать параллельность по ресурсам")
 def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
-            headless: bool, cooldown: int, parallel: int):
+            headless: bool, cooldown: int, parallel: int, auto_scale: bool):
     """Мигрировать аккаунт(ы) из session в browser profile"""
     import signal
     from .telegram_auth import migrate_account, migrate_accounts_batch, ParallelMigrationController
@@ -151,14 +153,25 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
         # FIX #8: Безопасное получение пароля
         password_2fa = get_2fa_password("all", password)
 
-        if parallel > 0:
+        if parallel > 0 or auto_scale:
             # Параллельный режим
+            from .resource_monitor import ResourceMonitor
+
+            monitor = None
+            if auto_scale:
+                monitor = ResourceMonitor()
+                if parallel == 0:
+                    parallel = monitor.recommended_concurrency()
+                click.echo(f"Ресурсы: {monitor.format_status()}")
+                click.echo(f"Рекомендуемая параллельность: {monitor.recommended_concurrency()}")
+
             click.echo(f"Режим: ПАРАЛЛЕЛЬНЫЙ (max {parallel} браузеров)")
             click.echo(f"Cooldown между запусками: {cooldown}s")
 
             controller = ParallelMigrationController(
                 max_concurrent=parallel,
-                cooldown=cooldown
+                cooldown=cooldown,
+                resource_monitor=monitor if auto_scale else None
             )
 
             # Signal handler для graceful shutdown

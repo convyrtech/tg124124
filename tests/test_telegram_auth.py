@@ -457,3 +457,57 @@ class TestParallelMigration:
         assert completed == 3
         assert total == 3
         assert len(results) == 3
+
+    @pytest.mark.asyncio
+    async def test_parallel_migration_respects_resource_limits(self, tmp_path):
+        """Verify resource monitor is called and resources are checked."""
+        import asyncio
+        from src.telegram_auth import ParallelMigrationController
+        from src.resource_monitor import ResourceMonitor
+
+        # Track how many times can_launch_more is called
+        check_count = 0
+
+        def mock_can_launch():
+            nonlocal check_count
+            check_count += 1
+            return True  # Always allow (but we track calls)
+
+        monitor = ResourceMonitor()
+        monitor.can_launch_more = mock_can_launch
+
+        controller = ParallelMigrationController(
+            max_concurrent=5,
+            cooldown=0,
+            resource_monitor=monitor
+        )
+
+        async def quick_migrate(account_dir, **kwargs):
+            await asyncio.sleep(0.01)
+            return AuthResult(success=True, profile_name=account_dir.name)
+
+        dirs = [tmp_path / f"acc_{i}" for i in range(3)]
+        for d in dirs:
+            d.mkdir()
+
+        with patch('src.telegram_auth.migrate_account', side_effect=quick_migrate):
+            results = await controller.run(dirs, headless=True)
+
+        # Resource monitor should have been checked
+        assert check_count >= 3  # At least once per account
+        assert len(results) == 3
+        assert all(r.success for r in results)
+
+    @pytest.mark.asyncio
+    async def test_parallel_migration_controller_accepts_resource_monitor(self, tmp_path):
+        """Verify controller accepts resource_monitor parameter."""
+        from src.telegram_auth import ParallelMigrationController
+        from src.resource_monitor import ResourceMonitor
+
+        monitor = ResourceMonitor()
+        controller = ParallelMigrationController(
+            max_concurrent=5,
+            resource_monitor=monitor
+        )
+
+        assert controller.resource_monitor is monitor
