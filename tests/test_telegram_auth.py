@@ -394,3 +394,66 @@ class TestParallelMigration:
         assert len(successes) == 2
         assert len(failures) == 1
         assert "Simulated failure" in failures[0].error
+
+    @pytest.mark.asyncio
+    async def test_parallel_migration_shutdown_flag(self, tmp_path):
+        """Verify shutdown flag stops accepting new tasks."""
+        import asyncio
+        from src.telegram_auth import ParallelMigrationController
+
+        controller = ParallelMigrationController(max_concurrent=2, cooldown=0.1)
+
+        started_count = 0
+
+        async def slow_migrate(account_dir, password_2fa=None, headless=False):
+            nonlocal started_count
+            started_count += 1
+            await asyncio.sleep(0.5)  # Long running
+            return AuthResult(success=True, profile_name=account_dir.name)
+
+        dirs = [tmp_path / f"acc_{i}" for i in range(5)]
+        for d in dirs:
+            d.mkdir()
+
+        with patch('src.telegram_auth.migrate_account', side_effect=slow_migrate):
+            # Start migration
+            task = asyncio.create_task(
+                controller.run(dirs, headless=True)
+            )
+            await asyncio.sleep(0.2)  # Let some tasks start
+
+            # Request shutdown
+            controller.request_shutdown()
+
+            results = await task
+
+        # Should have stopped early, not all 5 completed
+        # At least the running ones should complete
+        assert controller.is_shutdown_requested
+        # Some should be marked as skipped
+        skipped = [r for r in results if r.error and "shutdown" in r.error.lower()]
+        assert len(skipped) > 0 or len(results) < 5
+
+    @pytest.mark.asyncio
+    async def test_parallel_migration_controller_progress_tracking(self, tmp_path):
+        """Verify controller tracks progress correctly."""
+        import asyncio
+        from src.telegram_auth import ParallelMigrationController
+
+        controller = ParallelMigrationController(max_concurrent=2, cooldown=0)
+
+        async def quick_migrate(account_dir, password_2fa=None, headless=False):
+            await asyncio.sleep(0.01)
+            return AuthResult(success=True, profile_name=account_dir.name)
+
+        dirs = [tmp_path / f"acc_{i}" for i in range(3)]
+        for d in dirs:
+            d.mkdir()
+
+        with patch('src.telegram_auth.migrate_account', side_effect=quick_migrate):
+            results = await controller.run(dirs, headless=True)
+
+        completed, total = controller.progress
+        assert completed == 3
+        assert total == 3
+        assert len(results) == 3

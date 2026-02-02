@@ -1227,6 +1227,133 @@ async def migrate_accounts_batch(
 ProgressCallback = Callable[[int, int, Optional["AuthResult"]], None]
 
 
+class ParallelMigrationController:
+    """
+    Controller for parallel migration with graceful shutdown support.
+
+    Usage:
+        controller = ParallelMigrationController(max_concurrent=10)
+
+        # In signal handler:
+        signal.signal(signal.SIGINT, lambda s, f: controller.request_shutdown())
+
+        results = await controller.run(account_dirs)
+    """
+
+    def __init__(
+        self,
+        max_concurrent: int = 10,
+        cooldown: float = 5.0
+    ):
+        self.max_concurrent = max_concurrent
+        self.cooldown = cooldown
+        self._shutdown_requested = False
+        self._active_tasks: set = set()
+        self._completed = 0
+        self._total = 0
+
+    @property
+    def is_shutdown_requested(self) -> bool:
+        return self._shutdown_requested
+
+    @property
+    def progress(self) -> tuple[int, int]:
+        """Returns (completed, total)"""
+        return (self._completed, self._total)
+
+    def request_shutdown(self):
+        """Request graceful shutdown - finish running, don't start new"""
+        print("\n[ParallelMigration] Shutdown requested - finishing active tasks...")
+        self._shutdown_requested = True
+
+    async def run(
+        self,
+        account_dirs: list[Path],
+        password_2fa: Optional[str] = None,
+        headless: bool = False,
+        on_progress: Optional[ProgressCallback] = None
+    ) -> list[AuthResult]:
+        """
+        Run parallel migration with shutdown support.
+
+        Returns results for completed accounts (may be partial on shutdown).
+        """
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        results: dict[int, AuthResult] = {}
+        lock = asyncio.Lock()
+        self._total = len(account_dirs)
+        self._completed = 0
+        self._shutdown_requested = False
+
+        async def migrate_one(index: int, account_dir: Path):
+            # Check shutdown before acquiring semaphore
+            if self._shutdown_requested:
+                return None
+
+            async with semaphore:
+                # Check again after acquiring
+                if self._shutdown_requested:
+                    return None
+
+                try:
+                    result = await migrate_account(
+                        account_dir=account_dir,
+                        password_2fa=password_2fa,
+                        headless=headless
+                    )
+                except Exception as e:
+                    result = AuthResult(
+                        success=False,
+                        profile_name=account_dir.name,
+                        error=str(e)
+                    )
+
+                async with lock:
+                    results[index] = result
+                    self._completed += 1
+                    if on_progress:
+                        try:
+                            on_progress(self._completed, self._total, result)
+                        except Exception:
+                            pass
+
+                return result
+
+        # Create and track tasks
+        tasks = []
+        for i, account_dir in enumerate(account_dirs):
+            if self._shutdown_requested:
+                break
+
+            task = asyncio.create_task(migrate_one(i, account_dir))
+            self._active_tasks.add(task)
+            task.add_done_callback(self._active_tasks.discard)
+            tasks.append(task)
+
+            # Rate limiting
+            if i < len(account_dirs) - 1 and self.cooldown > 0:
+                await asyncio.sleep(self.cooldown)
+
+        # Wait for all started tasks
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Return results in order (only completed ones)
+        ordered_results = []
+        for i in range(len(account_dirs)):
+            if i in results:
+                ordered_results.append(results[i])
+            elif self._shutdown_requested:
+                # Mark as skipped due to shutdown
+                ordered_results.append(AuthResult(
+                    success=False,
+                    profile_name=account_dirs[i].name,
+                    error="Skipped due to shutdown"
+                ))
+
+        return ordered_results
+
+
 async def migrate_accounts_parallel(
     account_dirs: list[Path],
     password_2fa: Optional[str] = None,
