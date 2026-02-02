@@ -289,3 +289,108 @@ class TestTelegramAuthIntegration:
         assert auth.account == mock_account
         assert auth.browser_manager is not None
         assert auth._client is None
+
+
+class TestParallelMigration:
+    """Tests for parallel migration functionality."""
+
+    @pytest.mark.asyncio
+    async def test_migrate_accounts_parallel_respects_semaphore(self, tmp_path):
+        """Verify semaphore limits concurrent executions."""
+        import asyncio
+
+        # Track concurrent calls
+        concurrent_count = 0
+        max_concurrent = 0
+        call_order = []
+
+        async def mock_migrate(account_dir, password_2fa=None, headless=False):
+            nonlocal concurrent_count, max_concurrent
+            concurrent_count += 1
+            max_concurrent = max(max_concurrent, concurrent_count)
+            call_order.append(f"start_{account_dir.name}")
+            await asyncio.sleep(0.1)  # Simulate work
+            call_order.append(f"end_{account_dir.name}")
+            concurrent_count -= 1
+            return AuthResult(success=True, profile_name=account_dir.name)
+
+        # Create 5 fake account dirs
+        account_dirs = []
+        for i in range(5):
+            d = tmp_path / f"account_{i}"
+            d.mkdir()
+            account_dirs.append(d)
+
+        with patch('src.telegram_auth.migrate_account', side_effect=mock_migrate):
+            from src.telegram_auth import migrate_accounts_parallel
+            results = await migrate_accounts_parallel(
+                account_dirs=account_dirs,
+                max_concurrent=2,  # Only 2 at a time
+                cooldown=0,  # No cooldown for fast tests
+                headless=True
+            )
+
+        assert len(results) == 5
+        assert all(r.success for r in results)
+        assert max_concurrent <= 2, f"Semaphore violated: max was {max_concurrent}"
+
+    @pytest.mark.asyncio
+    async def test_migrate_accounts_parallel_progress_callback(self, tmp_path):
+        """Verify progress callback is called correctly."""
+        import asyncio
+
+        progress_calls = []
+
+        def on_progress(completed, total, result):
+            progress_calls.append((completed, total, result.profile_name if result else None))
+
+        async def mock_migrate(account_dir, password_2fa=None, headless=False):
+            await asyncio.sleep(0.01)
+            return AuthResult(success=True, profile_name=account_dir.name)
+
+        account_dirs = [tmp_path / f"acc_{i}" for i in range(3)]
+        for d in account_dirs:
+            d.mkdir()
+
+        with patch('src.telegram_auth.migrate_account', side_effect=mock_migrate):
+            from src.telegram_auth import migrate_accounts_parallel
+            await migrate_accounts_parallel(
+                account_dirs=account_dirs,
+                max_concurrent=2,
+                cooldown=0,
+                on_progress=on_progress
+            )
+
+        assert len(progress_calls) == 3
+        # Each call should have increasing completed count
+        completed_counts = [c[0] for c in progress_calls]
+        assert sorted(completed_counts) == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_migrate_accounts_parallel_handles_errors(self, tmp_path):
+        """Verify one error doesn't stop others."""
+        import asyncio
+
+        async def mock_migrate(account_dir, password_2fa=None, headless=False):
+            if "fail" in account_dir.name:
+                raise Exception("Simulated failure")
+            return AuthResult(success=True, profile_name=account_dir.name)
+
+        dirs = [tmp_path / "ok_1", tmp_path / "fail_2", tmp_path / "ok_3"]
+        for d in dirs:
+            d.mkdir()
+
+        with patch('src.telegram_auth.migrate_account', side_effect=mock_migrate):
+            from src.telegram_auth import migrate_accounts_parallel
+            results = await migrate_accounts_parallel(
+                account_dirs=dirs,
+                max_concurrent=3,
+                cooldown=0
+            )
+
+        assert len(results) == 3
+        successes = [r for r in results if r.success]
+        failures = [r for r in results if not r.success]
+        assert len(successes) == 2
+        assert len(failures) == 1
+        assert "Simulated failure" in failures[0].error

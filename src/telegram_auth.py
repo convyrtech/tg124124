@@ -17,7 +17,7 @@ import json
 import io
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Callable
 
 # QR decoding - use OpenCV (works on Windows without extra DLLs)
 try:
@@ -1221,6 +1221,81 @@ async def migrate_accounts_batch(
             await asyncio.sleep(cooldown)
 
     return results
+
+
+# Progress callback type for parallel migration
+ProgressCallback = Callable[[int, int, Optional["AuthResult"]], None]
+
+
+async def migrate_accounts_parallel(
+    account_dirs: list[Path],
+    password_2fa: Optional[str] = None,
+    headless: bool = False,
+    max_concurrent: int = 10,
+    cooldown: float = 5.0,
+    on_progress: Optional[ProgressCallback] = None
+) -> list[AuthResult]:
+    """
+    Migrates multiple accounts in parallel with concurrency control.
+
+    Args:
+        account_dirs: List of account directories
+        password_2fa: Shared 2FA password (if same for all)
+        headless: Run browsers in headless mode
+        max_concurrent: Maximum parallel browser instances (default 10)
+        cooldown: Seconds between starting new tasks (rate limiting)
+        on_progress: Callback(completed, total, result) for progress updates
+
+    Returns:
+        List of AuthResult in same order as account_dirs
+    """
+    semaphore = asyncio.Semaphore(max_concurrent)
+    results: dict[int, AuthResult] = {}
+    completed = 0
+    total = len(account_dirs)
+    lock = asyncio.Lock()
+
+    async def migrate_with_semaphore(index: int, account_dir: Path):
+        nonlocal completed
+        async with semaphore:
+            try:
+                result = await migrate_account(
+                    account_dir=account_dir,
+                    password_2fa=password_2fa,
+                    headless=headless
+                )
+            except Exception as e:
+                result = AuthResult(
+                    success=False,
+                    profile_name=account_dir.name,
+                    error=str(e)
+                )
+
+            async with lock:
+                results[index] = result
+                completed += 1
+                if on_progress:
+                    try:
+                        on_progress(completed, total, result)
+                    except Exception as e:
+                        print(f"[Parallel] Progress callback error: {e}")
+
+            return result
+
+    # Create tasks with staggered start (rate limiting)
+    tasks = []
+    for i, account_dir in enumerate(account_dirs):
+        task = asyncio.create_task(migrate_with_semaphore(i, account_dir))
+        tasks.append(task)
+        # Stagger task creation to avoid thundering herd
+        if i < len(account_dirs) - 1 and cooldown > 0:
+            await asyncio.sleep(cooldown)
+
+    # Wait for all to complete
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Return results in original order
+    return [results[i] for i in range(len(account_dirs))]
 
 
 async def main():
