@@ -169,13 +169,14 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                 click.echo(f"      Error: {result.error}")
 
 
-@cli.command()
+@cli.command(name="open")
 @click.option("--account", "-a", required=True, help="Имя профиля для открытия")
 @click.option("--url", default="https://web.telegram.org/k/", help="URL для открытия")
-def open(account: str, url: str):
+def open_profile(account: str, url: str):
     """Открыть существующий browser profile"""
     from .browser_manager import BrowserManager
     import json
+    import builtins
 
     manager = BrowserManager()
     profile = manager.get_profile(account)
@@ -189,7 +190,7 @@ def open(account: str, url: str):
 
     # Загружаем прокси из конфига
     if profile.config_path.exists():
-        with open(profile.config_path, encoding='utf-8') as f:
+        with builtins.open(profile.config_path, encoding='utf-8') as f:
             config = json.load(f)
             profile.proxy = config.get('proxy')
 

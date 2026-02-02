@@ -19,13 +19,26 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any
 
-# QR decoding
+# QR decoding - use OpenCV (works on Windows without extra DLLs)
 try:
-    from pyzbar import pyzbar
+    import cv2
+    import numpy as np
     from PIL import Image
 except ImportError:
-    print("ERROR: pyzbar/Pillow not installed. Run: pip install pyzbar Pillow")
+    print("ERROR: opencv-python/Pillow not installed. Run: pip install opencv-python Pillow")
     exit(1)
+
+# pyzbar is optional - lazy load to avoid DLL errors on Windows
+pyzbar = None
+def _get_pyzbar():
+    global pyzbar
+    if pyzbar is None:
+        try:
+            from pyzbar import pyzbar as _pyzbar
+            pyzbar = _pyzbar
+        except (ImportError, OSError, FileNotFoundError):
+            pass  # pyzbar not available, will use OpenCV only
+    return pyzbar
 
 # Telethon
 try:
@@ -178,28 +191,120 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
 
     image = Image.open(io.BytesIO(screenshot_bytes))
 
-    # Пробуем декодировать в разных вариантах
+    def extract_token(data):
+        """Extract token bytes from tg://login URL"""
+        if not data or 'tg://login?token=' not in data:
+            return None
+        token_b64 = data.split('token=')[1]
+        if '&' in token_b64:
+            token_b64 = token_b64.split('&')[0]
+        padding = 4 - len(token_b64) % 4
+        if padding != 4:
+            token_b64 += '=' * padding
+        return base64.urlsafe_b64decode(token_b64)
+
+    # Try Node.js jsQR first (handles Telegram rounded corners better)
+    try:
+        import subprocess
+        import tempfile
+        import os
+
+        # Save image to temp file
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+            temp_path = f.name
+            image.save(f, 'PNG')
+
+        # Call Node.js decoder
+        script_path = os.path.join(os.path.dirname(__file__), '..', 'decode_qr.js')
+        result = subprocess.run(
+            ['node', script_path, temp_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        os.unlink(temp_path)
+
+        if result.returncode == 0 and result.stdout.strip():
+            data = result.stdout.strip()
+            if data != 'QR_NOT_FOUND' and 'tg://login?token=' in data:
+                token_bytes = extract_token(data)
+                if token_bytes:
+                    print(f"[QR] Decoded with jsQR (Node.js)")
+                    return token_bytes
+    except Exception as e:
+        print(f"[QR] jsQR error: {e}")
+
+    # Try QRCodeDetectorAruco (more robust than standard detector)
+    try:
+        aruco_detector = cv2.QRCodeDetectorAruco()
+        img_np = np.array(image.convert('RGB'))
+        cv_img = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        decoded, _, _ = aruco_detector.detectAndDecode(cv_img)
+        if decoded and decoded[0]:
+            for data in decoded:
+                if data and 'tg://login?token=' in data:
+                    token_bytes = extract_token(data)
+                    if token_bytes:
+                        print(f"[QR] Decoded with QRCodeDetectorAruco")
+                        return token_bytes
+    except Exception as e:
+        print(f"[QR] QRCodeDetectorAruco error: {e}")
+
+    # Конвертируем PIL Image в numpy array для OpenCV
+    def pil_to_cv2(pil_img):
+        """Convert PIL Image to OpenCV format"""
+        if pil_img.mode == '1':
+            pil_img = pil_img.convert('L')
+        if pil_img.mode == 'L':
+            return np.array(pil_img)
+        elif pil_img.mode == 'RGB':
+            return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        elif pil_img.mode == 'RGBA':
+            return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGBA2BGR)
+        return np.array(pil_img.convert('RGB'))
+
+    def decode_with_opencv(cv_img):
+        """Try to decode QR with OpenCV"""
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(cv_img)
+        return data if data else None
+
+    def decode_with_pyzbar(pil_img):
+        """Try to decode QR with pyzbar if available"""
+        pyzbar_module = _get_pyzbar()
+        if pyzbar_module is None:
+            return None
+        try:
+            decoded = pyzbar_module.decode(pil_img)
+            for obj in decoded:
+                return obj.data.decode('utf-8')
+        except Exception:
+            pass
+        return None
+
+    # Пробуем декодировать в разных вариантах с OpenCV/pyzbar
     # Telegram Web использует белый QR на тёмном фоне - нужно инвертировать
     variants = []
 
     # 1. Оригинал
-    variants.append(image)
+    variants.append(("original", image))
 
     # 2. Grayscale
     gray = image.convert('L')
-    variants.append(gray)
+    variants.append(("grayscale", gray))
 
     # 3. Инвертированный RGB (для белого QR на тёмном)
     try:
         inverted_rgb = ImageOps.invert(image.convert('RGB'))
-        variants.append(inverted_rgb)
+        variants.append(("inverted_rgb", inverted_rgb))
     except Exception:
         pass
 
     # 4. Инвертированный grayscale
     try:
         inverted_gray = ImageOps.invert(gray)
-        variants.append(inverted_gray)
+        variants.append(("inverted_gray", inverted_gray))
     except Exception:
         pass
 
@@ -207,39 +312,43 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
     try:
         enhancer = ImageEnhance.Contrast(gray)
         high_contrast = enhancer.enhance(2.0)
-        variants.append(high_contrast)
-        variants.append(ImageOps.invert(high_contrast))
+        variants.append(("high_contrast", high_contrast))
+        variants.append(("high_contrast_inv", ImageOps.invert(high_contrast)))
     except Exception:
         pass
 
     # 6. Thresholding (бинаризация)
     try:
-        threshold = gray.point(lambda x: 255 if x > 128 else 0, '1')
-        variants.append(threshold)
-        threshold_inv = gray.point(lambda x: 0 if x > 128 else 255, '1')
-        variants.append(threshold_inv)
+        threshold = gray.point(lambda x: 255 if x > 128 else 0, 'L')
+        variants.append(("threshold", threshold))
+        threshold_inv = gray.point(lambda x: 0 if x > 128 else 255, 'L')
+        variants.append(("threshold_inv", threshold_inv))
     except Exception:
         pass
 
-    for i, img_variant in enumerate(variants):
+    for name, img_variant in variants:
+        # Try OpenCV first (more reliable on Windows)
         try:
-            decoded = pyzbar.decode(img_variant)
-
-            for obj in decoded:
-                data = obj.data.decode('utf-8')
-                # Telegram QR format: tg://login?token=BASE64TOKEN
-                if data.startswith('tg://login?token='):
-                    token_b64 = data.split('token=')[1]
-                    # Декодируем base64url в bytes
-                    # Добавляем padding если нужно
-                    padding = 4 - len(token_b64) % 4
-                    if padding != 4:
-                        token_b64 += '=' * padding
-                    token_bytes = base64.urlsafe_b64decode(token_b64)
-                    print(f"[QR] Decoded successfully using variant {i}")
+            cv_img = pil_to_cv2(img_variant)
+            data = decode_with_opencv(cv_img)
+            if data and 'tg://login?token=' in data:
+                token_bytes = extract_token(data)
+                if token_bytes:
+                    print(f"[QR] Decoded with OpenCV using {name}")
                     return token_bytes
-        except Exception as e:
-            continue
+        except Exception:
+            pass
+
+        # Fallback to pyzbar if available
+        try:
+            data = decode_with_pyzbar(img_variant)
+            if data and 'tg://login?token=' in data:
+                token_bytes = extract_token(data)
+                if token_bytes:
+                    print(f"[QR] Decoded with pyzbar using {name}")
+                    return token_bytes
+        except Exception:
+            pass
 
     return None
 
@@ -429,8 +538,9 @@ class TelegramAuth:
         Ждёт появления QR-кода и извлекает токен.
 
         Использует несколько методов:
-        1. JS extraction - напрямую из DOM/переменных страницы
-        2. Canvas screenshot + pyzbar decoding
+        1. jsQR library injected in browser (most reliable)
+        2. JS extraction - напрямую из DOM/переменных страницы
+        3. Canvas screenshot + OpenCV decoding
 
         Returns:
             Token bytes или screenshot bytes (для дальнейшего декодирования)
@@ -439,6 +549,81 @@ class TelegramAuth:
 
         for attempt in range(timeout):
             try:
+                # Метод 0: Попробуем получить QR token из памяти приложения
+                qr_token_direct = await page.evaluate("""
+                    () => {
+                        // Telegram Web K stores QR token in various places
+                        try {
+                            // Method 1: Check MTProto state
+                            if (window.MTProto && window.MTProto.qrToken) {
+                                return 'tg://login?token=' + btoa(String.fromCharCode(...window.MTProto.qrToken));
+                            }
+
+                            // Method 2: Check for exportLoginToken result in App state
+                            if (window.App && window.App.managers) {
+                                const managers = window.App.managers;
+                                if (managers.authState && managers.authState.qrToken) {
+                                    return managers.authState.qrToken;
+                                }
+                            }
+
+                            // Method 3: Look in sessionStorage/localStorage
+                            for (const storage of [sessionStorage, localStorage]) {
+                                for (let i = 0; i < storage.length; i++) {
+                                    const key = storage.key(i);
+                                    const val = storage.getItem(key);
+                                    if (val && val.includes('tg://login?token=')) {
+                                        const match = val.match(/tg:\\/\\/login\\?token=[A-Za-z0-9_-]+/);
+                                        if (match) return match[0];
+                                    }
+                                }
+                            }
+
+                            // Method 4: Check IndexedDB for auth state
+                            // (async, can't do here easily)
+
+                        } catch (e) {}
+                        return null;
+                    }
+                """)
+
+                if qr_token_direct and 'tg://login?token=' in str(qr_token_direct):
+                    print(f"[TelegramAuth] Token found directly in app state!")
+                    token_bytes = extract_token_from_tg_url(qr_token_direct)
+                    if token_bytes:
+                        return token_bytes
+
+                # Метод 0b: Получить canvas data для декодирования
+                qr_from_canvas = await page.evaluate("""
+                    () => {
+                        const canvas = document.querySelector('canvas');
+                        if (!canvas) return null;
+
+                        const ctx = canvas.getContext('2d');
+                        if (!ctx) return null;
+
+                        return {
+                            dataUrl: canvas.toDataURL('image/png'),
+                            width: canvas.width,
+                            height: canvas.height
+                        };
+                    }
+                """)
+
+                if qr_from_canvas and qr_from_canvas.get('dataUrl'):
+                    # Decode the canvas data URL externally
+                    try:
+                        canvas_data = qr_from_canvas['dataUrl'].split(',')[1]
+                        canvas_bytes = base64.b64decode(canvas_data)
+
+                        # Try to decode this smaller canvas image
+                        token = decode_qr_from_screenshot(canvas_bytes)
+                        if token:
+                            print(f"[TelegramAuth] Token decoded from canvas!")
+                            return token
+                    except Exception as e:
+                        pass  # Continue to other methods
+
                 # Метод 1: Комплексное JS извлечение токена
                 token_from_js = await page.evaluate("""
                     () => {
@@ -590,12 +775,19 @@ class TelegramAuth:
         for i in range(timeout):
             current_url = page.url
 
-            # Проверяем успешную авторизацию - URL изменился на чат
+            # Проверяем успешную авторизацию - ищем элементы главной страницы
+            chat_list = await page.query_selector('.chatlist, .chat-list, [class*="ChatList"], .folders-tabs')
+            search_input = await page.query_selector('input[placeholder="Search"], .input-search')
+
+            if chat_list or search_input:
+                print(f"[TelegramAuth] Authorization successful! (chat list found)")
+                return (True, False)
+
+            # Также проверяем URL
             if '/k/#' in current_url and 'auth' not in current_url.lower():
-                # Проверяем что не на странице логина
-                login_form = await page.query_selector('.auth-form, [class*="auth"]')
+                login_form = await page.query_selector('.auth-form, [class*="auth-page"]')
                 if not login_form:
-                    print(f"[TelegramAuth] Authorization successful!")
+                    print(f"[TelegramAuth] Authorization successful! (URL check)")
                     return (True, False)
 
             # Проверяем 2FA форму
@@ -667,46 +859,37 @@ class TelegramAuth:
             return False
 
         try:
-            # Активируем окно браузера и фокусируемся на странице
-            await page.bring_to_front()
-            await asyncio.sleep(0.3)
+            # Получаем координаты поля пароля и кликаем по центру
+            box = await password_input.bounding_box()
+            if box:
+                x = box['x'] + box['width'] / 2
+                y = box['y'] + box['height'] / 2
+                await page.mouse.click(x, y)
+                await asyncio.sleep(0.5)
+                print(f"[TelegramAuth] Clicked at ({x}, {y})")
 
-            # Фокусируемся на странице через клик по body
-            await page.evaluate("() => { document.body.focus(); window.focus(); }")
-            await asyncio.sleep(0.2)
-
-            # Используем Tab для навигации к полю пароля
-            # Это обходит проблемы с overlay элементами
-            await page.keyboard.press('Tab')
-            await asyncio.sleep(0.2)
-            await page.keyboard.press('Tab')
-            await asyncio.sleep(0.2)
-
-            # Теперь вводим пароль через keyboard.type()
-            await page.keyboard.type(password, delay=80)
+            # Вводим пароль посимвольно
+            await page.keyboard.type(password, delay=100)
             await asyncio.sleep(0.5)
-            print(f"[TelegramAuth] Password typed via Tab+keyboard ({len(password)} chars)")
+            print(f"[TelegramAuth] Password typed ({len(password)} chars)")
 
-            # Enter для отправки
+            # Нажимаем Enter
             await page.keyboard.press('Enter')
-            await asyncio.sleep(0.3)
             print("[TelegramAuth] Pressed Enter to submit")
 
         except Exception as e:
             error_msg = str(e).encode('ascii', 'replace').decode('ascii')
-            print(f"[TelegramAuth] Tab+keyboard approach failed: {error_msg}")
+            print(f"[TelegramAuth] Mouse click + type failed: {error_msg}")
 
-            # Fallback: force click и type
+            # Fallback: использеум locator.type
             try:
-                await page.click('input[type="password"]', force=True, timeout=5000)
-                await asyncio.sleep(0.5)
-                await page.keyboard.type(password, delay=80)
+                await password_input.type(password, delay=100)
                 await asyncio.sleep(0.5)
                 await page.keyboard.press('Enter')
-                print(f"[TelegramAuth] Password entered via force click fallback")
+                print(f"[TelegramAuth] Password entered via locator.type")
             except Exception as e2:
                 error_msg2 = str(e2).encode('ascii', 'replace').decode('ascii')
-                print(f"[TelegramAuth] Force click fallback also failed: {error_msg2}")
+                print(f"[TelegramAuth] Locator.type also failed: {error_msg2}")
                 return False
 
         print("[TelegramAuth] Password submitted, waiting for response...")
@@ -882,6 +1065,13 @@ class TelegramAuth:
                     profile_name=profile.name,
                     error="Failed to accept login token"
                 )
+
+            # Обновляем страницу чтобы браузер увидел авторизацию
+            await asyncio.sleep(2)  # Даём время на синхронизацию
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                print(f"[TelegramAuth] Page reload after accept: {e}")
 
             # Ждём авторизацию в браузере
             success, need_2fa = await self._wait_for_auth_complete(page)

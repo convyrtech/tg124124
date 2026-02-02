@@ -114,9 +114,12 @@ class ProxyRelay:
         listen_uri = f"http://{self.local_host}:{self.local_port}"
         remote_uri = self.config.to_pproxy_uri()
 
-        # Запускаем pproxy как subprocess
+        # Запускаем pproxy через wrapper (исправляет Python 3.14+ совместимость)
+        import os
+        wrapper_path = os.path.join(os.path.dirname(__file__), "pproxy_wrapper.py")
+
         cmd = [
-            "python", "-m", "pproxy",
+            "python", wrapper_path,
             "-l", listen_uri,
             "-r", remote_uri,
             "-v"  # Verbose для отладки
@@ -206,6 +209,9 @@ def needs_relay(proxy_str: str) -> bool:
     """
     Проверяет, нужен ли proxy relay для данного прокси.
     Нужен если: SOCKS5 + username/password.
+
+    Firefox/Camoufox НЕ поддерживает SOCKS5 с аутентификацией напрямую,
+    поэтому нужен локальный HTTP relay.
     """
     if not proxy_str:
         return False

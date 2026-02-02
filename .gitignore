@@ -39,3 +39,12 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Node.js
+node_modules/
+package-lock.json
+
+# Temp files
+temp_pyzbar/
+nul
+*.exe
