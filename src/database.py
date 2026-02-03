@@ -283,6 +283,32 @@ class Database:
         )
         await self._connection.commit()
 
+    async def update_proxy(self, proxy_id: int, **kwargs) -> None:
+        """Update proxy fields."""
+        if not kwargs:
+            return
+
+        # Add last_check timestamp when status changes
+        if "status" in kwargs:
+            kwargs["last_check"] = "datetime('now')"
+
+        fields = []
+        values = []
+        for k, v in kwargs.items():
+            if v == "datetime('now')":
+                fields.append(f"{k} = datetime('now')")
+            else:
+                fields.append(f"{k} = ?")
+                values.append(v)
+
+        values.append(proxy_id)
+
+        await self._connection.execute(
+            f"UPDATE proxies SET {', '.join(fields)} WHERE id = ?",
+            values
+        )
+        await self._connection.commit()
+
     async def list_proxies(
         self,
         status: Optional[str] = None,

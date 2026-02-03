@@ -1,5 +1,6 @@
 """Business logic controllers for GUI."""
 import asyncio
+import socket
 from pathlib import Path
 from typing import Optional, List, Callable
 import logging
@@ -8,6 +9,21 @@ import shutil
 from ..database import Database, AccountRecord, ProxyRecord
 
 logger = logging.getLogger(__name__)
+
+
+async def check_proxy_connection(host: str, port: int, timeout: float = 5.0) -> bool:
+    """Check if proxy is reachable via TCP connection."""
+    try:
+        # Use asyncio to check TCP connection
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout
+        )
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
 
 
 class AppController:
@@ -59,6 +75,10 @@ class AppController:
         """Search accounts by name/username/phone."""
         return await self.db.list_accounts(search=query if query else None)
 
+    async def check_proxy(self, proxy: ProxyRecord, timeout: float = 5.0) -> bool:
+        """Check if proxy is alive."""
+        return await check_proxy_connection(proxy.host, proxy.port, timeout)
+
     async def import_sessions(
         self,
         source_dir: Path,
@@ -104,8 +124,17 @@ class AppController:
         return imported
 
     async def import_proxies(self, proxy_list: str) -> int:
-        """Import proxies from text (one per line, format: host:port:user:pass)."""
+        """
+        Import proxies from text (one per line).
+
+        Supported formats:
+        - host:port:user:pass (main format)
+        - host:port (no auth)
+        - socks5:host:port:user:pass (with protocol)
+        - user:pass@host:port (URL-style)
+        """
         imported = 0
+        skipped = 0
 
         for line in proxy_list.strip().split("\n"):
             line = line.strip()
@@ -113,21 +142,71 @@ class AppController:
                 continue
 
             try:
-                parts = line.split(":")
-                if len(parts) >= 2:
-                    host = parts[0]
-                    port = int(parts[1])
-                    username = parts[2] if len(parts) > 2 else None
-                    password = parts[3] if len(parts) > 3 else None
+                host, port, username, password, protocol = self._parse_proxy_line(line)
 
+                if host and port:
                     await self.db.add_proxy(
                         host=host,
                         port=port,
                         username=username,
-                        password=password
+                        password=password,
+                        protocol=protocol
                     )
                     imported += 1
+                else:
+                    skipped += 1
+                    logger.warning("Invalid proxy format: %s", line[:50])
+
             except Exception as e:
-                logger.warning("Failed to parse proxy line: %s - %s", line, e)
+                skipped += 1
+                logger.warning("Failed to parse proxy: %s - %s", line[:50], e)
+
+        if skipped > 0:
+            logger.info("Imported %d proxies, skipped %d invalid", imported, skipped)
 
         return imported
+
+    def _parse_proxy_line(self, line: str) -> tuple:
+        """
+        Parse proxy line into components.
+
+        Returns: (host, port, username, password, protocol)
+        """
+        protocol = "socks5"  # default
+
+        # Remove protocol prefix if present
+        if line.startswith(("socks5:", "socks4:", "http:", "https://")):
+            if "://" in line:
+                protocol, rest = line.split("://", 1)
+                line = rest
+            else:
+                parts = line.split(":", 1)
+                protocol = parts[0]
+                line = parts[1] if len(parts) > 1 else ""
+
+        # Handle user:pass@host:port format
+        if "@" in line:
+            auth_part, host_part = line.rsplit("@", 1)
+            if ":" in auth_part:
+                username, password = auth_part.split(":", 1)
+            else:
+                username, password = auth_part, None
+
+            if ":" in host_part:
+                host, port_str = host_part.split(":", 1)
+                port = int(port_str)
+            else:
+                return (None, None, None, None, protocol)
+
+            return (host, port, username, password, protocol)
+
+        # Handle host:port:user:pass format (main format)
+        parts = line.split(":")
+        if len(parts) >= 2:
+            host = parts[0]
+            port = int(parts[1])
+            username = parts[2] if len(parts) > 2 and parts[2] else None
+            password = parts[3] if len(parts) > 3 and parts[3] else None
+            return (host, port, username, password, protocol)
+
+        return (None, None, None, None, protocol)

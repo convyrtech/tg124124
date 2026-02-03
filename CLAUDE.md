@@ -1,7 +1,62 @@
 # TG Web Auth Migration Tool
 
 ## Project Goal
-Автоматическая миграция Telegram session файлов (Telethon/Pyrogram) в браузерные профили web.telegram.org с сохранением сессий между запусками.
+Автоматическая миграция Telegram session файлов (Telethon/Pyrogram) в браузерные профили для:
+- **web.telegram.org** - основной веб-клиент
+- **fragment.com** - NFT usernames, Telegram Stars (планируется)
+
+Масштаб: **1000 аккаунтов**, переносимость между ПК.
+
+## Current Status
+
+### Что работает
+- Programmatic QR Login (без ручного сканирования)
+- Multi-decoder QR (jsQR, OpenCV, pyzbar)
+- Camoufox antidetect browser с persistent profiles
+- SOCKS5 proxy с auth через pproxy relay
+- Batch миграция с cooldown 45 сек
+- 81 тест проходит
+
+### Что НЕ работает
+- **Direct Session Injection** - Telegram Web валидирует сессии на сервере, просто записать auth_key в localStorage/IndexedDB недостаточно
+
+## Architecture
+
+### Programmatic QR Login Flow
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
+│   Telethon  │     │   Camoufox   │     │  Telegram Web   │
+│   Client    │     │   Browser    │     │    Server       │
+└──────┬──────┘     └──────┬───────┘     └────────┬────────┘
+       │                   │                      │
+       │  1. Connect with existing session        │
+       │─────────────────────────────────────────>│
+       │                   │                      │
+       │                   │  2. Open web.telegram.org
+       │                   │─────────────────────>│
+       │                   │                      │
+       │                   │  3. Show QR code     │
+       │                   │<─────────────────────│
+       │                   │                      │
+       │  4. Screenshot QR │                      │
+       │<──────────────────│                      │
+       │                   │                      │
+       │  5. Decode token from QR                 │
+       │  6. AcceptLoginTokenRequest(token)       │
+       │─────────────────────────────────────────>│
+       │                   │                      │
+       │                   │  7. Session authorized
+       │                   │<─────────────────────│
+       │                   │                      │
+       │  8. Save browser profile                 │
+       │<──────────────────│                      │
+```
+
+### Proxy Relay (для SOCKS5 auth)
+```
+Browser ──HTTP──> pproxy (localhost:random) ──SOCKS5+auth──> Remote Proxy
+```
+Браузеры не поддерживают SOCKS5 с auth напрямую, поэтому pproxy создаёт локальный HTTP relay.
 
 ## Technical Context
 
@@ -31,135 +86,187 @@ SQLite database:
 }
 ```
 
-### Telegram Web Architecture
-- web.telegram.org использует GramJS (MTProto over WebSocket)
-- Auth data хранится в IndexedDB, не localStorage
-- Два способа входа: QR-код или phone+code
-- QR login API: auth.exportLoginToken → auth.acceptLoginToken
-
-### Programmatic QR Login Flow
-1. Telethon client с существующей сессией вызывает `auth.exportLoginToken`
-2. Получаем token, кодируем в base64url
-3. Playwright открывает web.telegram.org, показывает QR
-4. Telethon client вызывает `auth.acceptLoginToken` для подтверждения
-5. Браузер получает авторизацию
-6. Сохраняем browser profile (storageState + userDataDir)
-
-## Requirements
-
-### Functional
-- Полностью автоматический вход без ручного QR сканирования
-- Поддержка прокси (SOCKS5 из config)
-- Сохранение профилей между запусками (через неделю открыл - работает)
-- Batch операции для множества аккаунтов
-- CLI интерфейс: migrate, open, list
-
-### Security
-- НЕ хранить auth_key в plaintext логах
-- Изолированные browser profiles для каждого аккаунта
-- Прокси обязателен для каждого аккаунта
-
-### Technical Stack
-- Python 3.11+
-- Telethon (MTProto client)
-- Playwright (browser automation)
-- Click или Typer (CLI)
-
 ## File Structure
 ```
 tg-web-auth/
-├── accounts/           # Исходные session файлы
+├── accounts/               # Исходные session файлы (в .gitignore)
 │   └── account_name/
 │       ├── session.session
 │       ├── api.json
 │       └── ___config.json
-├── profiles/           # Сохранённые browser profiles
+├── profiles/               # Browser profiles (в .gitignore)
 │   └── account_name/
-│       ├── storage_state.json
-│       └── user_data/
+│       ├── config.json
+│       └── browser_data/
 ├── src/
-│   ├── session_reader.py
-│   ├── qr_auth.py
-│   ├── browser_manager.py
-│   └── cli.py
+│   ├── telegram_auth.py    # Основная логика QR auth (1266 строк)
+│   ├── browser_manager.py  # Camoufox управление
+│   ├── proxy_relay.py      # SOCKS5 → HTTP relay
+│   ├── pproxy_wrapper.py   # pproxy process wrapper
+│   ├── cli.py              # CLI интерфейс
+│   ├── utils.py            # Утилиты
+│   └── security_check.py   # Проверка безопасности
+├── tests/                  # 81 тест
+│   ├── test_telegram_auth.py
+│   ├── test_browser_manager.py
+│   ├── test_proxy_relay.py
+│   ├── test_utils.py
+│   ├── test_integration.py
+│   └── conftest.py
+├── scripts/                # Эксперименты (не в git)
+│   ├── extract_tg_storage.py
+│   ├── session_converter.py
+│   └── inject_session.py
+├── docs/
+│   └── SESSION_NOTES_*.md  # Заметки сессий разработки
+├── decode_qr.js            # Node.js jsQR decoder
+├── package.json
 ├── requirements.txt
-└── README.md
+├── CLAUDE.md
+└── .gitignore
 ```
 
+## Technical Stack
+- **Python 3.11+**
+- **Telethon** - MTProto client для AcceptLoginToken
+- **Camoufox** - Antidetect browser (Firefox-based)
+- **Playwright** - Browser automation fallback
+- **pproxy** - SOCKS5 auth relay
+- **OpenCV/pyzbar/jsQR** - QR decoding
+- **Click** - CLI
+
 ## Commands
-- `pip install -r requirements.txt` - установка
-- `playwright install chromium` - установка браузера
-- `python -m src.cli migrate --account "Name"` - миграция одного
-- `python -m src.cli migrate --all` - миграция всех
-- `python -m src.cli open --account "Name"` - открыть профиль
-- `python -m src.cli list` - список профилей
 
-## Constraints
-- НИКОГДА не логировать auth_key или api_hash в консоль
-- Всегда использовать прокси из конфига
-- Graceful shutdown - корректно закрывать Telethon client
-- Playwright userDataDir для персистентности, не только storageState
+### Установка
+```bash
+pip install -r requirements.txt
+playwright install chromium  # fallback browser
+npm install                  # для jsQR decoder
+```
 
-## Testing
-- Сначала тестируем на тестовом аккаунте (session.session в uploads)
-- Только после успешного теста - batch операции
-- Run `pytest` before any real account testing
+### Миграция
+```bash
+# Один аккаунт
+python -m src.cli migrate --account "Name"
 
-## Quality Gates (ОБЯЗАТЕЛЬНО)
+# Все аккаунты
+python -m src.cli migrate --all
 
-### Перед завершением любой задачи:
-1. [ ] Self-review на типичные ошибки
-2. [ ] Unit тесты написаны и проходят
-3. [ ] Нет секретов в логах (grep -r "api_hash\|auth_key\|password")
-4. [ ] Все ресурсы закрываются (async with, try/finally)
-5. [ ] Type hints на всех функциях
-6. [ ] pytest проходит без ошибок
+# С паролем 2FA
+python -m src.cli migrate --account "Name" --password "2fa_pass"
+```
 
-### Запрещено:
+### Управление профилями
+```bash
+python -m src.cli open --account "Name"  # Открыть профиль
+python -m src.cli list                   # Список профилей
+```
+
+### Тесты
+```bash
+pytest              # Все тесты
+pytest -v           # Verbose
+pytest tests/test_integration.py  # Только интеграционные
+```
+
+## Scaling для 1000 аккаунтов
+
+### Ресурсы
+```
+┌─────────────────────────┬───────────┬───────────┬────────────┐
+│         Метрика         │ 100 акков │ 500 акков │ 1000 акков │
+├─────────────────────────┼───────────┼───────────┼────────────┤
+│ RAM (batch 10 parallel) │ ~2 GB     │ ~2 GB     │ ~2 GB      │
+├─────────────────────────┼───────────┼───────────┼────────────┤
+│ Disk (profiles)         │ ~10 GB    │ ~50 GB    │ ~100 GB    │
+├─────────────────────────┼───────────┼───────────┼────────────┤
+│ Time (sequential, 45s)  │ ~1.5 ч    │ ~6 ч      │ ~12 ч      │
+├─────────────────────────┼───────────┼───────────┼────────────┤
+│ Time (10 parallel)      │ ~10 мин   │ ~40 мин   │ ~1.5 ч     │
+└─────────────────────────┴───────────┴───────────┴────────────┘
+```
+
+### Переносимость между ПК
+- **Session файлы** (~50MB для 1000) - синхронизируем между ПК
+- **Browser profiles** (~100GB) - создаём локально по требованию
+- Миграция на новом ПК: `python -m src.cli migrate --all`
+
+## Roadmap
+
+### Phase 1: Core (DONE)
+- [x] Programmatic QR Login
+- [x] Multi-decoder QR
+- [x] Camoufox antidetect
+- [x] SOCKS5 proxy relay
+- [x] Batch миграция
+- [x] 81 тест
+
+### Phase 2: Parallel Migration (TODO)
+- [ ] 10-50 параллельных браузеров
+- [ ] Semaphore для контроля concurrency
+- [ ] Progress reporting
+- [ ] Error recovery & retry
+
+### Phase 3: Fragment.com (TODO)
+- [ ] Исследовать auth flow Fragment
+- [ ] Интеграция с существующими профилями
+- [ ] TON wallet НЕ нужен (только Telegram auth)
+
+### Phase 4: Health & Monitoring (TODO)
+- [ ] Session health check
+- [ ] Auto-refresh истекающих сессий
+- [ ] Dashboard со статусами
+
+## Security Constraints
+
+### ОБЯЗАТЕЛЬНО
+- НЕ логировать auth_key, api_hash, passwords, tokens
+- Изолированные browser profiles для каждого аккаунта
+- Прокси обязателен для каждого аккаунта
+- Graceful shutdown - корректно закрывать все ресурсы
+
+### ЗАПРЕЩЕНО
 - Hardcoded credentials
-- print() вместо logging
-- Bare except: (только except Exception as e:)
+- `print()` вместо `logging`
+- Bare `except:` (только `except Exception as e:`)
 - Игнорирование возвращаемых ошибок
 
-## Code Quality Rules
+## GUI Testing Rules (ОБЯЗАТЕЛЬНО)
 
-### Before marking task complete:
-- [ ] Run `pytest` - all tests must pass
-- [ ] Self-review checklist completed (see below)
-- [ ] Integration test passes
-- [ ] No new bare `except:` blocks
+### После каждой GUI фичи:
+1. [ ] Запустить приложение: `python -m src.gui.app`
+2. [ ] Протестировать КАЖДУЮ кнопку вручную
+3. [ ] Проверить что нет крашей
+4. [ ] Все ошибки логируются, не молча падают
 
-### Self-review checklist:
-- [ ] **Error handling**: No bare `except:`, use specific exceptions
-- [ ] **Resource cleanup**: All browsers/clients closed in finally blocks
-- [ ] **No secrets in logs**: Never log api_hash, auth_key, passwords, tokens
-- [ ] **Type hints**: All public functions have type hints
-- [ ] **Docstrings**: All public functions have docstrings with Args/Returns
+### Запрещено:
+- Говорить "готово" без ручного тестирования
+- Кнопки без try/except
+- Краши без понятного сообщения об ошибке
 
-### Code standards:
+## Quality Gates
+
+### Перед завершением любой задачи
+1. [ ] `pytest` проходит без ошибок
+2. [ ] Self-review на типичные ошибки
+3. [ ] Нет секретов в логах
+4. [ ] Все ресурсы закрываются (async with, try/finally)
+5. [ ] Type hints на всех публичных функциях
+6. [ ] Docstrings с Args/Returns
+
+### Code Standards
 - Type hints required for all function parameters and return values
 - Use `Optional[T]` for nullable types
 - Prefer `Path` over string paths
 - Use dataclasses for structured data
 - Async context managers for resource management
 
-### Test requirements:
-- Unit tests for all utility functions
-- Mock tests for external dependencies (Camoufox, Telethon)
-- Integration test must validate real accounts structure
-- Run `pytest -v` to see detailed output
+## Known Issues
 
-### Commands:
-```bash
-# Run all tests
-pytest
+### Direct Session Injection (НЕ РАБОТАЕТ)
+Попытки напрямую инжектить auth_key в браузер не работают:
+- Telegram Web K валидирует сессии на сервере
+- authState в IndexedDB сбрасывается приложением
+- **Единственный рабочий путь - Programmatic QR Login**
 
-# Run with verbose output
-pytest -v
-
-# Run specific test file
-pytest tests/test_utils.py
-
-# Run integration tests only
-pytest tests/test_integration.py
-```
+Экспериментальный код в `scripts/` - только для исследования.

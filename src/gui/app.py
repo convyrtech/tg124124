@@ -1,17 +1,65 @@
 """Main GUI application."""
 import dearpygui.dearpygui as dpg
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Callable
 import asyncio
 import threading
+import queue
 import time
 import logging
+import traceback
 
 from .theme import create_hacker_theme, create_status_themes
 from .controllers import AppController
-from ..database import AccountRecord
+from ..database import AccountRecord, ProxyRecord
 
 logger = logging.getLogger(__name__)
+
+
+def _select_folder_tkinter() -> Optional[Path]:
+    """Use tkinter for folder selection (more stable than dpg file dialog)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        # Create hidden root window
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+
+        folder = filedialog.askdirectory(title="Select Sessions Folder")
+        root.destroy()
+
+        if folder:
+            return Path(folder)
+        return None
+    except Exception as e:
+        logger.error("Tkinter folder dialog error: %s", e)
+        return None
+
+
+def _select_file_tkinter(title: str = "Select File", filetypes: list = None) -> Optional[Path]:
+    """Use tkinter for file selection."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+
+        if filetypes is None:
+            filetypes = [("Text files", "*.txt"), ("All files", "*.*")]
+
+        filepath = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        root.destroy()
+
+        if filepath:
+            return Path(filepath)
+        return None
+    except Exception as e:
+        logger.error("Tkinter file dialog error: %s", e)
+        return None
 
 
 class TGWebAuthApp:
@@ -24,6 +72,8 @@ class TGWebAuthApp:
         self._controller = AppController(self.data_dir)
         self._async_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Thread-safe queue for UI updates from async code
+        self._ui_queue: queue.Queue = queue.Queue()
 
     def _start_async_loop(self) -> None:
         """Start async event loop in background thread."""
@@ -40,6 +90,20 @@ class TGWebAuthApp:
         """Schedule coroutine on async loop."""
         if self._loop:
             asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    def _schedule_ui(self, func: Callable) -> None:
+        """Schedule a function to run on the main UI thread."""
+        self._ui_queue.put(func)
+
+    def _process_ui_queue(self) -> None:
+        """Process pending UI updates (call from main thread)."""
+        while not self._ui_queue.empty():
+            try:
+                func = self._ui_queue.get_nowait()
+                func()
+            except Exception as e:
+                logger.error("UI queue error: %s", e)
+                self._log(f"[Error] UI update failed: {e}")
 
     def run(self) -> None:
         """Start the application."""
@@ -75,7 +139,11 @@ class TGWebAuthApp:
         # Show 2FA dialog on start
         self._show_2fa_dialog()
 
-        dpg.start_dearpygui()
+        # Custom render loop to process UI queue
+        while dpg.is_dearpygui_running():
+            self._process_ui_queue()
+            dpg.render_dearpygui_frame()
+
         dpg.destroy_context()
 
     def _create_main_window(self) -> None:
@@ -235,122 +303,192 @@ class TGWebAuthApp:
 
     def _on_2fa_submit(self, sender=None, app_data=None) -> None:
         """Handle 2FA password submission."""
-        password = dpg.get_value("2fa_input")
-        if password:
-            self._2fa_password = password
-            self._log("[System] 2FA password set for session")
-        dpg.delete_item("2fa_dialog")
+        try:
+            password = dpg.get_value("2fa_input")
+            if password:
+                self._2fa_password = password
+                self._log("[System] 2FA password set for session")
+            dpg.delete_item("2fa_dialog")
+        except Exception as e:
+            logger.error("2FA submit error: %s\n%s", e, traceback.format_exc())
+            self._log(f"[Error] 2FA: {e}")
 
     def _on_2fa_skip(self, sender=None, app_data=None) -> None:
         """Skip 2FA password."""
-        dpg.delete_item("2fa_dialog")
-        self._log("[System] 2FA password skipped - will prompt when needed")
+        try:
+            dpg.delete_item("2fa_dialog")
+            self._log("[System] 2FA password skipped - will prompt when needed")
+        except Exception as e:
+            logger.error("2FA skip error: %s", e)
 
     def _log(self, message: str) -> None:
-        """Add message to log."""
-        if dpg.does_item_exist("log_output"):
-            current = dpg.get_value("log_output")
-            dpg.set_value("log_output", current + message + "\n")
+        """Add message to log (thread-safe)."""
+        def do_log():
+            if dpg.does_item_exist("log_output"):
+                current = dpg.get_value("log_output")
+                dpg.set_value("log_output", current + message + "\n")
+
+        # If called from main thread, do directly; otherwise queue
+        try:
+            if threading.current_thread() is threading.main_thread():
+                do_log()
+            else:
+                self._schedule_ui(do_log)
+        except Exception as e:
+            logger.error("Log error: %s", e)
 
     # Import dialog
     def _show_import_dialog(self, sender=None, app_data=None) -> None:
         """Show file dialog to select sessions folder."""
-        with dpg.file_dialog(
-            directory_selector=True,
-            show=True,
-            callback=self._on_import_folder_selected,
-            width=700,
-            height=400
-        ):
-            pass
+        try:
+            # Use tkinter dialog (more stable than dpg file dialog)
+            folder_path = _select_folder_tkinter()
+            if folder_path is None:
+                self._log("[Import] Cancelled")
+                return
 
-    def _on_import_folder_selected(self, sender, app_data) -> None:
-        """Handle folder selection for import."""
-        if not app_data or "file_path_name" not in app_data:
-            return
+            self._log(f"[Import] Scanning {folder_path}...")
 
-        folder_path = Path(app_data["file_path_name"])
-        self._log(f"[Import] Scanning {folder_path}...")
+            async def do_import():
+                try:
+                    count = await self._controller.import_sessions(
+                        folder_path,
+                        on_progress=lambda done, total: self._log(f"[Import] {done}/{total}")
+                    )
+                    self._log(f"[Import] Completed: {count} accounts imported")
 
-        async def do_import():
-            count = await self._controller.import_sessions(
-                folder_path,
-                on_progress=lambda done, total: self._log(f"[Import] {done}/{total}")
-            )
-            self._log(f"[Import] Completed: {count} accounts imported")
-            # Refresh UI
-            await self._refresh_accounts_table()
-            await self._refresh_stats()
+                    # Schedule UI updates on main thread
+                    accounts = await self._controller.search_accounts("")
+                    stats = await self._controller.get_stats()
 
-        self._run_async(do_import())
+                    self._schedule_ui(lambda: self._update_stats_sync(stats))
+                    self._schedule_ui(lambda: self._update_accounts_table_sync(accounts))
 
-    async def _refresh_stats(self) -> None:
-        """Refresh header statistics."""
-        stats = await self._controller.get_stats()
+                except Exception as e:
+                    logger.error("Import error: %s\n%s", e, traceback.format_exc())
+                    self._log(f"[Error] Import failed: {e}")
 
-        dpg.set_value("stat_total", str(stats["total"]))
-        dpg.set_value("stat_healthy", str(stats["healthy"]))
-        dpg.set_value("stat_migrating", str(stats["migrating"]))
-        dpg.set_value("stat_errors", str(stats["errors"]))
-        dpg.set_value("stat_proxies", f"{stats['proxies_active']}/{stats['proxies_total']}")
+            self._run_async(do_import())
 
-    async def _refresh_accounts_table(self) -> None:
-        """Refresh accounts table from database."""
-        accounts = await self._controller.search_accounts("")
-        await self._update_accounts_table(accounts)
+        except Exception as e:
+            logger.error("Import dialog error: %s\n%s", e, traceback.format_exc())
+            self._log(f"[Error] Import: {e}")
 
-    async def _update_accounts_table(self, accounts: List[AccountRecord]) -> None:
-        """Update table with given accounts list."""
-        # Clear existing rows
-        for child in dpg.get_item_children("accounts_table", 1) or []:
-            dpg.delete_item(child)
+    def _update_stats_sync(self, stats: dict) -> None:
+        """Update stats on main thread."""
+        try:
+            dpg.set_value("stat_total", str(stats["total"]))
+            dpg.set_value("stat_healthy", str(stats["healthy"]))
+            dpg.set_value("stat_migrating", str(stats["migrating"]))
+            dpg.set_value("stat_errors", str(stats["errors"]))
+            dpg.set_value("stat_proxies", f"{stats['proxies_active']}/{stats['proxies_total']}")
+        except Exception as e:
+            logger.error("Update stats error: %s", e)
 
-        # Add rows
-        for account in accounts:
-            with dpg.table_row(parent="accounts_table"):
-                # Checkbox
-                dpg.add_checkbox(tag=f"sel_{account.id}")
+    def _update_accounts_table_sync(self, accounts: List[AccountRecord]) -> None:
+        """Update table on main thread."""
+        try:
+            # Clear existing rows
+            for child in dpg.get_item_children("accounts_table", 1) or []:
+                dpg.delete_item(child)
 
-                # Name (clickable to open profile)
-                dpg.add_selectable(
-                    label=account.name,
-                    callback=self._on_account_click,
-                    user_data=account.id
-                )
+            # Add rows
+            for account in accounts:
+                with dpg.table_row(parent="accounts_table"):
+                    # Checkbox
+                    dpg.add_checkbox(tag=f"sel_{account.id}")
 
-                # Username
-                dpg.add_text(account.username or "-")
+                    # Name
+                    dpg.add_text(account.name)
 
-                # Status with color
-                status_text = dpg.add_text(account.status)
-                if account.status in self._status_themes:
-                    dpg.bind_item_theme(status_text, self._status_themes[account.status])
+                    # Username
+                    dpg.add_text(account.username or "-")
 
-                # Proxy
-                dpg.add_text("-")  # TODO: join with proxy
+                    # Status with color
+                    status_text = dpg.add_text(account.status)
+                    if account.status in self._status_themes:
+                        dpg.bind_item_theme(status_text, self._status_themes[account.status])
 
-                # Actions
-                with dpg.group(horizontal=True):
+                    # Proxy
+                    dpg.add_text("-")
+
+                    # Actions
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(
+                            label="Open",
+                            callback=self._open_profile,
+                            user_data=account.id,
+                            width=60
+                        )
+                        dpg.add_button(
+                            label="Migrate",
+                            callback=self._migrate_single,
+                            user_data=account.id,
+                            width=60
+                        )
+        except Exception as e:
+            logger.error("Update accounts table error: %s\n%s", e, traceback.format_exc())
+            self._log(f"[Error] Table update: {e}")
+
+    def _update_proxies_table_sync(self, proxies: list) -> None:
+        """Update proxies table on main thread."""
+        try:
+            # Clear existing rows
+            for child in dpg.get_item_children("proxies_table", 1) or []:
+                dpg.delete_item(child)
+
+            # Add rows
+            for proxy in proxies:
+                with dpg.table_row(parent="proxies_table"):
+                    # Host:Port
+                    dpg.add_text(f"{proxy.host}:{proxy.port}")
+
+                    # Protocol
+                    dpg.add_text(proxy.protocol)
+
+                    # Status with color
+                    status_text = dpg.add_text(proxy.status)
+                    if proxy.status == "active":
+                        dpg.bind_item_theme(status_text, self._status_themes.get("healthy"))
+                    elif proxy.status == "dead":
+                        dpg.bind_item_theme(status_text, self._status_themes.get("error"))
+
+                    # Assigned To
+                    assigned = str(proxy.assigned_account_id) if proxy.assigned_account_id else "-"
+                    dpg.add_text(assigned)
+
+                    # Actions
                     dpg.add_button(
-                        label="Open",
-                        callback=self._open_profile,
-                        user_data=account.id,
+                        label="Delete",
+                        callback=self._delete_proxy,
+                        user_data=proxy.id,
                         width=60
                     )
-                    dpg.add_button(
-                        label="Migrate",
-                        callback=self._migrate_single,
-                        user_data=account.id,
-                        width=60
-                    )
+
+            self._log(f"[UI] Loaded {len(proxies)} proxies")
+        except Exception as e:
+            logger.error("Update proxies table error: %s\n%s", e, traceback.format_exc())
+            self._log(f"[Error] Proxies table: {e}")
+
+    def _delete_proxy(self, sender, app_data, user_data) -> None:
+        """Delete a proxy."""
+        proxy_id = user_data
+        self._log(f"[Action] Delete proxy {proxy_id} - not implemented yet")
 
     def _on_search_accounts(self, sender, filter_string) -> None:
         """Handle search input."""
-        async def do_search():
-            accounts = await self._controller.search_accounts(filter_string)
-            await self._update_accounts_table(accounts)
+        try:
+            async def do_search():
+                try:
+                    accounts = await self._controller.search_accounts(filter_string)
+                    self._schedule_ui(lambda: self._update_accounts_table_sync(accounts))
+                except Exception as e:
+                    logger.error("Search error: %s", e)
+                    self._log(f"[Error] Search: {e}")
 
-        self._run_async(do_search())
+            self._run_async(do_search())
+        except Exception as e:
+            logger.error("Search accounts error: %s", e)
 
     def _on_account_click(self, sender, app_data, user_data) -> None:
         """Handle account row click."""
@@ -371,24 +509,27 @@ class TGWebAuthApp:
 
     def _migrate_selected(self, sender=None, app_data=None) -> None:
         """Migrate all selected accounts."""
-        # Get selected checkboxes
-        selected_ids = []
-        for child in dpg.get_item_children("accounts_table", 1) or []:
-            row_children = dpg.get_item_children(child, 1) or []
-            if row_children:
-                checkbox = row_children[0]
-                if dpg.get_value(checkbox):
-                    # Extract account_id from checkbox tag
-                    tag = dpg.get_item_alias(checkbox)
-                    if tag and tag.startswith("sel_"):
-                        selected_ids.append(int(tag[4:]))
+        try:
+            # Get selected checkboxes
+            selected_ids = []
+            for child in dpg.get_item_children("accounts_table", 1) or []:
+                row_children = dpg.get_item_children(child, 1) or []
+                if row_children:
+                    checkbox = row_children[0]
+                    if dpg.get_value(checkbox):
+                        tag = dpg.get_item_alias(checkbox)
+                        if tag and tag.startswith("sel_"):
+                            selected_ids.append(int(tag[4:]))
 
-        if not selected_ids:
-            self._log("[Warning] No accounts selected")
-            return
+            if not selected_ids:
+                self._log("[Warning] No accounts selected")
+                return
 
-        self._log(f"[Migrate] Starting migration of {len(selected_ids)} accounts...")
-        # TODO: integrate with telegram_auth
+            self._log(f"[Migrate] Starting migration of {len(selected_ids)} accounts...")
+            # TODO: integrate with telegram_auth
+        except Exception as e:
+            logger.error("Migrate selected error: %s", e)
+            self._log(f"[Error] Migrate: {e}")
 
     def _migrate_all(self, sender=None, app_data=None) -> None:
         """Migrate all pending accounts."""
@@ -396,48 +537,79 @@ class TGWebAuthApp:
         # TODO: integrate with telegram_auth
 
     def _show_proxy_import_dialog(self, sender=None, app_data=None) -> None:
-        """Show proxy import dialog."""
-        if dpg.does_item_exist("proxy_import_dialog"):
-            dpg.delete_item("proxy_import_dialog")
-
-        with dpg.window(
-            tag="proxy_import_dialog",
-            label="Import Proxies",
-            modal=True,
-            width=500,
-            height=400,
-            pos=[350, 200]
-        ):
-            dpg.add_text("Paste proxies (one per line):")
-            dpg.add_text("Format: host:port:user:pass or host:port", color=(150, 150, 150))
-            dpg.add_spacer(height=10)
-            dpg.add_input_text(
-                tag="proxy_import_text",
-                multiline=True,
-                width=-1,
-                height=250
+        """Show proxy import - select file directly."""
+        try:
+            filepath = _select_file_tkinter(
+                title="Select Proxies File",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
             )
-            dpg.add_spacer(height=10)
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="Import", width=100, callback=self._do_import_proxies)
-                dpg.add_button(label="Cancel", width=100, callback=lambda: dpg.delete_item("proxy_import_dialog"))
 
-    def _do_import_proxies(self, sender=None, app_data=None) -> None:
-        """Execute proxy import."""
-        proxy_text = dpg.get_value("proxy_import_text")
-        dpg.delete_item("proxy_import_dialog")
+            if filepath is None:
+                self._log("[Import] Proxy import cancelled")
+                return
 
-        async def do_import():
-            count = await self._controller.import_proxies(proxy_text)
-            self._log(f"[Import] Imported {count} proxies")
-            await self._refresh_stats()
+            self._log(f"[Import] Loading proxies from {filepath.name}...")
 
-        self._run_async(do_import())
+            # Read file
+            proxy_text = filepath.read_text(encoding='utf-8', errors='ignore')
+
+            async def do_import():
+                try:
+                    count = await self._controller.import_proxies(proxy_text)
+                    self._log(f"[Import] Imported {count} proxies")
+
+                    # Refresh UI
+                    stats = await self._controller.get_stats()
+                    proxies = await self._controller.db.list_proxies()
+
+                    self._schedule_ui(lambda: self._update_stats_sync(stats))
+                    self._schedule_ui(lambda: self._update_proxies_table_sync(proxies))
+                except Exception as e:
+                    logger.error("Proxy import error: %s\n%s", e, traceback.format_exc())
+                    self._log(f"[Error] Proxy import: {e}")
+
+            self._run_async(do_import())
+
+        except Exception as e:
+            logger.error("Show proxy import dialog error: %s\n%s", e, traceback.format_exc())
+            self._log(f"[Error] Proxy import: {e}")
 
     def _check_all_proxies(self, sender=None, app_data=None) -> None:
         """Check all proxies status."""
-        self._log("[Proxies] Checking all proxies...")
-        # TODO: implement proxy checking
+        self._log("[Proxies] Starting proxy check...")
+
+        async def do_check():
+            try:
+                proxies = await self._controller.db.list_proxies()
+                total = len(proxies)
+                alive = 0
+                dead = 0
+
+                for i, proxy in enumerate(proxies):
+                    self._log(f"[Proxies] Checking {i+1}/{total}: {proxy.host}:{proxy.port}")
+
+                    is_alive = await self._controller.check_proxy(proxy)
+
+                    if is_alive:
+                        alive += 1
+                        await self._controller.db.update_proxy(proxy.id, status="active")
+                    else:
+                        dead += 1
+                        await self._controller.db.update_proxy(proxy.id, status="dead")
+
+                self._log(f"[Proxies] Done: {alive} alive, {dead} dead")
+
+                # Refresh UI
+                proxies = await self._controller.db.list_proxies()
+                stats = await self._controller.get_stats()
+                self._schedule_ui(lambda: self._update_proxies_table_sync(proxies))
+                self._schedule_ui(lambda: self._update_stats_sync(stats))
+
+            except Exception as e:
+                logger.error("Check proxies error: %s\n%s", e, traceback.format_exc())
+                self._log(f"[Error] Proxy check: {e}")
+
+        self._run_async(do_check())
 
     def _replace_dead_proxies(self, sender=None, app_data=None) -> None:
         """Replace dead proxies with new ones."""
@@ -447,7 +619,11 @@ class TGWebAuthApp:
 
 def main():
     """Entry point."""
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(levelname)-7s | %(name)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
     app = TGWebAuthApp()
     app.run()
 
