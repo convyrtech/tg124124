@@ -566,42 +566,50 @@ class TGWebAuthApp:
 
         async def do_open():
             try:
+                from ..browser_manager import BrowserManager
+
                 account = await self._controller.db.get_account(account_id)
                 if not account:
                     self._log(f"[Error] Account {account_id} not found")
                     return
 
-                # Extract profile name - handle "12345 (Name)" format
-                import re
+                # Profile name is the FULL account name (directory name)
+                # e.g. "12709623038 (Софт 312)"
                 profile_name = account.name
-                match = re.match(r'\d+\s*\((.+)\)', account.name)
-                if match:
-                    profile_name = match.group(1)
-
                 self._log(f"[Open] Launching browser for {profile_name}...")
 
-                # Use CLI open command with captured output
-                proc = await asyncio.create_subprocess_exec(
-                    "python", "-m", "src.cli", "open", "--account", profile_name,
-                    cwd=str(Path(__file__).parent.parent.parent),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT
-                )
+                # Use BrowserManager directly (not CLI!)
+                manager = BrowserManager()
+                profile = manager.get_profile(profile_name)
 
-                # Wait briefly and check for errors
-                try:
-                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-                    output = stdout.decode('utf-8', errors='ignore') if stdout else ""
-                    if proc.returncode == 0:
-                        self._log(f"[Open] Browser opened for {profile_name}")
-                    else:
-                        self._log(f"[Open] Error: {output.strip()}")
-                except asyncio.TimeoutError:
-                    # Browser is running (didn't exit in 10s) - that's good
-                    self._log(f"[Open] Browser running for {profile_name} (pid={proc.pid})")
+                if not profile.exists():
+                    self._log(f"[Open] Profile not found: {profile_name}")
+                    self._log(f"[Open] Hint: Run migration first to create browser profile")
+                    return
+
+                # Load proxy from profile config if exists
+                if profile.config_path.exists():
+                    import json
+                    try:
+                        with open(profile.config_path, encoding='utf-8') as f:
+                            config = json.load(f)
+                            profile.proxy = config.get('proxy')
+                    except Exception:
+                        pass
+
+                # Launch browser
+                ctx = await manager.launch(profile, headless=False)
+                page = await ctx.new_page()
+                await page.goto("https://web.telegram.org/k/")
+
+                self._log(f"[Open] Browser opened for {profile_name}")
+
+                # Keep browser open until user closes it
+                # We don't wait here - browser runs in background
+                # Note: this will keep the context alive until browser closes
 
             except Exception as e:
-                logger.error("Open profile error: %s", e)
+                logger.error("Open profile error: %s\n%s", e, traceback.format_exc())
                 self._log(f"[Error] Open: {e}")
 
         self._run_async(do_open())
@@ -613,17 +621,12 @@ class TGWebAuthApp:
 
         async def do_migrate():
             try:
-                import re
+                from ..telegram_auth import migrate_account, AccountConfig
+
                 account = await self._controller.db.get_account(account_id)
                 if not account:
                     self._log(f"[Error] Account {account_id} not found")
                     return
-
-                # Extract profile name - handle "12345 (Name)" format
-                profile_name = account.name
-                match = re.match(r'\d+\s*\((.+)\)', account.name)
-                if match:
-                    profile_name = match.group(1)
 
                 self._log(f"[Migrate] Starting {account.name}...")
 
@@ -631,39 +634,53 @@ class TGWebAuthApp:
                 await self._controller.db.update_account(account_id, status="migrating")
                 self._schedule_ui(lambda: self._refresh_table_async())
 
-                # Run migration via CLI using ASYNC subprocess (non-blocking!)
-                args = ["python", "-m", "src.cli", "migrate", "--account", profile_name, "--headless"]
-                if self._2fa_password:
-                    args.extend(["--password", self._2fa_password])
+                # Get session directory from database path
+                session_path = Path(account.session_path)
+                session_dir = session_path.parent
 
-                # Use asyncio subprocess - NOT blocking!
-                proc = await asyncio.create_subprocess_exec(
-                    *args,
-                    cwd=str(Path(__file__).parent.parent.parent),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT
-                )
+                if not session_dir.exists():
+                    self._log(f"[Error] Session dir not found: {session_dir}")
+                    await self._controller.db.update_account(account_id, status="error",
+                                                             error_message="Session dir not found")
+                    self._schedule_ui(lambda: self._refresh_table_async())
+                    return
 
-                # Wait for result asynchronously
-                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
-                stdout = stdout_bytes.decode('utf-8', errors='ignore') if stdout_bytes else ""
+                # Call migrate_account directly (not via CLI!)
+                try:
+                    result = await migrate_account(
+                        account_dir=session_dir,
+                        password_2fa=self._2fa_password,
+                        headless=True  # GUI mode uses headless by default
+                    )
 
-                if proc.returncode == 0:
-                    await self._controller.db.update_account(account_id, status="healthy")
-                    self._log(f"[Migrate] {account.name} - SUCCESS")
-                else:
-                    await self._controller.db.update_account(account_id, status="error")
-                    self._log(f"[Migrate] {account.name} - FAILED")
-                    if stdout:
-                        last_line = stdout.strip().split('\n')[-1]
-                        self._log(f"[Migrate] {last_line}")
+                    if result.success:
+                        await self._controller.db.update_account(
+                            account_id,
+                            status="healthy",
+                            username=result.user_info.get("username") if result.user_info else None,
+                            error_message=None
+                        )
+                        self._log(f"[Migrate] {account.name} - SUCCESS")
+                        if result.user_info:
+                            self._log(f"[Migrate] Username: @{result.user_info.get('username', 'N/A')}")
+                    else:
+                        await self._controller.db.update_account(
+                            account_id,
+                            status="error",
+                            error_message=result.error
+                        )
+                        self._log(f"[Migrate] {account.name} - FAILED: {result.error}")
+
+                except Exception as e:
+                    await self._controller.db.update_account(
+                        account_id,
+                        status="error",
+                        error_message=str(e)
+                    )
+                    self._log(f"[Migrate] {account.name} - ERROR: {e}")
 
                 self._schedule_ui(lambda: self._refresh_table_async())
 
-            except asyncio.TimeoutError:
-                self._log(f"[Error] Migration timeout for account {account_id}")
-                await self._controller.db.update_account(account_id, status="error")
-                self._schedule_ui(lambda: self._refresh_table_async())
             except Exception as e:
                 logger.error("Migrate error: %s\n%s", e, traceback.format_exc())
                 self._log(f"[Error] Migrate: {e}")
@@ -671,6 +688,7 @@ class TGWebAuthApp:
                     await self._controller.db.update_account(account_id, status="error")
                 except:
                     pass
+                self._schedule_ui(lambda: self._refresh_table_async())
 
         self._run_async(do_migrate())
 
@@ -812,6 +830,8 @@ class TGWebAuthApp:
 
         async def do_migrate_all():
             try:
+                from ..telegram_auth import migrate_account, get_randomized_cooldown
+
                 accounts = await self._controller.db.list_accounts(status="pending")
                 if not accounts:
                     self._log("[Migrate] No pending accounts")
@@ -819,52 +839,63 @@ class TGWebAuthApp:
 
                 self._log(f"[Migrate] {len(accounts)} accounts to migrate...")
 
-                import re
-                for account in accounts:
-                    # Extract profile name - handle "12345 (Name)" format
-                    profile_name = account.name
-                    match = re.match(r'\d+\s*\((.+)\)', account.name)
-                    if match:
-                        profile_name = match.group(1)
-
-                    self._log(f"[Migrate] {account.name}...")
+                for i, account in enumerate(accounts):
+                    self._log(f"[Migrate] [{i+1}/{len(accounts)}] {account.name}...")
                     await self._controller.db.update_account(account.id, status="migrating")
                     self._schedule_ui(lambda: self._refresh_table_async())
 
-                    args = ["python", "-m", "src.cli", "migrate", "--account", profile_name, "--headless"]
-                    if self._2fa_password:
-                        args.extend(["--password", self._2fa_password])
+                    # Get session directory
+                    session_path = Path(account.session_path)
+                    session_dir = session_path.parent
 
-                    # Use asyncio subprocess - NOT blocking!
-                    proc = await asyncio.create_subprocess_exec(
-                        *args,
-                        cwd=str(Path(__file__).parent.parent.parent),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT
-                    )
+                    if not session_dir.exists():
+                        self._log(f"[Migrate] {account.name} - SKIP (session not found)")
+                        await self._controller.db.update_account(account.id, status="error",
+                                                                 error_message="Session dir not found")
+                        continue
 
                     try:
-                        stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
-                        stdout = stdout_bytes.decode('utf-8', errors='ignore') if stdout_bytes else ""
+                        result = await migrate_account(
+                            account_dir=session_dir,
+                            password_2fa=self._2fa_password,
+                            headless=True
+                        )
 
-                        if proc.returncode == 0:
-                            await self._controller.db.update_account(account.id, status="healthy")
+                        if result.success:
+                            await self._controller.db.update_account(
+                                account.id,
+                                status="healthy",
+                                username=result.user_info.get("username") if result.user_info else None,
+                                error_message=None
+                            )
                             self._log(f"[Migrate] {account.name} - OK")
                         else:
-                            await self._controller.db.update_account(account.id, status="error")
-                            self._log(f"[Migrate] {account.name} - FAILED")
-                            if stdout:
-                                last_line = stdout.strip().split('\n')[-1]
-                                self._log(f"[Migrate] {last_line}")
-                    except asyncio.TimeoutError:
-                        self._log(f"[Migrate] {account.name} - TIMEOUT")
-                        await self._controller.db.update_account(account.id, status="error")
+                            await self._controller.db.update_account(
+                                account.id,
+                                status="error",
+                                error_message=result.error
+                            )
+                            self._log(f"[Migrate] {account.name} - FAILED: {result.error}")
+
+                    except Exception as e:
+                        await self._controller.db.update_account(
+                            account.id,
+                            status="error",
+                            error_message=str(e)
+                        )
+                        self._log(f"[Migrate] {account.name} - ERROR: {e}")
+
+                    # Randomized cooldown between accounts (anti-detection)
+                    if i < len(accounts) - 1:
+                        cooldown = get_randomized_cooldown()
+                        self._log(f"[Migrate] Cooldown {cooldown:.1f}s...")
+                        await asyncio.sleep(cooldown)
 
                 self._log("[Migrate] Batch complete")
                 self._schedule_ui(lambda: self._refresh_table_async())
 
             except Exception as e:
-                logger.error("Migrate all error: %s", e)
+                logger.error("Migrate all error: %s\n%s", e, traceback.format_exc())
                 self._log(f"[Error] Migrate all: {e}")
 
         self._run_async(do_migrate_all())
