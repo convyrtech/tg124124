@@ -208,6 +208,11 @@ class TGWebAuthApp:
                 label="Migrate All",
                 callback=self._migrate_all
             )
+            dpg.add_spacer(width=20)
+            dpg.add_button(
+                label="Auto-Assign Proxies",
+                callback=self._auto_assign_proxies
+            )
 
         dpg.add_spacer(height=10)
 
@@ -351,18 +356,20 @@ class TGWebAuthApp:
 
             async def do_import():
                 try:
-                    count = await self._controller.import_sessions(
+                    imported, skipped = await self._controller.import_sessions(
                         folder_path,
-                        on_progress=lambda done, total: self._log(f"[Import] {done}/{total}")
+                        on_progress=lambda done, total, msg: self._log(f"[Import] {done}/{total} {msg}")
                     )
-                    self._log(f"[Import] Completed: {count} accounts imported")
+                    self._log(f"[Import] Done: {imported} imported, {skipped} skipped")
 
                     # Schedule UI updates on main thread
                     accounts = await self._controller.search_accounts("")
                     stats = await self._controller.get_stats()
+                    proxies = await self._controller.db.list_proxies()
+                    proxies_map = {p.id: p for p in proxies}
 
                     self._schedule_ui(lambda: self._update_stats_sync(stats))
-                    self._schedule_ui(lambda: self._update_accounts_table_sync(accounts))
+                    self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
 
                 except Exception as e:
                     logger.error("Import error: %s\n%s", e, traceback.format_exc())
@@ -385,7 +392,7 @@ class TGWebAuthApp:
         except Exception as e:
             logger.error("Update stats error: %s", e)
 
-    def _update_accounts_table_sync(self, accounts: List[AccountRecord]) -> None:
+    def _update_accounts_table_sync(self, accounts: List[AccountRecord], proxies_map: dict = None) -> None:
         """Update table on main thread."""
         try:
             # Clear existing rows
@@ -410,7 +417,14 @@ class TGWebAuthApp:
                         dpg.bind_item_theme(status_text, self._status_themes[account.status])
 
                     # Proxy
-                    dpg.add_text("-")
+                    if account.proxy_id and proxies_map and account.proxy_id in proxies_map:
+                        proxy = proxies_map[account.proxy_id]
+                        proxy_text = f"{proxy.host}:{proxy.port}"
+                    elif account.proxy_id:
+                        proxy_text = f"ID:{account.proxy_id}"
+                    else:
+                        proxy_text = "-"
+                    dpg.add_text(proxy_text)
 
                     # Actions
                     with dpg.group(horizontal=True):
@@ -418,13 +432,19 @@ class TGWebAuthApp:
                             label="Open",
                             callback=self._open_profile,
                             user_data=account.id,
-                            width=60
+                            width=50
                         )
                         dpg.add_button(
                             label="Migrate",
                             callback=self._migrate_single,
                             user_data=account.id,
-                            width=60
+                            width=55
+                        )
+                        dpg.add_button(
+                            label="Proxy",
+                            callback=self._show_assign_proxy_dialog,
+                            user_data=account.id,
+                            width=45
                         )
         except Exception as e:
             logger.error("Update accounts table error: %s\n%s", e, traceback.format_exc())
@@ -473,7 +493,23 @@ class TGWebAuthApp:
     def _delete_proxy(self, sender, app_data, user_data) -> None:
         """Delete a proxy."""
         proxy_id = user_data
-        self._log(f"[Action] Delete proxy {proxy_id} - not implemented yet")
+
+        async def do_delete():
+            try:
+                await self._controller.db.delete_proxy(proxy_id)
+                self._log(f"[Proxies] Deleted proxy {proxy_id}")
+
+                # Refresh UI
+                proxies = await self._controller.db.list_proxies()
+                stats = await self._controller.get_stats()
+                self._schedule_ui(lambda: self._update_proxies_table_sync(proxies))
+                self._schedule_ui(lambda: self._update_stats_sync(stats))
+
+            except Exception as e:
+                logger.error("Delete proxy error: %s", e)
+                self._log(f"[Error] Delete proxy: {e}")
+
+        self._run_async(do_delete())
 
     def _on_search_accounts(self, sender, filter_string) -> None:
         """Handle search input."""
@@ -481,7 +517,9 @@ class TGWebAuthApp:
             async def do_search():
                 try:
                     accounts = await self._controller.search_accounts(filter_string)
-                    self._schedule_ui(lambda: self._update_accounts_table_sync(accounts))
+                    proxies = await self._controller.db.list_proxies()
+                    proxies_map = {p.id: p for p in proxies}
+                    self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
                 except Exception as e:
                     logger.error("Search error: %s", e)
                     self._log(f"[Error] Search: {e}")
@@ -498,14 +536,190 @@ class TGWebAuthApp:
     def _open_profile(self, sender, app_data, user_data) -> None:
         """Open browser profile for account."""
         account_id = user_data
-        self._log(f"[Action] Opening profile for account {account_id}...")
-        # TODO: integrate with browser_manager
+
+        async def do_open():
+            try:
+                account = await self._controller.db.get_account(account_id)
+                if not account:
+                    self._log(f"[Error] Account {account_id} not found")
+                    return
+
+                self._log(f"[Open] Opening {account.name}...")
+
+                # Use CLI open command
+                import subprocess
+                proc = subprocess.Popen(
+                    ["python", "-m", "src.cli", "open", "--account", account.name],
+                    cwd=str(Path(__file__).parent.parent.parent)
+                )
+                self._log(f"[Open] Browser launched for {account.name} (pid={proc.pid})")
+
+            except Exception as e:
+                logger.error("Open profile error: %s", e)
+                self._log(f"[Error] Open: {e}")
+
+        self._run_async(do_open())
 
     def _migrate_single(self, sender, app_data, user_data) -> None:
         """Migrate single account."""
         account_id = user_data
-        self._log(f"[Action] Starting migration for account {account_id}...")
-        # TODO: integrate with telegram_auth
+
+        async def do_migrate():
+            try:
+                account = await self._controller.db.get_account(account_id)
+                if not account:
+                    self._log(f"[Error] Account {account_id} not found")
+                    return
+
+                self._log(f"[Migrate] Starting {account.name}...")
+
+                # Update status
+                await self._controller.db.update_account(account_id, status="migrating")
+                self._schedule_ui(lambda: self._refresh_table_async())
+
+                # Run migration via CLI
+                import subprocess
+                args = ["python", "-m", "src.cli", "migrate", "--account", account.name, "--headless"]
+                if self._2fa_password:
+                    args.extend(["--password", self._2fa_password])
+
+                proc = subprocess.Popen(
+                    args,
+                    cwd=str(Path(__file__).parent.parent.parent),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True
+                )
+
+                # Wait for result
+                stdout, _ = proc.communicate(timeout=300)
+
+                if proc.returncode == 0:
+                    await self._controller.db.update_account(account_id, status="healthy")
+                    self._log(f"[Migrate] {account.name} - SUCCESS")
+                else:
+                    await self._controller.db.update_account(account_id, status="error")
+                    self._log(f"[Migrate] {account.name} - FAILED")
+                    # Show last line of output
+                    if stdout:
+                        last_line = stdout.strip().split('\n')[-1]
+                        self._log(f"[Migrate] {last_line}")
+
+                self._schedule_ui(lambda: self._refresh_table_async())
+
+            except Exception as e:
+                logger.error("Migrate error: %s\n%s", e, traceback.format_exc())
+                self._log(f"[Error] Migrate: {e}")
+                await self._controller.db.update_account(account_id, status="error")
+
+        self._run_async(do_migrate())
+
+    def _refresh_table_async(self) -> None:
+        """Trigger async table refresh from UI thread."""
+        async def do_refresh():
+            accounts = await self._controller.search_accounts("")
+            stats = await self._controller.get_stats()
+            proxies = await self._controller.db.list_proxies()
+            proxies_map = {p.id: p for p in proxies}
+            self._schedule_ui(lambda: self._update_stats_sync(stats))
+            self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
+        self._run_async(do_refresh())
+
+    def _show_assign_proxy_dialog(self, sender, app_data, user_data) -> None:
+        """Show dialog to assign proxy to account."""
+        account_id = user_data
+
+        async def show_dialog():
+            try:
+                account = await self._controller.db.get_account(account_id)
+                proxies = await self._controller.db.list_proxies()
+
+                # Build proxy options
+                self._schedule_ui(lambda: self._create_proxy_dialog(account, proxies))
+
+            except Exception as e:
+                logger.error("Show assign proxy dialog error: %s", e)
+                self._log(f"[Error] Proxy dialog: {e}")
+
+        self._run_async(show_dialog())
+
+    def _create_proxy_dialog(self, account, proxies) -> None:
+        """Create proxy selection dialog on main thread."""
+        dialog_tag = f"proxy_dialog_{account.id}"
+
+        if dpg.does_item_exist(dialog_tag):
+            dpg.delete_item(dialog_tag)
+
+        with dpg.window(
+            tag=dialog_tag,
+            label=f"Assign Proxy: {account.name}",
+            modal=True,
+            width=400,
+            height=300,
+            pos=[400, 200]
+        ):
+            dpg.add_text(f"Select proxy for: {account.name}")
+            dpg.add_separator()
+
+            # Current proxy
+            if account.proxy_id:
+                dpg.add_text(f"Current: ID {account.proxy_id}", color=(150, 150, 150))
+            else:
+                dpg.add_text("Current: None", color=(150, 150, 150))
+
+            dpg.add_spacer(height=10)
+
+            # Proxy list
+            with dpg.child_window(height=150):
+                # None option
+                dpg.add_selectable(
+                    label="[No Proxy]",
+                    callback=self._on_proxy_selected,
+                    user_data=(account.id, None, dialog_tag)
+                )
+
+                for proxy in proxies:
+                    status_icon = "[OK]" if proxy.status == "active" else "[X]"
+                    assigned = f" (used)" if proxy.assigned_account_id else ""
+                    label = f"{status_icon} {proxy.host}:{proxy.port}{assigned}"
+
+                    dpg.add_selectable(
+                        label=label,
+                        callback=self._on_proxy_selected,
+                        user_data=(account.id, proxy.id, dialog_tag)
+                    )
+
+            dpg.add_spacer(height=10)
+            dpg.add_button(
+                label="Cancel",
+                callback=lambda: dpg.delete_item(dialog_tag),
+                width=100
+            )
+
+    def _on_proxy_selected(self, sender, app_data, user_data) -> None:
+        """Handle proxy selection."""
+        account_id, proxy_id, dialog_tag = user_data
+
+        async def do_assign():
+            try:
+                if proxy_id is None:
+                    # Remove proxy assignment
+                    await self._controller.db.update_account(account_id, proxy_id=None)
+                    self._log(f"[Proxies] Removed proxy from account {account_id}")
+                else:
+                    await self._controller.db.assign_proxy(account_id, proxy_id)
+                    proxy = await self._controller.db.get_proxy(proxy_id)
+                    self._log(f"[Proxies] Assigned {proxy.host}:{proxy.port} to account {account_id}")
+
+                # Close dialog and refresh
+                self._schedule_ui(lambda: dpg.delete_item(dialog_tag) if dpg.does_item_exist(dialog_tag) else None)
+                self._schedule_ui(lambda: self._refresh_table_async())
+
+            except Exception as e:
+                logger.error("Assign proxy error: %s", e)
+                self._log(f"[Error] Assign: {e}")
+
+        self._run_async(do_assign())
 
     def _migrate_selected(self, sender=None, app_data=None) -> None:
         """Migrate all selected accounts."""
@@ -534,7 +748,92 @@ class TGWebAuthApp:
     def _migrate_all(self, sender=None, app_data=None) -> None:
         """Migrate all pending accounts."""
         self._log("[Migrate] Starting batch migration...")
-        # TODO: integrate with telegram_auth
+
+        async def do_migrate_all():
+            try:
+                accounts = await self._controller.db.list_accounts(status="pending")
+                if not accounts:
+                    self._log("[Migrate] No pending accounts")
+                    return
+
+                self._log(f"[Migrate] {len(accounts)} accounts to migrate...")
+
+                for account in accounts:
+                    self._log(f"[Migrate] {account.name}...")
+                    await self._controller.db.update_account(account.id, status="migrating")
+
+                    import subprocess
+                    args = ["python", "-m", "src.cli", "migrate", "--account", account.name, "--headless"]
+                    if self._2fa_password:
+                        args.extend(["--password", self._2fa_password])
+
+                    proc = subprocess.Popen(
+                        args,
+                        cwd=str(Path(__file__).parent.parent.parent),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True
+                    )
+
+                    stdout, _ = proc.communicate(timeout=300)
+
+                    if proc.returncode == 0:
+                        await self._controller.db.update_account(account.id, status="healthy")
+                        self._log(f"[Migrate] {account.name} - OK")
+                    else:
+                        await self._controller.db.update_account(account.id, status="error")
+                        self._log(f"[Migrate] {account.name} - FAILED")
+
+                self._log("[Migrate] Batch complete")
+                self._schedule_ui(lambda: self._refresh_table_async())
+
+            except Exception as e:
+                logger.error("Migrate all error: %s", e)
+                self._log(f"[Error] Migrate all: {e}")
+
+        self._run_async(do_migrate_all())
+
+    def _auto_assign_proxies(self, sender=None, app_data=None) -> None:
+        """Auto-assign free proxies to accounts without proxies."""
+        self._log("[Proxies] Auto-assigning...")
+
+        async def do_assign():
+            try:
+                # Get accounts without proxies
+                all_accounts = await self._controller.db.list_accounts()
+                accounts_without_proxy = [a for a in all_accounts if a.proxy_id is None]
+
+                if not accounts_without_proxy:
+                    self._log("[Proxies] All accounts have proxies assigned")
+                    return
+
+                assigned = 0
+                for account in accounts_without_proxy:
+                    # Get free proxy
+                    proxy = await self._controller.db.get_free_proxy()
+                    if not proxy:
+                        self._log(f"[Proxies] No free proxies left ({assigned} assigned)")
+                        break
+
+                    await self._controller.db.assign_proxy(account.id, proxy.id)
+                    assigned += 1
+                    self._log(f"[Proxies] {account.name} <- {proxy.host}:{proxy.port}")
+
+                self._log(f"[Proxies] Assigned {assigned} proxies")
+
+                # Refresh UI
+                accounts = await self._controller.search_accounts("")
+                stats = await self._controller.get_stats()
+                proxies = await self._controller.db.list_proxies()
+                proxies_map = {p.id: p for p in proxies}
+                self._schedule_ui(lambda: self._update_stats_sync(stats))
+                self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
+
+            except Exception as e:
+                logger.error("Auto-assign error: %s", e)
+                self._log(f"[Error] Auto-assign: {e}")
+
+        self._run_async(do_assign())
 
     def _show_proxy_import_dialog(self, sender=None, app_data=None) -> None:
         """Show proxy import - select file directly."""
@@ -612,9 +911,32 @@ class TGWebAuthApp:
         self._run_async(do_check())
 
     def _replace_dead_proxies(self, sender=None, app_data=None) -> None:
-        """Replace dead proxies with new ones."""
-        self._log("[Proxies] Replacing dead proxies...")
-        # TODO: implement proxy replacement
+        """Delete dead proxies from database."""
+        async def do_replace():
+            try:
+                proxies = await self._controller.db.list_proxies(status="dead")
+                if not proxies:
+                    self._log("[Proxies] No dead proxies to remove")
+                    return
+
+                count = 0
+                for proxy in proxies:
+                    await self._controller.db.delete_proxy(proxy.id)
+                    count += 1
+
+                self._log(f"[Proxies] Removed {count} dead proxies")
+
+                # Refresh UI
+                proxies = await self._controller.db.list_proxies()
+                stats = await self._controller.get_stats()
+                self._schedule_ui(lambda: self._update_proxies_table_sync(proxies))
+                self._schedule_ui(lambda: self._update_stats_sync(stats))
+
+            except Exception as e:
+                logger.error("Replace dead proxies error: %s", e)
+                self._log(f"[Error] Replace dead: {e}")
+
+        self._run_async(do_replace())
 
 
 def main():

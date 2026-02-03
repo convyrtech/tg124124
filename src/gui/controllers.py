@@ -82,10 +82,14 @@ class AppController:
     async def import_sessions(
         self,
         source_dir: Path,
-        on_progress: Optional[Callable[[int, int], None]] = None
-    ) -> int:
-        """Import session files from directory."""
+        on_progress: Optional[Callable[[int, int, str], None]] = None
+    ) -> tuple[int, int]:
+        """
+        Import session files from directory.
+        Returns: (imported_count, skipped_count)
+        """
         imported = 0
+        skipped = 0
         session_files = list(source_dir.glob("**/*.session"))
         total = len(session_files)
 
@@ -94,6 +98,14 @@ class AppController:
                 # Find associated files
                 account_dir = session_path.parent
                 name = account_dir.name
+
+                # Check if already exists
+                existing = await self.db.list_accounts(search=name)
+                if any(a.name == name for a in existing):
+                    skipped += 1
+                    if on_progress:
+                        on_progress(i + 1, total, f"skip: {name}")
+                    continue
 
                 # Copy to sessions directory
                 dest_dir = self.sessions_dir / name
@@ -107,6 +119,11 @@ class AppController:
                 if api_json.exists():
                     shutil.copy2(api_json, dest_dir / "api.json")
 
+                # Copy ___config.json if exists
+                config_json = account_dir / "___config.json"
+                if config_json.exists():
+                    shutil.copy2(config_json, dest_dir / "___config.json")
+
                 # Add to database
                 await self.db.add_account(
                     name=name,
@@ -116,12 +133,13 @@ class AppController:
                 imported += 1
 
                 if on_progress:
-                    on_progress(i + 1, total)
+                    on_progress(i + 1, total, f"ok: {name}")
 
             except Exception as e:
+                skipped += 1
                 logger.error("Failed to import %s: %s", session_path, e)
 
-        return imported
+        return imported, skipped
 
     async def import_proxies(self, proxy_list: str) -> int:
         """

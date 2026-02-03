@@ -55,7 +55,12 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Use sync sqlite3 for initial schema creation
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        # Enable WAL mode for better concurrency
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass  # WAL might already be set or locked
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -280,6 +285,14 @@ class Database:
         await self._connection.execute(
             "UPDATE proxies SET assigned_account_id = ? WHERE id = ?",
             (account_id, proxy_id)
+        )
+        await self._connection.commit()
+
+    async def delete_proxy(self, proxy_id: int) -> None:
+        """Delete proxy by ID."""
+        await self._connection.execute(
+            "DELETE FROM proxies WHERE id = ?",
+            (proxy_id,)
         )
         await self._connection.commit()
 
