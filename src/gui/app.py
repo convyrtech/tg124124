@@ -571,14 +571,34 @@ class TGWebAuthApp:
                     self._log(f"[Error] Account {account_id} not found")
                     return
 
-                self._log(f"[Open] Launching browser for {account.name}...")
+                # Extract profile name - handle "12345 (Name)" format
+                import re
+                profile_name = account.name
+                match = re.match(r'\d+\s*\((.+)\)', account.name)
+                if match:
+                    profile_name = match.group(1)
 
-                # Use CLI open command - Popen without communicate is non-blocking
+                self._log(f"[Open] Launching browser for {profile_name}...")
+
+                # Use CLI open command with captured output
                 proc = await asyncio.create_subprocess_exec(
-                    "python", "-m", "src.cli", "open", "--account", account.name,
-                    cwd=str(Path(__file__).parent.parent.parent)
+                    "python", "-m", "src.cli", "open", "--account", profile_name,
+                    cwd=str(Path(__file__).parent.parent.parent),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT
                 )
-                self._log(f"[Open] Browser started for {account.name} (pid={proc.pid})")
+
+                # Wait briefly and check for errors
+                try:
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                    output = stdout.decode('utf-8', errors='ignore') if stdout else ""
+                    if proc.returncode == 0:
+                        self._log(f"[Open] Browser opened for {profile_name}")
+                    else:
+                        self._log(f"[Open] Error: {output.strip()}")
+                except asyncio.TimeoutError:
+                    # Browser is running (didn't exit in 10s) - that's good
+                    self._log(f"[Open] Browser running for {profile_name} (pid={proc.pid})")
 
             except Exception as e:
                 logger.error("Open profile error: %s", e)
@@ -593,10 +613,17 @@ class TGWebAuthApp:
 
         async def do_migrate():
             try:
+                import re
                 account = await self._controller.db.get_account(account_id)
                 if not account:
                     self._log(f"[Error] Account {account_id} not found")
                     return
+
+                # Extract profile name - handle "12345 (Name)" format
+                profile_name = account.name
+                match = re.match(r'\d+\s*\((.+)\)', account.name)
+                if match:
+                    profile_name = match.group(1)
 
                 self._log(f"[Migrate] Starting {account.name}...")
 
@@ -605,7 +632,7 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._refresh_table_async())
 
                 # Run migration via CLI using ASYNC subprocess (non-blocking!)
-                args = ["python", "-m", "src.cli", "migrate", "--account", account.name, "--headless"]
+                args = ["python", "-m", "src.cli", "migrate", "--account", profile_name, "--headless"]
                 if self._2fa_password:
                     args.extend(["--password", self._2fa_password])
 
@@ -792,12 +819,19 @@ class TGWebAuthApp:
 
                 self._log(f"[Migrate] {len(accounts)} accounts to migrate...")
 
+                import re
                 for account in accounts:
+                    # Extract profile name - handle "12345 (Name)" format
+                    profile_name = account.name
+                    match = re.match(r'\d+\s*\((.+)\)', account.name)
+                    if match:
+                        profile_name = match.group(1)
+
                     self._log(f"[Migrate] {account.name}...")
                     await self._controller.db.update_account(account.id, status="migrating")
                     self._schedule_ui(lambda: self._refresh_table_async())
 
-                    args = ["python", "-m", "src.cli", "migrate", "--account", account.name, "--headless"]
+                    args = ["python", "-m", "src.cli", "migrate", "--account", profile_name, "--headless"]
                     if self._2fa_password:
                         args.extend(["--password", self._2fa_password])
 
