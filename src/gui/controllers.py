@@ -153,6 +153,7 @@ class AppController:
         """
         imported = 0
         skipped = 0
+        duplicates = 0
 
         for line in proxy_list.strip().split("\n"):
             line = line.strip()
@@ -176,11 +177,18 @@ class AppController:
                     logger.warning("Invalid proxy format: %s", line[:50])
 
             except Exception as e:
-                skipped += 1
-                logger.warning("Failed to parse proxy: %s - %s", line[:50], e)
+                error_str = str(e)
+                if "UNIQUE constraint" in error_str:
+                    duplicates += 1
+                    logger.debug("Proxy already exists: %s:%s", host, port)
+                else:
+                    skipped += 1
+                    logger.warning("Failed to import proxy: %s - %s", line[:50], e)
 
+        if duplicates > 0:
+            logger.info("Skipped %d duplicate proxies (already in DB)", duplicates)
         if skipped > 0:
-            logger.info("Imported %d proxies, skipped %d invalid", imported, skipped)
+            logger.warning("Failed to import %d proxies (invalid format)", skipped)
 
         return imported
 
