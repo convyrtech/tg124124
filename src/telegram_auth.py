@@ -16,6 +16,8 @@ import base64
 import json
 import io
 import logging
+import random
+import math
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any, Callable, Set, TYPE_CHECKING
@@ -49,7 +51,7 @@ try:
     from telethon import TelegramClient
     from telethon.sessions import SQLiteSession
     from telethon.tl.functions.auth import AcceptLoginTokenRequest
-    from telethon.errors import SessionPasswordNeededError
+    from telethon.errors import SessionPasswordNeededError, FloodWaitError
 except ImportError:
     logger.error("telethon not installed. Run: pip install telethon")
     exit(1)
@@ -775,15 +777,54 @@ class TelegramAuth:
         return None
 
     async def _accept_token(self, client: TelegramClient, token: bytes) -> bool:
-        """Отправляет acceptLoginToken для авторизации браузера"""
-        try:
-            logger.info("Accepting login token...")
-            result = await client(AcceptLoginTokenRequest(token=token))
-            logger.info(f"Token accepted! Authorization: {type(result).__name__}")
-            return True
-        except Exception as e:
-            logger.error(f"Error accepting token: {e}")
-            return False
+        """
+        Отправляет acceptLoginToken для авторизации браузера с FloodWaitError handling.
+
+        Реализует:
+        - FloodWaitError handling с ожиданием указанного времени
+        - Exponential backoff для других ошибок
+        - Максимум 3 попытки
+        """
+        max_retries = 3
+        base_delay = 5
+
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Accepting login token (attempt {attempt + 1}/{max_retries})...")
+                result = await client(AcceptLoginTokenRequest(token=token))
+                logger.info(f"Token accepted! Authorization: {type(result).__name__}")
+                return True
+
+            except FloodWaitError as e:
+                wait_time = e.seconds
+                logger.warning(
+                    f"FloodWaitError: must wait {wait_time}s "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+
+                # Если слишком долго ждать - прерываем
+                if wait_time > 300:  # 5 минут максимум
+                    logger.error(f"Flood wait {wait_time}s too long, aborting")
+                    return False
+
+                # Ждём указанное время + небольшой jitter
+                jitter = random.uniform(1, 5)
+                logger.info(f"Waiting {wait_time + jitter:.1f}s before retry...")
+                await asyncio.sleep(wait_time + jitter)
+
+            except Exception as e:
+                # Exponential backoff для других ошибок
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 3)
+                logger.warning(
+                    f"Error accepting token: {e}, "
+                    f"retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                )
+
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay)
+
+        logger.error("Failed to accept token after all retries")
+        return False
 
     async def _wait_for_auth_complete(self, page, timeout: int = AUTH_WAIT_TIMEOUT) -> Tuple[bool, bool]:
         """
@@ -885,12 +926,34 @@ class TelegramAuth:
             await page.click(visible_password_selector, timeout=5000)
             logger.debug("Clicked visible password input")
 
-            # Печатаем пароль
-            await page.type(visible_password_selector, password, delay=10)
-            logger.debug(f"Password typed ({len(password)} chars)")
+            # Human-like typing: печатаем символ за символом с рандомными задержками
+            # Имитирует реальный ввод человека (100-200ms между нажатиями)
+            prev_char = ''
+            for char in password:
+                # Базовая задержка 100-200ms, модифицируется от символа
+                base_delay = random.uniform(0.10, 0.20)
 
-            # Пауза перед Enter
-            await asyncio.sleep(0.3)
+                # Модификаторы для реалистичности:
+                # - Заглавные буквы и спецсимволы медленнее (Shift)
+                if char.isupper() or char in '!@#$%^&*()_+{}|:"<>?':
+                    base_delay *= random.uniform(1.2, 1.5)
+                # - Цифры немного медленнее (переключение внимания)
+                elif char.isdigit():
+                    base_delay *= random.uniform(1.1, 1.3)
+                # - Пробелы чуть медленнее (конец слова)
+                elif char == ' ':
+                    base_delay *= random.uniform(1.1, 1.2)
+
+                # Печатаем символ
+                await page.keyboard.type(char)
+                await asyncio.sleep(base_delay)
+                prev_char = char
+
+            logger.debug(f"Password typed with human-like delays ({len(password)} chars)")
+
+            # Пауза перед Enter (человек проверяет ввод)
+            think_time = random.uniform(0.3, 0.8)
+            await asyncio.sleep(think_time)
             await page.keyboard.press('Enter')
             logger.debug("Pressed Enter to submit")
 
@@ -1166,7 +1229,33 @@ class TelegramAuth:
 
 
 # FIX #6: MULTI-ACCOUNT COOLDOWN
-DEFAULT_ACCOUNT_COOLDOWN = 45  # секунд между аккаунтами
+DEFAULT_ACCOUNT_COOLDOWN = 45  # базовое значение в секундах
+MIN_COOLDOWN = 30  # минимальный cooldown
+MAX_COOLDOWN = 135  # максимальный cooldown
+
+
+def get_randomized_cooldown(base_cooldown: float = DEFAULT_ACCOUNT_COOLDOWN) -> float:
+    """
+    Генерирует randomized cooldown для избежания детекции паттернов.
+
+    Использует log-normal distribution с центром около base_cooldown.
+    Результат в диапазоне [MIN_COOLDOWN, MAX_COOLDOWN].
+
+    Args:
+        base_cooldown: Базовое значение cooldown в секундах
+
+    Returns:
+        Randomized cooldown в секундах
+    """
+    # Log-normal distribution: большинство значений около base_cooldown,
+    # но с длинным хвостом для редких длинных пауз
+    mu = math.log(base_cooldown) - 0.5 * 0.3**2  # Корректировка для среднего
+    sigma = 0.3  # Стандартное отклонение в log-space
+
+    delay = random.lognormvariate(mu, sigma)
+
+    # Ограничиваем диапазон
+    return max(MIN_COOLDOWN, min(delay, MAX_COOLDOWN))
 
 
 async def migrate_account(
@@ -1222,10 +1311,11 @@ async def migrate_accounts_batch(
         )
         results.append(result)
 
-        # FIX #6: Cooldown между аккаунтами (кроме последнего)
+        # FIX #6: Randomized cooldown между аккаунтами (кроме последнего)
         if i < len(account_dirs) - 1:
-            logger.info(f"Cooldown {cooldown}s before next account...")
-            await asyncio.sleep(cooldown)
+            jittered_cooldown = get_randomized_cooldown(cooldown)
+            logger.info(f"Cooldown {jittered_cooldown:.1f}s before next account (base: {cooldown}s)...")
+            await asyncio.sleep(jittered_cooldown)
 
     return results
 
@@ -1362,9 +1452,10 @@ class ParallelMigrationController:
             task.add_done_callback(self._active_tasks.discard)
             tasks.append(task)
 
-            # Rate limiting
+            # Rate limiting with jitter to avoid pattern detection
             if i < len(account_dirs) - 1 and self.cooldown > 0:
-                await asyncio.sleep(self.cooldown)
+                jittered = get_randomized_cooldown(self.cooldown)
+                await asyncio.sleep(jittered)
 
         # Wait for all started tasks
         if tasks:
@@ -1441,14 +1532,15 @@ async def migrate_accounts_parallel(
 
             return result
 
-    # Create tasks with staggered start (rate limiting)
+    # Create tasks with staggered start (rate limiting with jitter)
     tasks = []
     for i, account_dir in enumerate(account_dirs):
         task = asyncio.create_task(migrate_with_semaphore(i, account_dir))
         tasks.append(task)
-        # Stagger task creation to avoid thundering herd
+        # Stagger task creation with randomized delay to avoid pattern detection
         if i < len(account_dirs) - 1 and cooldown > 0:
-            await asyncio.sleep(cooldown)
+            jittered = get_randomized_cooldown(cooldown)
+            await asyncio.sleep(jittered)
 
     # Wait for all to complete
     await asyncio.gather(*tasks, return_exceptions=True)

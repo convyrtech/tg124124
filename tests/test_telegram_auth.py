@@ -12,6 +12,10 @@ from src.telegram_auth import (
     AuthResult,
     decode_qr_from_screenshot,
     parse_telethon_proxy,
+    get_randomized_cooldown,
+    MIN_COOLDOWN,
+    MAX_COOLDOWN,
+    DEFAULT_ACCOUNT_COOLDOWN,
 )
 
 
@@ -511,3 +515,103 @@ class TestParallelMigration:
         )
 
         assert controller.resource_monitor is monitor
+
+
+class TestRandomizedCooldown:
+    """Tests for randomized cooldown function."""
+
+    def test_cooldown_in_range(self):
+        """Test that cooldown values are within expected range."""
+        for _ in range(100):
+            cooldown = get_randomized_cooldown()
+            assert MIN_COOLDOWN <= cooldown <= MAX_COOLDOWN
+
+    def test_cooldown_varies(self):
+        """Test that cooldown values are not fixed (have variance)."""
+        values = [get_randomized_cooldown() for _ in range(50)]
+        unique_values = set(values)
+        # Should have significant variance
+        assert len(unique_values) > 10, "Cooldown should vary significantly"
+
+    def test_cooldown_respects_base(self):
+        """Test that base_cooldown affects the distribution."""
+        # With low base, values should trend lower
+        low_values = [get_randomized_cooldown(35) for _ in range(50)]
+        # With high base, values should trend higher
+        high_values = [get_randomized_cooldown(90) for _ in range(50)]
+
+        avg_low = sum(low_values) / len(low_values)
+        avg_high = sum(high_values) / len(high_values)
+
+        # High base should give higher average
+        assert avg_high > avg_low
+
+    def test_cooldown_never_negative(self):
+        """Test that cooldown is never negative."""
+        for _ in range(100):
+            cooldown = get_randomized_cooldown(10)  # Low base
+            assert cooldown >= MIN_COOLDOWN
+            assert cooldown > 0
+
+
+class TestFloodWaitHandling:
+    """Tests for FloodWaitError handling in _accept_token."""
+
+    @pytest.fixture
+    def mock_account(self, tmp_path):
+        """Create mock account config."""
+        account_dir = tmp_path / "test"
+        account_dir.mkdir()
+        (account_dir / "session.session").touch()
+
+        with open(account_dir / "api.json", 'w') as f:
+            json.dump({"api_id": 123, "api_hash": "hash"}, f)
+
+        return AccountConfig.load(account_dir)
+
+    @pytest.mark.asyncio
+    async def test_accept_token_handles_floodwait(self, mock_account):
+        """Test that FloodWaitError is handled with retry."""
+        from src.telegram_auth import TelegramAuth
+        from telethon.errors import FloodWaitError
+
+        auth = TelegramAuth(mock_account)
+
+        # Track call count via side_effect list
+        call_count = [0]
+
+        def create_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                error = FloodWaitError(request=None, message="FLOOD_WAIT", code=420)
+                error.seconds = 1  # Short wait for testing
+                raise error
+            return MagicMock()
+
+        # Use side_effect on AsyncMock - this is how to control async callable behavior
+        mock_client = AsyncMock(side_effect=create_side_effect)
+
+        result = await auth._accept_token(mock_client, b"test_token")
+
+        assert result is True
+        assert call_count[0] == 2  # First failed, second succeeded
+
+    @pytest.mark.asyncio
+    async def test_accept_token_aborts_long_floodwait(self, mock_account):
+        """Test that very long FloodWait aborts instead of waiting."""
+        from src.telegram_auth import TelegramAuth
+        from telethon.errors import FloodWaitError
+
+        auth = TelegramAuth(mock_account)
+
+        def raise_long_flood(*args, **kwargs):
+            error = FloodWaitError(request=None, message="FLOOD_WAIT", code=420)
+            error.seconds = 3600  # 1 hour - too long
+            raise error
+
+        mock_client = AsyncMock(side_effect=raise_long_flood)
+
+        result = await auth._accept_token(mock_client, b"test_token")
+
+        # Should abort, not wait 1 hour
+        assert result is False

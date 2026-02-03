@@ -43,8 +43,32 @@ class ProxyRecord:
     created_at: datetime
 
 
+@dataclass
+class MigrationRecord:
+    """Migration history record."""
+    id: int
+    account_id: int
+    started_at: datetime
+    completed_at: Optional[datetime]
+    success: Optional[bool]
+    error_message: Optional[str]
+    profile_path: Optional[str]
+
+
 class Database:
     """SQLite database manager for TG Web Auth."""
+
+    # Whitelist of allowed fields for update_account to prevent SQL injection
+    ALLOWED_ACCOUNT_FIELDS = {
+        'name', 'phone', 'username', 'session_path',
+        'proxy_id', 'status', 'last_check', 'error_message'
+    }
+
+    # Whitelist for update_proxy
+    ALLOWED_PROXY_FIELDS = {
+        'host', 'port', 'username', 'password', 'protocol',
+        'status', 'assigned_account_id', 'last_check'
+    }
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -197,9 +221,14 @@ class Database:
             ]
 
     async def update_account(self, account_id: int, **kwargs) -> None:
-        """Update account fields."""
+        """Update account fields with SQL injection protection."""
         if not kwargs:
             return
+
+        # Validate field names against whitelist
+        invalid_fields = set(kwargs.keys()) - self.ALLOWED_ACCOUNT_FIELDS
+        if invalid_fields:
+            raise ValueError(f"Invalid account fields: {invalid_fields}")
 
         fields = ", ".join(f"{k} = ?" for k in kwargs.keys())
         values = list(kwargs.values()) + [account_id]
@@ -297,9 +326,14 @@ class Database:
         await self._connection.commit()
 
     async def update_proxy(self, proxy_id: int, **kwargs) -> None:
-        """Update proxy fields."""
+        """Update proxy fields with SQL injection protection."""
         if not kwargs:
             return
+
+        # Validate field names against whitelist
+        invalid_fields = set(kwargs.keys()) - self.ALLOWED_PROXY_FIELDS
+        if invalid_fields:
+            raise ValueError(f"Invalid proxy fields: {invalid_fields}")
 
         # Add last_check timestamp when status changes
         if "status" in kwargs:
@@ -357,3 +391,167 @@ class Database:
                 )
                 for row in rows
             ]
+
+    # ==================== Migration Tracking ====================
+
+    async def start_migration(self, account_id: int) -> int:
+        """
+        Record migration start. Returns migration record ID.
+
+        Updates account status to 'migrating'.
+        """
+        # Update account status
+        await self.update_account(account_id, status="migrating")
+
+        # Create migration record
+        async with self._connection.execute(
+            """
+            INSERT INTO migrations (account_id, started_at)
+            VALUES (?, datetime('now'))
+            """,
+            (account_id,)
+        ) as cursor:
+            await self._connection.commit()
+            return cursor.lastrowid
+
+    async def complete_migration(
+        self,
+        migration_id: int,
+        success: bool,
+        error_message: Optional[str] = None,
+        profile_path: Optional[str] = None
+    ) -> None:
+        """
+        Record migration completion.
+
+        Updates account status to 'healthy' or 'error'.
+        """
+        await self._connection.execute(
+            """
+            UPDATE migrations
+            SET completed_at = datetime('now'),
+                success = ?,
+                error_message = ?,
+                profile_path = ?
+            WHERE id = ?
+            """,
+            (1 if success else 0, error_message, profile_path, migration_id)
+        )
+        await self._connection.commit()
+
+        # Get account_id from migration record
+        async with self._connection.execute(
+            "SELECT account_id FROM migrations WHERE id = ?",
+            (migration_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                account_id = row["account_id"]
+                # Update account status
+                new_status = "healthy" if success else "error"
+                await self.update_account(
+                    account_id,
+                    status=new_status,
+                    error_message=error_message
+                )
+
+    async def get_pending_migrations(self) -> List[AccountRecord]:
+        """
+        Get accounts that need migration (status='pending' or incomplete migration).
+
+        Used for resume after crash.
+        """
+        # Get accounts with status 'pending' or 'migrating' (interrupted)
+        return await self.list_accounts(status="pending")
+
+    async def get_incomplete_migrations(self) -> List[MigrationRecord]:
+        """
+        Get migrations that started but never completed.
+
+        These indicate crashes during migration.
+        """
+        async with self._connection.execute(
+            """
+            SELECT * FROM migrations
+            WHERE completed_at IS NULL
+            ORDER BY started_at DESC
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                MigrationRecord(
+                    id=row["id"],
+                    account_id=row["account_id"],
+                    started_at=row["started_at"],
+                    completed_at=row["completed_at"],
+                    success=bool(row["success"]) if row["success"] is not None else None,
+                    error_message=row["error_message"],
+                    profile_path=row["profile_path"]
+                )
+                for row in rows
+            ]
+
+    async def reset_interrupted_migrations(self) -> int:
+        """
+        Reset accounts that were 'migrating' but migration never completed.
+
+        Returns count of reset accounts.
+        """
+        # Find incomplete migrations
+        incomplete = await self.get_incomplete_migrations()
+
+        count = 0
+        for migration in incomplete:
+            # Mark migration as failed
+            await self._connection.execute(
+                """
+                UPDATE migrations
+                SET completed_at = datetime('now'),
+                    success = 0,
+                    error_message = 'Interrupted - reset on restart'
+                WHERE id = ?
+                """,
+                (migration.id,)
+            )
+
+            # Reset account status to pending
+            await self._connection.execute(
+                """
+                UPDATE accounts
+                SET status = 'pending',
+                    error_message = 'Previous migration interrupted'
+                WHERE id = ? AND status = 'migrating'
+                """,
+                (migration.account_id,)
+            )
+            count += 1
+
+        if count > 0:
+            await self._connection.commit()
+            logger.info(f"Reset {count} interrupted migrations")
+
+        return count
+
+    async def get_migration_stats(self) -> dict:
+        """Get migration statistics."""
+        stats = {
+            "total": 0,
+            "pending": 0,
+            "migrating": 0,
+            "healthy": 0,
+            "error": 0,
+            "success_rate": 0.0
+        }
+
+        accounts = await self.list_accounts()
+        stats["total"] = len(accounts)
+
+        for acc in accounts:
+            if acc.status in stats:
+                stats[acc.status] += 1
+
+        completed = stats["healthy"] + stats["error"]
+        if completed > 0:
+            stats["success_rate"] = stats["healthy"] / completed * 100
+
+        return stats

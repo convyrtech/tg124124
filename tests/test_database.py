@@ -141,3 +141,186 @@ class TestDatabase:
             assert free2.id != free.id
         finally:
             await db.close()
+
+    @pytest.mark.asyncio
+    async def test_migration_tracking(self, db_path):
+        """Test migration state persistence."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            # Add account
+            account_id = await db.add_account(
+                name="Test Account",
+                session_path="/test.session"
+            )
+
+            # Start migration
+            migration_id = await db.start_migration(account_id)
+            assert migration_id > 0
+
+            # Account should be 'migrating'
+            account = await db.get_account(account_id)
+            assert account.status == "migrating"
+
+            # Complete migration successfully
+            await db.complete_migration(
+                migration_id,
+                success=True,
+                profile_path="/profiles/test"
+            )
+
+            # Account should be 'healthy'
+            account = await db.get_account(account_id)
+            assert account.status == "healthy"
+
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_migration_failure_tracking(self, db_path):
+        """Test migration failure is tracked correctly."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            account_id = await db.add_account(
+                name="Failing Account",
+                session_path="/fail.session"
+            )
+
+            migration_id = await db.start_migration(account_id)
+
+            # Complete migration with failure
+            await db.complete_migration(
+                migration_id,
+                success=False,
+                error_message="QR decode failed"
+            )
+
+            # Account should be 'error' with message
+            account = await db.get_account(account_id)
+            assert account.status == "error"
+            assert account.error_message == "QR decode failed"
+
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_reset_interrupted_migrations(self, db_path):
+        """Test that interrupted migrations can be reset."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            # Create account and start migration (don't complete)
+            account_id = await db.add_account(
+                name="Interrupted",
+                session_path="/interrupted.session"
+            )
+            await db.start_migration(account_id)
+
+            # Verify it's migrating
+            account = await db.get_account(account_id)
+            assert account.status == "migrating"
+
+            # Get incomplete migrations
+            incomplete = await db.get_incomplete_migrations()
+            assert len(incomplete) == 1
+
+            # Reset interrupted
+            count = await db.reset_interrupted_migrations()
+            assert count == 1
+
+            # Account should be back to pending
+            account = await db.get_account(account_id)
+            assert account.status == "pending"
+
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_update_account_sql_injection_protection(self, db_path):
+        """Test that SQL injection via field names is blocked."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            account_id = await db.add_account(
+                name="Test",
+                session_path="/test.session"
+            )
+
+            # Try to inject via field name
+            with pytest.raises(ValueError, match="Invalid account fields"):
+                await db.update_account(
+                    account_id,
+                    **{"name = 'hacked'; DROP TABLE accounts; --": "value"}
+                )
+
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_update_proxy_sql_injection_protection(self, db_path):
+        """Test that SQL injection via proxy field names is blocked."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            proxy_id = await db.add_proxy(
+                host="1.1.1.1",
+                port=1080
+            )
+
+            # Try to inject via field name
+            with pytest.raises(ValueError, match="Invalid proxy fields"):
+                await db.update_proxy(
+                    proxy_id,
+                    **{"host = '1.1.1.1'; DROP TABLE proxies; --": "value"}
+                )
+
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_migration_stats(self, db_path):
+        """Test migration statistics."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            # Add accounts with various statuses
+            await db.add_account(name="A1", session_path="/a1.session", status="pending")
+            await db.add_account(name="A2", session_path="/a2.session", status="healthy")
+            await db.add_account(name="A3", session_path="/a3.session", status="healthy")
+            await db.add_account(name="A4", session_path="/a4.session", status="error")
+
+            stats = await db.get_migration_stats()
+
+            assert stats["total"] == 4
+            assert stats["pending"] == 1
+            assert stats["healthy"] == 2
+            assert stats["error"] == 1
+            assert stats["success_rate"] == pytest.approx(66.67, rel=0.1)
+
+        finally:
+            await db.close()
