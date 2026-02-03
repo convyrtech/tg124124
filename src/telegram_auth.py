@@ -18,6 +18,8 @@ import io
 import logging
 import random
 import math
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any, Callable, Set, TYPE_CHECKING
@@ -422,7 +424,7 @@ class TelegramAuth:
     TELEGRAM_WEB_URL = "https://web.telegram.org/k/"
     QR_WAIT_TIMEOUT = 30  # секунд ждать появления QR
     AUTH_WAIT_TIMEOUT = 120  # секунд ждать завершения авторизации
-    QR_MAX_RETRIES = 3  # FIX #4: QR retry
+    QR_MAX_RETRIES = 5  # FIX-008: Увеличено с 3 до 5 для надёжности
     QR_RETRY_DELAY = 5  # секунд между retry
 
     def __init__(self, account: AccountConfig, browser_manager: Optional[BrowserManager] = None):
@@ -431,9 +433,27 @@ class TelegramAuth:
         self._client: Optional[TelegramClient] = None
 
     async def _create_telethon_client(self) -> TelegramClient:
-        """Создаёт Telethon client из существующей сессии с синхронизированным device"""
+        """
+        Создаёт Telethon client из существующей сессии с синхронизированным device.
+
+        FIX-002: Включает WAL режим для SQLite чтобы избежать "database locked".
+        FIX-006: Добавлен timeout на connect().
+        """
         proxy = parse_telethon_proxy(self.account.proxy)
         device = self.account.device
+
+        # FIX-002: Включить WAL режим для SQLite session перед открытием
+        # Это позволяет параллельное чтение и уменьшает блокировки
+        session_path = self.account.session_path
+        if session_path.exists():
+            try:
+                conn = sqlite3.connect(str(session_path), timeout=10)
+                conn.execute('PRAGMA journal_mode=WAL')
+                conn.execute('PRAGMA busy_timeout=10000')  # 10 секунд ожидания
+                conn.close()
+                logger.debug("SQLite WAL mode enabled for session")
+            except sqlite3.Error as e:
+                logger.warning(f"Could not set WAL mode for session: {e}")
 
         # FIX #3: DEVICE SYNC - передаём device параметры
         client = TelegramClient(
@@ -448,9 +468,14 @@ class TelegramAuth:
             system_lang_code=device.system_lang_code,
         )
 
-        await client.connect()
+        # FIX-006: Timeout на connect() чтобы не зависать навечно
+        try:
+            await asyncio.wait_for(client.connect(), timeout=30)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Telethon connect timeout after 30s")
 
         if not await client.is_user_authorized():
+            await client.disconnect()
             raise RuntimeError("Session is not authorized. Cannot proceed with QR login.")
 
         # Получаем инфо о текущем пользователе (без логирования sensitive data)
@@ -487,28 +512,105 @@ class TelegramAuth:
         try:
             # Проверяем URL
             current_url = page.url
+            logger.debug(f"Checking page state, URL: {current_url}")
 
-            # Проверяем авторизован ли пользователь (в чатах)
-            # Используем расширенный набор селекторов для Telegram Web K
-            if '/k/#' in current_url or '/a/#' in current_url:
-                # Проверяем наличие chat list или search input (признаки авторизации)
-                chat_list = await page.query_selector(
-                    '.chatlist, .chat-list, [class*="ChatList"], '
-                    '[class*="chat-list"], [class*="dialogs"], '
-                    '.folders-tabs, .chats-container'
-                )
-                search_input = await page.query_selector(
-                    'input[placeholder="Search"], .input-search, '
-                    '[class*="SearchInput"], [data-peer-id]'
-                )
-                if chat_list or search_input:
-                    try:
-                        is_visible = (await chat_list.is_visible()) if chat_list else (await search_input.is_visible())
-                        if is_visible:
-                            return "authorized"
-                    except Exception:
-                        # Element found but visibility check failed - still likely authorized
+            # FIX-010: Улучшенная детекция "authorized" состояния
+            # Проверяем признаки авторизованного состояния:
+            # 1. Наличие chat items (li с peer-id)
+            # 2. Наличие sidebar/columns
+            # 3. Наличие avatar/user info
+            # 4. URL patterns
+
+            # Метод 1: Проверяем наличие chat items (самый надёжный индикатор)
+            chat_items = await page.query_selector(
+                '[data-peer-id], '                    # Chat items with peer ID
+                '.chatlist-chat, '                    # Individual chats
+                'li.chatlist-chat, '                  # Chat list items
+                '.dialog, '                           # Dialog elements
+                '[class*="ListItem"][class*="Chat"]'  # Generic chat list items
+            )
+            if chat_items:
+                try:
+                    is_visible = await chat_items.is_visible()
+                    if is_visible:
+                        logger.debug("Authorized: found visible chat items")
                         return "authorized"
+                except Exception:
+                    # Element exists - likely authorized
+                    logger.debug("Authorized: chat items found (visibility check failed)")
+                    return "authorized"
+
+            # Метод 2: Проверяем структуру страницы (columns/sidebar)
+            columns = await page.query_selector(
+                '.tabs-tab, '                        # Tab navigation
+                '.sidebar, '                          # Sidebar
+                '#column-left, '                      # Left column
+                '.chats-container, '                  # Chats container
+                '.folders-tabs, '                     # Folder tabs
+                '[class*="LeftColumn"], '             # Left column variations
+                '[class*="ChatFolders"]'              # Chat folders
+            )
+            if columns:
+                try:
+                    is_visible = await columns.is_visible()
+                    if is_visible:
+                        logger.debug("Authorized: found visible columns/sidebar")
+                        return "authorized"
+                except Exception:
+                    pass
+
+            # Метод 3: Проверяем наличие аватара пользователя в шапке (признак авторизации)
+            user_avatar = await page.query_selector(
+                '.avatar-like-icon, '                # User avatar
+                '[class*="Avatar"], '                 # Avatar component
+                '.profile-photo, '                    # Profile photo
+                '.menu-toggle'                        # Menu toggle (only in authorized state)
+            )
+            if user_avatar:
+                try:
+                    is_visible = await user_avatar.is_visible()
+                    if is_visible:
+                        # Дополнительно проверяем что это не аватар в QR login
+                        qr_container = await page.query_selector('.auth-image, [class*="qr"]')
+                        if not qr_container:
+                            logger.debug("Authorized: found visible user avatar")
+                            return "authorized"
+                except Exception:
+                    pass
+
+            # Метод 4: Проверяем URL pattern (после авторизации URL меняется)
+            # /k/#@ или /a/#@ - указывает на конкретный чат
+            # /k/# без дополнительных параметров после # может быть и login и main page
+            if ('@' in current_url) or ('/k/#-' in current_url) or ('/a/#-' in current_url):
+                logger.debug(f"Authorized: URL pattern indicates chat view: {current_url}")
+                return "authorized"
+
+            # Метод 5: Проверяем через JavaScript наличие активной сессии
+            try:
+                has_session = await page.evaluate("""
+                    () => {
+                        // Check if app is initialized and has user
+                        try {
+                            // Telegram Web K stores user in various places
+                            if (window.App && window.App.managers && window.App.managers.appUsersManager) {
+                                const self = window.App.managers.appUsersManager.getSelf();
+                                if (self && self.id) return true;
+                            }
+                            // Check localStorage for auth state
+                            const authState = localStorage.getItem('authState') || localStorage.getItem('auth_state');
+                            if (authState && authState.includes('"userId"')) return true;
+                            // Check for user_auth in IDB (indirect check via DOM)
+                            const chatList = document.querySelector('[data-peer-id]');
+                            if (chatList) return true;
+                        } catch (e) {}
+                        return false;
+                    }
+                """)
+                if has_session:
+                    logger.debug("Authorized: JavaScript check confirmed session")
+                    return "authorized"
+            except Exception as e:
+                logger.debug(f"JS session check error: {e}")
 
             # ВАЖНО: Проверяем 2FA форму РАНЬШЕ чем QR (на странице 2FA тоже может быть canvas)
             password_input = await page.query_selector('input[type="password"]')
@@ -516,38 +618,54 @@ class TelegramAuth:
                 try:
                     is_visible = await password_input.is_visible()
                     if is_visible:
+                        logger.debug("2FA required: password input visible")
                         return "2fa_required"
                 except Exception:
                     pass
 
             # Проверяем текст "Enter Your Password" на странице
-            page_text = await page.inner_text('body')
-            if 'Enter Your Password' in page_text or 'password' in page_text.lower():
-                return "2fa_required"
+            try:
+                page_text = await page.inner_text('body')
+                if 'Enter Your Password' in page_text or 'Two-Step Verification' in page_text:
+                    logger.debug("2FA required: password text found")
+                    return "2fa_required"
+            except Exception:
+                pass
 
-            # Проверяем QR код (только если это не 2FA страница)
+            # Проверяем QR код (только если это не 2FA страница и не authorized)
             qr_canvas = await page.query_selector('canvas')
             if qr_canvas:
                 try:
                     is_visible = await qr_canvas.is_visible()
                     if is_visible:
-                        # Дополнительно проверяем что это QR login page
-                        qr_text = await page.inner_text('body')
-                        if 'scan' in qr_text.lower() or 'qr' in qr_text.lower() or 'log in' in qr_text.lower():
-                            return "qr_login"
+                        # Дополнительно проверяем что это QR login page по тексту
+                        try:
+                            qr_text = await page.inner_text('body')
+                            # QR login page has specific text
+                            qr_indicators = ['scan', 'qr', 'log in', 'phone', 'quick']
+                            if any(ind in qr_text.lower() for ind in qr_indicators):
+                                logger.debug("QR login: canvas and login text found")
+                                return "qr_login"
+                        except Exception:
+                            pass
+                        # Canvas visible but no clear login text - might still be login
+                        logger.debug("QR login: canvas visible (no clear text)")
+                        return "qr_login"
                 except Exception:
                     pass
 
             # Проверяем индикатор загрузки
-            spinner = await page.query_selector('[class*="spinner"], [class*="loading"]')
+            spinner = await page.query_selector('[class*="spinner"], [class*="loading"], [class*="preloader"]')
             if spinner:
                 try:
                     is_visible = await spinner.is_visible()
                     if is_visible:
+                        logger.debug("Loading: spinner visible")
                         return "loading"
                 except Exception:
                     pass
 
+            logger.debug("Unknown page state")
             return "unknown"
 
         except Exception as e:
@@ -728,14 +846,55 @@ class TelegramAuth:
 
         return None
 
+    def _is_screenshot_bytes(self, data: bytes) -> bool:
+        """
+        FIX-001: Проверяет является ли data изображением (screenshot).
+
+        Проверяет magic bytes для PNG, JPEG, GIF форматов.
+        """
+        if len(data) < 8:
+            return False
+
+        # PNG magic: 89 50 4E 47 0D 0A 1A 0A
+        if data[:8] == b'\x89PNG\r\n\x1a\n':
+            return True
+
+        # JPEG magic: FF D8 FF
+        if data[:3] == b'\xff\xd8\xff':
+            return True
+
+        # GIF magic: GIF87a or GIF89a
+        if data[:6] in (b'GIF87a', b'GIF89a'):
+            return True
+
+        return False
+
+    def _is_tg_url_token(self, data: bytes) -> bool:
+        """
+        FIX-001: Проверяет является ли data tg://login?token=... URL.
+        """
+        try:
+            text = data.decode('utf-8', errors='strict')
+            if 'tg://login?token=' in text:
+                token_part = text.split('token=')[1].split('&')[0]
+                if 20 <= len(token_part) <= 100:
+                    return True
+            return False
+        except (UnicodeDecodeError, IndexError):
+            return False
+
     async def _extract_qr_token_with_retry(self, page) -> Optional[bytes]:
         """
         FIX #4: QR RETRY - извлекает QR токен с повторными попытками.
 
         Поддерживает два варианта ответа от _wait_for_qr:
-        1. Token bytes - если JS успешно извлёк токен
+        1. Token bytes - если JS успешно извлёк токен (tg://login?token=...)
         2. Screenshot bytes - для декодирования через pyzbar
+
+        FIX-001: Используем проверку формата вместо размера для определения типа.
         """
+        profile_name = self.account.name.replace(' ', '_').replace('/', '_')
+
         for retry in range(self.QR_MAX_RETRIES):
             if retry > 0:
                 logger.info(f"QR retry {retry + 1}/{self.QR_MAX_RETRIES}...")
@@ -752,27 +911,38 @@ class TelegramAuth:
                 logger.warning(f"QR not found on page (attempt {retry + 1})")
                 continue
 
-            # Проверяем что вернулось - token bytes или screenshot
-            # Token обычно < 100 байт, screenshot > 10KB
-            if len(result) < 500:
-                # Это уже готовый token bytes
-                logger.info(f"Token extracted via JS ({len(result)} bytes)")
-                return result
-            else:
-                # Это screenshot, нужно декодировать
-                token = decode_qr_from_screenshot(result)
+            # FIX-001: Определяем тип данных по содержимому
+            # 1. Если это tg:// URL - извлекаем token
+            # 2. Если это изображение (PNG/JPEG) - декодируем QR
+            # 3. Иначе - это уже raw token bytes
 
+            if self._is_tg_url_token(result):
+                # tg://login?token=... URL - извлекаем token bytes
+                token = extract_token_from_tg_url(result.decode('utf-8'))
+                if token:
+                    logger.info(f"Token extracted from URL ({len(token)} bytes)")
+                    return token
+
+            elif self._is_screenshot_bytes(result):
+                # Это screenshot, декодируем QR
+                token = decode_qr_from_screenshot(result)
                 if token:
                     logger.info(f"Token extracted from screenshot ({len(token)} bytes)")
                     return token
                 else:
                     logger.warning(f"Failed to decode QR from screenshot (attempt {retry + 1})")
-                    # Сохраняем debug скриншот
-                    debug_path = Path("profiles") / f"debug_qr_retry_{retry}.png"
+                    # FIX-009: Сохраняем debug скриншот с timestamp
+                    timestamp = datetime.now().strftime('%H%M%S')
+                    debug_path = Path("profiles") / f"debug_qr_{profile_name}_{timestamp}_r{retry}.png"
                     debug_path.parent.mkdir(parents=True, exist_ok=True)
                     with open(debug_path, 'wb') as f:
                         f.write(result)
-                    logger.debug(f"Debug screenshot saved: {debug_path}")
+                    logger.info(f"Debug screenshot saved: {debug_path}")
+
+            else:
+                # Это уже raw token bytes (например, после canvas decode)
+                logger.info(f"Token already decoded ({len(result)} bytes)")
+                return result
 
         return None
 
@@ -877,107 +1047,127 @@ class TelegramAuth:
         return (False, False)
 
     async def _handle_2fa(self, page, password: str) -> bool:
-        """Вводит 2FA пароль"""
+        """
+        FIX-005: Улучшенный ввод 2FA пароля.
+
+        Изменения:
+        - Расширенный список селекторов (Telegram Web K/A)
+        - Проверка visibility + enabled + bounding_box
+        - Использование НАЙДЕННОГО селектора (не hardcoded)
+        - Упрощённый ввод (delay=50ms)
+        - Debug скриншоты с timestamp
+        """
         logger.info("Entering 2FA password...")
 
-        # Ждём появления поля ввода пароля (до 10 секунд)
-        password_input = None
+        # FIX-005: Расширенный список селекторов для разных версий Telegram Web
         password_selectors = [
-            'input[type="password"].input-field-input',  # Telegram Web K visible input
+            'input[type="password"].input-field-input',  # Telegram Web K
             'input[name="notsearch_password"]',          # Telegram Web K by name
-            'input[type="password"]:not(.stealthy)',     # Exclude hidden stealthy inputs
+            'input[type="password"]:not(.stealthy)',     # Exclude hidden inputs
             '.input-field-input[type="password"]',
             'input[placeholder="Password"]',
             'input[placeholder*="assword"]',
+            'input[autocomplete="current-password"]',
+            # Telegram Web A / mobile
+            'input.PasswordForm__input',
+            'input[data-test="password-input"]',
+            # Generic fallbacks
+            'input[type="password"]',
         ]
 
-        for attempt in range(10):
+        found_selector = None
+        password_input = None
+
+        # FIX-005: Увеличено время ожидания с 10 до 15 секунд
+        for attempt in range(15):
             for selector in password_selectors:
                 try:
-                    password_input = await page.query_selector(selector)
-                    if password_input:
-                        # Проверяем что элемент видим
-                        is_visible = await password_input.is_visible()
-                        if is_visible:
-                            logger.debug(f"Found password input with selector: {selector}")
+                    element = await page.query_selector(selector)
+                    if element:
+                        # FIX-005: Проверяем visibility + enabled + bounding_box
+                        is_visible = await element.is_visible()
+                        is_enabled = await element.is_enabled()
+                        box = await element.bounding_box()
+
+                        if is_visible and is_enabled and box and box['width'] > 0:
+                            password_input = element
+                            found_selector = selector
+                            logger.debug(f"Found password input: {selector}")
                             break
-                        else:
-                            password_input = None
                 except Exception:
                     continue
+
             if password_input:
                 break
             await asyncio.sleep(1)
-            if attempt % 3 == 0 and attempt > 0:
-                logger.debug(f"Still looking for password field... ({attempt}s)")
+            if attempt % 5 == 0 and attempt > 0:
+                logger.debug(f"Looking for password field... ({attempt}s)")
 
-        if not password_input:
-            # Сохраним скриншот для отладки
-            debug_path = Path("profiles") / "debug_2fa_form.png"
+        if not password_input or not found_selector:
+            # Debug screenshot с timestamp
+            timestamp = datetime.now().strftime('%H%M%S')
+            debug_path = Path("profiles") / f"debug_2fa_notfound_{timestamp}.png"
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
             await page.screenshot(path=str(debug_path))
-            logger.error(f"Password input not found! Screenshot saved to {debug_path}")
+            logger.error(f"Password input not found! Screenshot: {debug_path}")
             return False
 
         try:
-            # Используем точный селектор для видимого поля (не stealthy)
-            visible_password_selector = 'input[type="password"].input-field-input'
+            # FIX-005: Используем НАЙДЕННЫЙ селектор, не hardcoded
+            await page.click(found_selector, timeout=5000)
+            await asyncio.sleep(0.3)
+            logger.debug("Clicked password input")
 
-            # Кликаем на ВИДИМОЕ поле пароля
-            await page.click(visible_password_selector, timeout=5000)
-            logger.debug("Clicked visible password input")
+            # FIX-005: Упрощённый ввод - быстрый но с небольшой задержкой
+            # 50ms delay достаточен для большинства сайтов
+            await page.keyboard.type(password, delay=50)
+            logger.debug(f"Password typed ({len(password)} chars)")
 
-            # Human-like typing: печатаем символ за символом с рандомными задержками
-            # Имитирует реальный ввод человека (100-200ms между нажатиями)
-            prev_char = ''
-            for char in password:
-                # Базовая задержка 100-200ms, модифицируется от символа
-                base_delay = random.uniform(0.10, 0.20)
-
-                # Модификаторы для реалистичности:
-                # - Заглавные буквы и спецсимволы медленнее (Shift)
-                if char.isupper() or char in '!@#$%^&*()_+{}|:"<>?':
-                    base_delay *= random.uniform(1.2, 1.5)
-                # - Цифры немного медленнее (переключение внимания)
-                elif char.isdigit():
-                    base_delay *= random.uniform(1.1, 1.3)
-                # - Пробелы чуть медленнее (конец слова)
-                elif char == ' ':
-                    base_delay *= random.uniform(1.1, 1.2)
-
-                # Печатаем символ
-                await page.keyboard.type(char)
-                await asyncio.sleep(base_delay)
-                prev_char = char
-
-            logger.debug(f"Password typed with human-like delays ({len(password)} chars)")
-
-            # Пауза перед Enter (человек проверяет ввод)
-            think_time = random.uniform(0.3, 0.8)
-            await asyncio.sleep(think_time)
+            # Короткая пауза перед Enter
+            await asyncio.sleep(0.5)
             await page.keyboard.press('Enter')
             logger.debug("Pressed Enter to submit")
 
         except Exception as e:
             error_msg = str(e).encode('ascii', 'replace').decode('ascii')
             logger.error(f"Password input failed: {error_msg}")
+            # Debug screenshot
+            timestamp = datetime.now().strftime('%H%M%S')
+            debug_path = Path("profiles") / f"debug_2fa_error_{timestamp}.png"
+            await page.screenshot(path=str(debug_path))
             return False
 
         logger.info("Password submitted, waiting for response...")
 
-        # Ждём результата (даём больше времени)
-        await asyncio.sleep(5)
+        # Ждём результата - увеличено время для медленных соединений
+        # Также ждём пока кнопка перестанет показывать "PLEASE WAIT..."
+        for wait_attempt in range(15):  # До 15 секунд
+            await asyncio.sleep(1)
 
-        # Сохраняем скриншот для отладки
-        debug_path = Path("profiles") / "debug_after_2fa.png"
+            # Проверяем не исчезла ли форма пароля (успешный вход)
+            password_still_visible = await page.query_selector('input[type="password"]')
+            if not password_still_visible:
+                logger.info("Password form disappeared - likely successful")
+                break
+
+            # Проверяем loading state
+            loading_btn = await page.query_selector('button:has-text("PLEASE WAIT"), button:has-text("Loading")')
+            if not loading_btn:
+                # Кнопка не в loading state - можем проверить результат
+                break
+
+        # Debug screenshot
+        timestamp = datetime.now().strftime('%H%M%S')
+        debug_path = Path("profiles") / f"debug_2fa_after_{timestamp}.png"
         await page.screenshot(path=str(debug_path))
-        logger.debug(f"Debug screenshot saved: {debug_path}")
+        logger.debug(f"Debug screenshot: {debug_path}")
 
-        # Проверяем ошибки - Telegram Web K использует разные классы
+        # Проверяем ошибки
         error_selectors = [
             '[class*="error"]',
             '.error',
             '.input-field-error',
-            '[class*="shake"]',  # Анимация ошибки
+            '[class*="shake"]',
         ]
         for selector in error_selectors:
             try:
@@ -987,7 +1177,7 @@ class TelegramAuth:
                     if is_visible:
                         error_text = await error.inner_text()
                         if error_text.strip():
-                            logger.error(f"2FA error detected: {error_text}")
+                            logger.error(f"2FA error: {error_text}")
                             return False
             except Exception:
                 pass
@@ -1324,6 +1514,115 @@ async def migrate_accounts_batch(
 ProgressCallback = Callable[[int, int, Optional["AuthResult"]], None]
 
 
+class CircuitBreaker:
+    """
+    Circuit breaker for cascade failure protection.
+
+    When too many consecutive failures occur, the circuit "opens"
+    and pauses new operations to prevent overwhelming the system.
+
+    Usage:
+        breaker = CircuitBreaker(failure_threshold=5, reset_timeout=60)
+
+        if not breaker.can_proceed():
+            await asyncio.sleep(breaker.time_until_reset())
+            continue
+
+        result = await do_operation()
+        if not result.success:
+            breaker.record_failure()
+        else:
+            breaker.record_success()
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        reset_timeout: float = 60.0
+    ):
+        """
+        Args:
+            failure_threshold: Number of consecutive failures before opening
+            reset_timeout: Seconds to wait before trying again after opening
+        """
+        self._failure_threshold = failure_threshold
+        self._reset_timeout = reset_timeout
+        self._consecutive_failures = 0
+        self._last_failure_time: float = 0.0
+        self._is_open = False
+
+    @property
+    def is_open(self) -> bool:
+        """Check if circuit is currently open (blocking operations)"""
+        return self._is_open
+
+    @property
+    def consecutive_failures(self) -> int:
+        """Current count of consecutive failures"""
+        return self._consecutive_failures
+
+    def record_failure(self) -> None:
+        """Record a failure. Opens circuit if threshold exceeded."""
+        import time
+        self._consecutive_failures += 1
+        self._last_failure_time = time.time()
+
+        if self._consecutive_failures >= self._failure_threshold:
+            if not self._is_open:
+                logger.warning(
+                    f"Circuit breaker OPEN after {self._consecutive_failures} "
+                    f"consecutive failures. Pausing for {self._reset_timeout}s"
+                )
+            self._is_open = True
+
+    def record_success(self) -> None:
+        """Record a success. Resets failure counter and closes circuit."""
+        if self._consecutive_failures > 0 or self._is_open:
+            logger.info("Circuit breaker: success recorded, resetting state")
+        self._consecutive_failures = 0
+        self._is_open = False
+
+    def can_proceed(self) -> bool:
+        """
+        Check if operations can proceed.
+
+        Returns True if:
+        - Circuit is closed (normal operation)
+        - Circuit is open but reset_timeout has elapsed (half-open)
+        """
+        if not self._is_open:
+            return True
+
+        import time
+        elapsed = time.time() - self._last_failure_time
+
+        if elapsed >= self._reset_timeout:
+            logger.info(
+                f"Circuit breaker: reset timeout elapsed "
+                f"({elapsed:.1f}s >= {self._reset_timeout}s), allowing retry"
+            )
+            # Move to half-open state - allow one request
+            return True
+
+        return False
+
+    def time_until_reset(self) -> float:
+        """Seconds until circuit breaker resets (0 if closed)"""
+        if not self._is_open:
+            return 0.0
+
+        import time
+        elapsed = time.time() - self._last_failure_time
+        remaining = self._reset_timeout - elapsed
+        return max(0.0, remaining)
+
+    def reset(self) -> None:
+        """Manually reset the circuit breaker"""
+        self._consecutive_failures = 0
+        self._is_open = False
+        self._last_failure_time = 0.0
+
+
 class ParallelMigrationController:
     """
     Controller for parallel migration with graceful shutdown support.
@@ -1341,16 +1640,19 @@ class ParallelMigrationController:
         self,
         max_concurrent: int = 10,
         cooldown: float = 5.0,
-        resource_monitor: Optional["ResourceMonitor"] = None
+        resource_monitor: Optional["ResourceMonitor"] = None,
+        circuit_breaker: Optional[CircuitBreaker] = None
     ):
         self.max_concurrent = max_concurrent
         self.cooldown = cooldown
         self.resource_monitor = resource_monitor
+        self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self._shutdown_requested = False
         self._active_tasks: Set[asyncio.Task[Any]] = set()
         self._completed = 0
         self._total = 0
         self._paused_for_resources = False
+        self._paused_for_circuit_breaker = False
 
     @property
     def is_shutdown_requested(self) -> bool:
@@ -1390,6 +1692,19 @@ class ParallelMigrationController:
             if self._shutdown_requested:
                 return None
 
+            # Wait for circuit breaker if open (cascade failure protection)
+            if not self.circuit_breaker.can_proceed():
+                wait_time = self.circuit_breaker.time_until_reset()
+                if wait_time > 0:
+                    if not self._paused_for_circuit_breaker:
+                        self._paused_for_circuit_breaker = True
+                        logger.warning(
+                            f"Circuit breaker open, waiting {wait_time:.1f}s "
+                            f"after {self.circuit_breaker.consecutive_failures} failures"
+                        )
+                    await asyncio.sleep(wait_time)
+                    self._paused_for_circuit_breaker = False
+
             # Wait for resources if monitor provided
             if self.resource_monitor:
                 wait_count = 0
@@ -1412,16 +1727,27 @@ class ParallelMigrationController:
                         return results[index]
                 self._paused_for_resources = False
 
+            # Per-task timeout to prevent stuck tasks from blocking semaphore forever
+            TASK_TIMEOUT = 300  # 5 minutes per account
+
             async with semaphore:
                 # Check again after acquiring
                 if self._shutdown_requested:
                     return None
 
                 try:
-                    result = await migrate_account(
-                        account_dir=account_dir,
-                        password_2fa=password_2fa,
-                        headless=headless
+                    async with asyncio.timeout(TASK_TIMEOUT):
+                        result = await migrate_account(
+                            account_dir=account_dir,
+                            password_2fa=password_2fa,
+                            headless=headless
+                        )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Task timeout after {TASK_TIMEOUT}s for {account_dir.name}")
+                    result = AuthResult(
+                        success=False,
+                        profile_name=account_dir.name,
+                        error=f"Task timeout after {TASK_TIMEOUT}s"
                     )
                 except Exception as e:
                     result = AuthResult(
@@ -1429,6 +1755,12 @@ class ParallelMigrationController:
                         profile_name=account_dir.name,
                         error=str(e)
                     )
+
+                # Record result for circuit breaker
+                if result.success:
+                    self.circuit_breaker.record_success()
+                else:
+                    self.circuit_breaker.record_failure()
 
                 async with lock:
                     results[index] = result
@@ -1457,9 +1789,25 @@ class ParallelMigrationController:
                 jittered = get_randomized_cooldown(self.cooldown)
                 await asyncio.sleep(jittered)
 
-        # Wait for all started tasks
+        # Wait for all started tasks with batch timeout
+        BATCH_TIMEOUT = 3600  # 1 hour for entire batch
+
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=BATCH_TIMEOUT,
+                return_when=asyncio.ALL_COMPLETED
+            )
+
+            # Cancel any stuck tasks that exceeded batch timeout
+            if pending:
+                logger.warning(f"Batch timeout: cancelling {len(pending)} stuck tasks")
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
         # Return results in order (only completed ones)
         ordered_results = []
