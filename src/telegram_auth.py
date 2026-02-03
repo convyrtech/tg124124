@@ -733,7 +733,66 @@ class TelegramAuth:
                     if token_bytes:
                         return token_bytes
 
-                # Метод 0b: Получить canvas data для декодирования
+                # Метод 0b: Инжектируем jsQR и декодируем canvas прямо в браузере
+                # Это работает лучше чем внешние декодеры для стилизованных QR Telegram
+                # Загружаем jsQR из локального файла (CDN блокируется CSP)
+                if not hasattr(self, '_jsqr_injected') or not self._jsqr_injected:
+                    try:
+                        import os
+                        jsqr_path = os.path.join(
+                            os.path.dirname(__file__), '..', 'node_modules', 'jsqr', 'dist', 'jsQR.js'
+                        )
+                        if os.path.exists(jsqr_path):
+                            await page.add_script_tag(path=jsqr_path)
+                            self._jsqr_injected = True
+                            logger.debug("jsQR injected into page")
+                        else:
+                            logger.debug(f"jsQR not found at {jsqr_path}")
+                    except Exception as e:
+                        logger.debug(f"jsQR injection error: {e}")
+
+                qr_from_browser = await page.evaluate("""
+                    () => {
+                        const canvas = document.querySelector('canvas');
+                        if (!canvas) return null;
+
+                        const ctx = canvas.getContext('2d');
+                        if (!ctx) return null;
+
+                        if (typeof jsQR !== 'function') {
+                            return { error: 'jsQR not available' };
+                        }
+
+                        // Получаем данные canvas
+                        const width = canvas.width;
+                        const height = canvas.height;
+                        const imageData = ctx.getImageData(0, 0, width, height);
+
+                        // Декодируем с jsQR (attemptBoth пробует и нормальную и инвертированную версию)
+                        const code = jsQR(imageData.data, width, height, {
+                            inversionAttempts: 'attemptBoth'
+                        });
+
+                        if (code && code.data) {
+                            return { qrData: code.data };
+                        }
+
+                        return { error: 'QR not decoded', width, height };
+                    }
+                """)
+
+                if qr_from_browser:
+                    if qr_from_browser.get('qrData'):
+                        qr_data = qr_from_browser['qrData']
+                        logger.info(f"Token decoded via browser jsQR")
+                        if 'tg://login?token=' in qr_data:
+                            token_bytes = extract_token_from_tg_url(qr_data)
+                            if token_bytes:
+                                return token_bytes
+                    elif qr_from_browser.get('error'):
+                        logger.debug(f"Browser jsQR: {qr_from_browser.get('error')}")
+
+                # Fallback: Получить canvas data для внешнего декодирования
                 qr_from_canvas = await page.evaluate("""
                     () => {
                         const canvas = document.querySelector('canvas');
@@ -759,7 +818,7 @@ class TelegramAuth:
                         # Try to decode this smaller canvas image
                         token = decode_qr_from_screenshot(canvas_bytes)
                         if token:
-                            logger.info("Token decoded from canvas")
+                            logger.info("Token decoded from canvas (external)")
                             return token
                     except Exception as e:
                         logger.debug(f"Canvas decode error: {e}")
@@ -898,6 +957,8 @@ class TelegramAuth:
         for retry in range(self.QR_MAX_RETRIES):
             if retry > 0:
                 logger.info(f"QR retry {retry + 1}/{self.QR_MAX_RETRIES}...")
+                # Сбрасываем флаг jsQR при reload (скрипт теряется)
+                self._jsqr_injected = False
                 # Обновляем страницу для нового QR
                 try:
                     await page.reload(wait_until="domcontentloaded", timeout=30000)
