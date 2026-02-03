@@ -74,6 +74,9 @@ class TGWebAuthApp:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Thread-safe queue for UI updates from async code
         self._ui_queue: queue.Queue = queue.Queue()
+        # Track active browser contexts for cleanup
+        self._active_browsers: List = []
+        self._shutting_down: bool = False
 
     def _start_async_loop(self) -> None:
         """Start async event loop in background thread."""
@@ -104,6 +107,49 @@ class TGWebAuthApp:
             except Exception as e:
                 logger.error("UI queue error: %s", e)
                 self._log(f"[Error] UI update failed: {e}")
+
+    def _shutdown(self) -> None:
+        """Clean shutdown - close all browsers and stop async loop."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        logger.info("Shutting down application...")
+
+        # Close all tracked browser contexts
+        if self._loop and self._active_browsers:
+            async def close_browsers():
+                for ctx in self._active_browsers:
+                    try:
+                        await ctx.close()
+                        logger.info("Closed browser context")
+                    except Exception as e:
+                        logger.warning("Error closing browser: %s", e)
+                self._active_browsers.clear()
+
+            try:
+                future = asyncio.run_coroutine_threadsafe(close_browsers(), self._loop)
+                future.result(timeout=10)  # Wait up to 10 seconds
+            except Exception as e:
+                logger.warning("Error during browser cleanup: %s", e)
+
+        # Shutdown controller (close database)
+        if self._loop and self._controller:
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._controller.shutdown(), self._loop
+                )
+                future.result(timeout=5)
+            except Exception as e:
+                logger.warning("Error during controller shutdown: %s", e)
+
+        # Stop the async loop
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            # Wait for thread to finish
+            if self._async_thread and self._async_thread.is_alive():
+                self._async_thread.join(timeout=5)
+
+        logger.info("Shutdown complete")
 
     def run(self) -> None:
         """Start the application."""
@@ -165,11 +211,17 @@ class TGWebAuthApp:
         # Show 2FA dialog on start
         self._show_2fa_dialog()
 
+        # Register atexit handler for safety
+        import atexit
+        atexit.register(self._shutdown)
+
         # Custom render loop to process UI queue
         while dpg.is_dearpygui_running():
             self._process_ui_queue()
             dpg.render_dearpygui_frame()
 
+        # Clean shutdown before destroying context
+        self._shutdown()
         dpg.destroy_context()
 
     def _create_main_window(self) -> None:
@@ -599,14 +651,16 @@ class TGWebAuthApp:
 
                 # Launch browser
                 ctx = await manager.launch(profile, headless=False)
+
+                # Track browser for cleanup on shutdown
+                self._active_browsers.append(ctx)
+
                 page = await ctx.new_page()
                 await page.goto("https://web.telegram.org/k/")
 
                 self._log(f"[Open] Browser opened for {profile_name}")
 
-                # Keep browser open until user closes it
-                # We don't wait here - browser runs in background
-                # Note: this will keep the context alive until browser closes
+                # Browser runs in background - will be cleaned up on app shutdown
 
             except Exception as e:
                 logger.error("Open profile error: %s\n%s", e, traceback.format_exc())
