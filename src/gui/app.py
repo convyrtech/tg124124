@@ -524,6 +524,12 @@ class TGWebAuthApp:
                             user_data=account.id,
                             width=45
                         )
+                        dpg.add_button(
+                            label="Frag",
+                            callback=self._fragment_single,
+                            user_data=account.id,
+                            width=40
+                        )
         except Exception as e:
             logger.error("Update accounts table error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Table update: {e}")
@@ -745,6 +751,51 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._refresh_table_async())
 
         self._run_async(do_migrate())
+
+    def _fragment_single(self, sender, app_data, user_data) -> None:
+        """Authorize single account on fragment.com."""
+        account_id = user_data
+        self._log(f"[Fragment] Button clicked for account {account_id}")
+
+        async def do_fragment():
+            try:
+                account = await self._controller.db.get_account(account_id)
+                if not account:
+                    self._log(f"[Fragment] Account {account_id} not found")
+                    return
+
+                session_dir = Path(account.session_path) if account.session_path else None
+                if not session_dir or not session_dir.exists():
+                    self._log(f"[Fragment] Session not found for {account.name}")
+                    return
+
+                self._log(f"[Fragment] Starting {account.name}...")
+
+                from ..telegram_auth import AccountConfig
+                from ..fragment_auth import FragmentAuth
+                from ..browser_manager import BrowserManager
+
+                try:
+                    config = AccountConfig.load(session_dir)
+                except Exception as e:
+                    self._log(f"[Fragment] Config load error: {e}")
+                    return
+
+                browser_manager = BrowserManager()
+                auth = FragmentAuth(config, browser_manager)
+                result = await auth.connect(headless=False)
+
+                if result.success:
+                    status = "already authorized" if result.already_authorized else "connected"
+                    self._log(f"[Fragment] {account.name} - {status}")
+                else:
+                    self._log(f"[Fragment] {account.name} - FAILED: {result.error}")
+
+            except Exception as e:
+                logger.error("Fragment error: %s\n%s", e, traceback.format_exc())
+                self._log(f"[Error] Fragment: {e}")
+
+        self._run_async(do_fragment())
 
     def _refresh_table_async(self) -> None:
         """Trigger async table refresh from UI thread."""
