@@ -116,6 +116,32 @@ class TGWebAuthApp:
 
         dpg.create_context()
 
+        # Load font with Cyrillic support
+        # Use AppData path to avoid Cyrillic path issues with DearPyGui
+        try:
+            font_loaded = False
+            import os
+            appdata = os.environ.get('APPDATA', '')
+            font_path = Path(appdata) / "tgwebauth" / "JetBrainsMono-Regular.ttf"
+
+            if font_path.exists():
+                font_str = str(font_path)
+                logger.info("Loading font from: %s", font_str)
+
+                with dpg.font_registry():
+                    with dpg.font(font_str, 16) as default_font:
+                        dpg.add_font_range_hint(dpg.mvFontRangeHint_Cyrillic)
+                        dpg.add_font_range_hint(dpg.mvFontRangeHint_Default)
+                dpg.bind_font(default_font)
+                font_loaded = True
+                logger.info("Cyrillic font loaded successfully")
+
+            if not font_loaded:
+                logger.warning("Font not found at %s - Cyrillic may not display", font_path)
+        except Exception as e:
+            # Font loading failed - continue without custom font
+            logger.warning("Font loading failed: %s - using default font", e)
+
         # Apply theme
         theme = create_hacker_theme()
         dpg.bind_theme(theme)
@@ -536,6 +562,7 @@ class TGWebAuthApp:
     def _open_profile(self, sender, app_data, user_data) -> None:
         """Open browser profile for account."""
         account_id = user_data
+        self._log(f"[Open] Button clicked for account {account_id}")
 
         async def do_open():
             try:
@@ -544,15 +571,14 @@ class TGWebAuthApp:
                     self._log(f"[Error] Account {account_id} not found")
                     return
 
-                self._log(f"[Open] Opening {account.name}...")
+                self._log(f"[Open] Launching browser for {account.name}...")
 
-                # Use CLI open command
-                import subprocess
-                proc = subprocess.Popen(
-                    ["python", "-m", "src.cli", "open", "--account", account.name],
+                # Use CLI open command - Popen without communicate is non-blocking
+                proc = await asyncio.create_subprocess_exec(
+                    "python", "-m", "src.cli", "open", "--account", account.name,
                     cwd=str(Path(__file__).parent.parent.parent)
                 )
-                self._log(f"[Open] Browser launched for {account.name} (pid={proc.pid})")
+                self._log(f"[Open] Browser started for {account.name} (pid={proc.pid})")
 
             except Exception as e:
                 logger.error("Open profile error: %s", e)
@@ -563,6 +589,7 @@ class TGWebAuthApp:
     def _migrate_single(self, sender, app_data, user_data) -> None:
         """Migrate single account."""
         account_id = user_data
+        self._log(f"[Migrate] Button clicked for account {account_id}")
 
         async def do_migrate():
             try:
@@ -573,26 +600,26 @@ class TGWebAuthApp:
 
                 self._log(f"[Migrate] Starting {account.name}...")
 
-                # Update status
+                # Update status immediately
                 await self._controller.db.update_account(account_id, status="migrating")
                 self._schedule_ui(lambda: self._refresh_table_async())
 
-                # Run migration via CLI
-                import subprocess
+                # Run migration via CLI using ASYNC subprocess (non-blocking!)
                 args = ["python", "-m", "src.cli", "migrate", "--account", account.name, "--headless"]
                 if self._2fa_password:
                     args.extend(["--password", self._2fa_password])
 
-                proc = subprocess.Popen(
-                    args,
+                # Use asyncio subprocess - NOT blocking!
+                proc = await asyncio.create_subprocess_exec(
+                    *args,
                     cwd=str(Path(__file__).parent.parent.parent),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT
                 )
 
-                # Wait for result
-                stdout, _ = proc.communicate(timeout=300)
+                # Wait for result asynchronously
+                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+                stdout = stdout_bytes.decode('utf-8', errors='ignore') if stdout_bytes else ""
 
                 if proc.returncode == 0:
                     await self._controller.db.update_account(account_id, status="healthy")
@@ -600,17 +627,23 @@ class TGWebAuthApp:
                 else:
                     await self._controller.db.update_account(account_id, status="error")
                     self._log(f"[Migrate] {account.name} - FAILED")
-                    # Show last line of output
                     if stdout:
                         last_line = stdout.strip().split('\n')[-1]
                         self._log(f"[Migrate] {last_line}")
 
                 self._schedule_ui(lambda: self._refresh_table_async())
 
+            except asyncio.TimeoutError:
+                self._log(f"[Error] Migration timeout for account {account_id}")
+                await self._controller.db.update_account(account_id, status="error")
+                self._schedule_ui(lambda: self._refresh_table_async())
             except Exception as e:
                 logger.error("Migrate error: %s\n%s", e, traceback.format_exc())
                 self._log(f"[Error] Migrate: {e}")
-                await self._controller.db.update_account(account_id, status="error")
+                try:
+                    await self._controller.db.update_account(account_id, status="error")
+                except:
+                    pass
 
         self._run_async(do_migrate())
 
@@ -628,13 +661,14 @@ class TGWebAuthApp:
     def _show_assign_proxy_dialog(self, sender, app_data, user_data) -> None:
         """Show dialog to assign proxy to account."""
         account_id = user_data
+        self._log(f"[Proxy] Opening dialog for account {account_id}...")
 
         async def show_dialog():
             try:
                 account = await self._controller.db.get_account(account_id)
                 proxies = await self._controller.db.list_proxies()
 
-                # Build proxy options
+                # Build proxy options - schedule on main thread
                 self._schedule_ui(lambda: self._create_proxy_dialog(account, proxies))
 
             except Exception as e:
@@ -761,28 +795,36 @@ class TGWebAuthApp:
                 for account in accounts:
                     self._log(f"[Migrate] {account.name}...")
                     await self._controller.db.update_account(account.id, status="migrating")
+                    self._schedule_ui(lambda: self._refresh_table_async())
 
-                    import subprocess
                     args = ["python", "-m", "src.cli", "migrate", "--account", account.name, "--headless"]
                     if self._2fa_password:
                         args.extend(["--password", self._2fa_password])
 
-                    proc = subprocess.Popen(
-                        args,
+                    # Use asyncio subprocess - NOT blocking!
+                    proc = await asyncio.create_subprocess_exec(
+                        *args,
                         cwd=str(Path(__file__).parent.parent.parent),
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT
                     )
 
-                    stdout, _ = proc.communicate(timeout=300)
+                    try:
+                        stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+                        stdout = stdout_bytes.decode('utf-8', errors='ignore') if stdout_bytes else ""
 
-                    if proc.returncode == 0:
-                        await self._controller.db.update_account(account.id, status="healthy")
-                        self._log(f"[Migrate] {account.name} - OK")
-                    else:
+                        if proc.returncode == 0:
+                            await self._controller.db.update_account(account.id, status="healthy")
+                            self._log(f"[Migrate] {account.name} - OK")
+                        else:
+                            await self._controller.db.update_account(account.id, status="error")
+                            self._log(f"[Migrate] {account.name} - FAILED")
+                            if stdout:
+                                last_line = stdout.strip().split('\n')[-1]
+                                self._log(f"[Migrate] {last_line}")
+                    except asyncio.TimeoutError:
+                        self._log(f"[Migrate] {account.name} - TIMEOUT")
                         await self._controller.db.update_account(account.id, status="error")
-                        self._log(f"[Migrate] {account.name} - FAILED")
 
                 self._log("[Migrate] Batch complete")
                 self._schedule_ui(lambda: self._refresh_table_async())
