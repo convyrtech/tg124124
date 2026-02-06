@@ -3,6 +3,7 @@ SQLite database for TG Web Auth metadata.
 Sessions remain as files for portability.
 """
 import sqlite3
+import uuid
 import aiosqlite
 from pathlib import Path
 from typing import Optional, List, Any
@@ -61,7 +62,8 @@ class Database:
     # Whitelist of allowed fields for update_account to prevent SQL injection
     ALLOWED_ACCOUNT_FIELDS = {
         'name', 'phone', 'username', 'session_path',
-        'proxy_id', 'status', 'last_check', 'error_message'
+        'proxy_id', 'status', 'last_check', 'error_message',
+        'fragment_status', 'web_last_verified', 'auth_ttl_days'
     }
 
     # Whitelist for update_proxy
@@ -125,7 +127,39 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
                 CREATE INDEX IF NOT EXISTS idx_proxies_status ON proxies(status);
+
+                CREATE TABLE IF NOT EXISTS batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id TEXT UNIQUE NOT NULL,
+                    total_count INTEGER DEFAULT 0,
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS operation_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER REFERENCES accounts(id),
+                    operation TEXT NOT NULL,
+                    success INTEGER,
+                    error_message TEXT,
+                    details TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
+
+            # Safe ALTER TABLE migrations (ignore if column already exists)
+            alter_statements = [
+                "ALTER TABLE accounts ADD COLUMN fragment_status TEXT DEFAULT NULL",
+                "ALTER TABLE accounts ADD COLUMN web_last_verified TIMESTAMP DEFAULT NULL",
+                "ALTER TABLE accounts ADD COLUMN auth_ttl_days INTEGER DEFAULT NULL",
+                "ALTER TABLE migrations ADD COLUMN batch_id INTEGER REFERENCES batches(id)",
+            ]
+            for stmt in alter_statements:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
         logger.info("Database initialized: %s", self.db_path)
 
     async def connect(self) -> None:
@@ -553,3 +587,319 @@ class Database:
             stats["success_rate"] = stats["healthy"] / completed * 100
 
         return stats
+
+    # ==================== Batch Management ====================
+
+    async def start_batch(self, account_names: list[str]) -> str:
+        """
+        Start a new migration batch.
+
+        Args:
+            account_names: List of account names in this batch.
+
+        Returns:
+            Batch ID (UUID-based).
+        """
+        batch_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+
+        async with self._connection.execute(
+            """
+            INSERT INTO batches (batch_id, total_count)
+            VALUES (?, ?)
+            """,
+            (batch_id, len(account_names))
+        ) as cursor:
+            db_id = cursor.lastrowid
+
+        # Create pending migration records linked to batch
+        for name in account_names:
+            # Find or skip account — caller must ensure accounts exist in DB
+            async with self._connection.execute(
+                "SELECT id FROM accounts WHERE name = ?", (name,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    await self._connection.execute(
+                        """
+                        INSERT INTO migrations (account_id, batch_id)
+                        VALUES (?, ?)
+                        """,
+                        (row["id"], db_id)
+                    )
+
+        await self._connection.commit()
+        logger.info("Started batch %s with %d accounts", batch_id, len(account_names))
+        return batch_id
+
+    async def get_active_batch(self) -> Optional[dict]:
+        """
+        Get the most recent unfinished batch.
+
+        Returns:
+            Dict with batch info or None.
+        """
+        async with self._connection.execute(
+            """
+            SELECT * FROM batches
+            WHERE finished_at IS NULL
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "id": row["id"],
+                    "batch_id": row["batch_id"],
+                    "total_count": row["total_count"],
+                    "started_at": row["started_at"],
+                    "finished_at": row["finished_at"],
+                }
+            return None
+
+    async def mark_batch_account_completed(
+        self, batch_id: int, account_name: str
+    ) -> None:
+        """
+        Mark an account's migration as completed within a batch.
+
+        Args:
+            batch_id: Internal batch row ID.
+            account_name: Account name.
+        """
+        async with self._connection.execute(
+            "SELECT id FROM accounts WHERE name = ?", (account_name,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return
+            account_id = row["id"]
+
+        await self._connection.execute(
+            """
+            UPDATE migrations
+            SET completed_at = datetime('now'), success = 1
+            WHERE batch_id = ? AND account_id = ? AND completed_at IS NULL
+            """,
+            (batch_id, account_id)
+        )
+        await self.update_account(account_id, status="healthy")
+        await self._connection.commit()
+
+    async def mark_batch_account_failed(
+        self, batch_id: int, account_name: str, error: str
+    ) -> None:
+        """
+        Mark an account's migration as failed within a batch.
+
+        Args:
+            batch_id: Internal batch row ID.
+            account_name: Account name.
+            error: Error message.
+        """
+        async with self._connection.execute(
+            "SELECT id FROM accounts WHERE name = ?", (account_name,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return
+            account_id = row["id"]
+
+        await self._connection.execute(
+            """
+            UPDATE migrations
+            SET completed_at = datetime('now'), success = 0, error_message = ?
+            WHERE batch_id = ? AND account_id = ? AND completed_at IS NULL
+            """,
+            (error, batch_id, account_id)
+        )
+        await self.update_account(account_id, status="error", error_message=error)
+        await self._connection.commit()
+
+    async def get_batch_pending(self, batch_id: int) -> list[str]:
+        """
+        Get account names with pending (incomplete) migrations in a batch.
+
+        Args:
+            batch_id: Internal batch row ID.
+
+        Returns:
+            List of account names.
+        """
+        async with self._connection.execute(
+            """
+            SELECT a.name FROM migrations m
+            JOIN accounts a ON a.id = m.account_id
+            WHERE m.batch_id = ? AND m.completed_at IS NULL
+            """,
+            (batch_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row["name"] for row in rows]
+
+    async def get_batch_failed(self, batch_id: int) -> list[dict]:
+        """
+        Get failed migrations in a batch.
+
+        Args:
+            batch_id: Internal batch row ID.
+
+        Returns:
+            List of dicts with account name and error.
+        """
+        async with self._connection.execute(
+            """
+            SELECT a.name, m.error_message FROM migrations m
+            JOIN accounts a ON a.id = m.account_id
+            WHERE m.batch_id = ? AND m.success = 0
+            """,
+            (batch_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {"account": row["name"], "error": row["error_message"]}
+                for row in rows
+            ]
+
+    async def get_batch_status(self) -> Optional[dict]:
+        """
+        Get status summary of the most recent batch.
+
+        Returns:
+            Dict with batch status or None if no batch exists.
+        """
+        async with self._connection.execute(
+            """
+            SELECT * FROM batches
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+
+            batch_db_id = row["id"]
+            batch_id = row["batch_id"]
+            total = row["total_count"]
+            started_at = row["started_at"]
+            finished_at = row["finished_at"]
+
+        # Count completed/failed/pending
+        async with self._connection.execute(
+            "SELECT COUNT(*) as cnt FROM migrations WHERE batch_id = ? AND success = 1",
+            (batch_db_id,)
+        ) as cursor:
+            completed = (await cursor.fetchone())["cnt"]
+
+        async with self._connection.execute(
+            "SELECT COUNT(*) as cnt FROM migrations WHERE batch_id = ? AND success = 0",
+            (batch_db_id,)
+        ) as cursor:
+            failed = (await cursor.fetchone())["cnt"]
+
+        async with self._connection.execute(
+            "SELECT COUNT(*) as cnt FROM migrations WHERE batch_id = ? AND completed_at IS NULL",
+            (batch_db_id,)
+        ) as cursor:
+            pending = (await cursor.fetchone())["cnt"]
+
+        return {
+            "has_batch": True,
+            "batch_id": batch_id,
+            "batch_db_id": batch_db_id,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "total": total,
+            "completed": completed,
+            "failed": failed,
+            "pending": pending,
+            "is_finished": finished_at is not None,
+        }
+
+    async def finish_batch(self, batch_id: int) -> None:
+        """
+        Mark a batch as finished.
+
+        Args:
+            batch_id: Internal batch row ID.
+        """
+        await self._connection.execute(
+            "UPDATE batches SET finished_at = datetime('now') WHERE id = ?",
+            (batch_id,)
+        )
+        await self._connection.commit()
+
+    # ==================== Operation Log ====================
+
+    async def log_operation(
+        self,
+        account_id: Optional[int],
+        operation: str,
+        success: bool,
+        error_message: Optional[str] = None,
+        details: Optional[str] = None,
+    ) -> None:
+        """
+        Write an entry to the operation log.
+
+        Args:
+            account_id: Account ID (optional).
+            operation: Operation name (e.g. 'qr_login', 'fragment_auth').
+            success: Whether operation succeeded.
+            error_message: Error message on failure.
+            details: Additional JSON/text details.
+        """
+        await self._connection.execute(
+            """
+            INSERT INTO operation_log (account_id, operation, success, error_message, details)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (account_id, operation, 1 if success else 0, error_message, details)
+        )
+        await self._connection.commit()
+
+    async def get_operation_log(
+        self,
+        account_id: Optional[int] = None,
+        operation: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """
+        Read operation log entries.
+
+        Args:
+            account_id: Filter by account (optional).
+            operation: Filter by operation name (optional).
+            limit: Max entries to return.
+
+        Returns:
+            List of log entry dicts.
+        """
+        query = "SELECT * FROM operation_log WHERE 1=1"
+        params: list[Any] = []
+
+        if account_id is not None:
+            query += " AND account_id = ?"
+            params.append(account_id)
+        if operation is not None:
+            query += " AND operation = ?"
+            params.append(operation)
+
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        async with self._connection.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": row["id"],
+                    "account_id": row["account_id"],
+                    "operation": row["operation"],
+                    "success": bool(row["success"]) if row["success"] is not None else None,
+                    "error_message": row["error_message"],
+                    "details": row["details"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]

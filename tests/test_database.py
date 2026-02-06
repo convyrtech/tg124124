@@ -324,3 +324,237 @@ class TestDatabase:
 
         finally:
             await db.close()
+
+    # ==================== New schema tests ====================
+
+    def test_schema_new_columns(self, db_path):
+        """Test that fragment_status, web_last_verified, auth_ttl_days columns exist."""
+        from src.database import Database
+        import sqlite3
+
+        db = Database(db_path)
+        asyncio.run(db.initialize())
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(accounts)")
+        columns = {row[1] for row in cursor.fetchall()}
+        conn.close()
+
+        assert "fragment_status" in columns
+        assert "web_last_verified" in columns
+        assert "auth_ttl_days" in columns
+
+    def test_schema_new_tables(self, db_path):
+        """Test that batches and operation_log tables exist."""
+        from src.database import Database
+        import sqlite3
+
+        db = Database(db_path)
+        asyncio.run(db.initialize())
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+        tables = {row[0] for row in cursor.fetchall()}
+        conn.close()
+
+        assert "batches" in tables
+        assert "operation_log" in tables
+
+    def test_schema_migrations_batch_id(self, db_path):
+        """Test that migrations table has batch_id column."""
+        from src.database import Database
+        import sqlite3
+
+        db = Database(db_path)
+        asyncio.run(db.initialize())
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(migrations)")
+        columns = {row[1] for row in cursor.fetchall()}
+        conn.close()
+
+        assert "batch_id" in columns
+
+    def test_alter_table_idempotent(self, db_path):
+        """Test that re-running initialize() doesn't crash."""
+        from src.database import Database
+
+        db = Database(db_path)
+        asyncio.run(db.initialize())
+        # Second run should not raise
+        asyncio.run(db.initialize())
+
+        # Third run for good measure
+        asyncio.run(db.initialize())
+
+    # ==================== Batch lifecycle tests ====================
+
+    @pytest.mark.asyncio
+    async def test_batch_lifecycle(self, db_path):
+        """Test start batch, mark completed/failed, get pending, finish."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            # Create accounts first
+            await db.add_account(name="Acc1", session_path="/acc1.session")
+            await db.add_account(name="Acc2", session_path="/acc2.session")
+            await db.add_account(name="Acc3", session_path="/acc3.session")
+
+            # Start batch
+            batch_id = await db.start_batch(["Acc1", "Acc2", "Acc3"])
+            assert batch_id  # non-empty string
+
+            # Get active batch
+            active = await db.get_active_batch()
+            assert active is not None
+            assert active["batch_id"] == batch_id
+            assert active["total_count"] == 3
+
+            db_batch_id = active["id"]
+
+            # All three should be pending
+            pending = await db.get_batch_pending(db_batch_id)
+            assert len(pending) == 3
+            assert set(pending) == {"Acc1", "Acc2", "Acc3"}
+
+            # Mark one completed
+            await db.mark_batch_account_completed(db_batch_id, "Acc1")
+            pending = await db.get_batch_pending(db_batch_id)
+            assert len(pending) == 2
+            assert "Acc1" not in pending
+
+            # Mark one failed
+            await db.mark_batch_account_failed(db_batch_id, "Acc2", "QR timeout")
+            pending = await db.get_batch_pending(db_batch_id)
+            assert pending == ["Acc3"]
+
+            # Check failed
+            failed = await db.get_batch_failed(db_batch_id)
+            assert len(failed) == 1
+            assert failed[0]["account"] == "Acc2"
+            assert failed[0]["error"] == "QR timeout"
+
+            # Finish batch
+            await db.finish_batch(db_batch_id)
+            active = await db.get_active_batch()
+            assert active is None  # no more active batches
+
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_batch_status(self, db_path):
+        """Test batch status summary."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            # No batches yet
+            status = await db.get_batch_status()
+            assert status is None
+
+            # Create accounts and batch
+            await db.add_account(name="X1", session_path="/x1.session")
+            await db.add_account(name="X2", session_path="/x2.session")
+            await db.start_batch(["X1", "X2"])
+
+            status = await db.get_batch_status()
+            assert status is not None
+            assert status["has_batch"] is True
+            assert status["total"] == 2
+            assert status["completed"] == 0
+            assert status["failed"] == 0
+            assert status["pending"] == 2
+            assert status["is_finished"] is False
+
+            # Mark one completed
+            await db.mark_batch_account_completed(status["batch_db_id"], "X1")
+            status = await db.get_batch_status()
+            assert status["completed"] == 1
+            assert status["pending"] == 1
+
+        finally:
+            await db.close()
+
+    # ==================== Operation log tests ====================
+
+    @pytest.mark.asyncio
+    async def test_operation_log(self, db_path):
+        """Test write and read operation log."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            acc_id = await db.add_account(name="LogTest", session_path="/log.session")
+
+            # Log success
+            await db.log_operation(acc_id, "qr_login", True, details="token=abc")
+
+            # Log failure
+            await db.log_operation(acc_id, "qr_login", False, error_message="QR decode failed")
+
+            # Log without account
+            await db.log_operation(None, "batch_start", True, details="batch_123")
+
+            # Read all
+            logs = await db.get_operation_log()
+            assert len(logs) == 3
+
+            # Filter by account
+            acc_logs = await db.get_operation_log(account_id=acc_id)
+            assert len(acc_logs) == 2
+
+            # Filter by operation
+            qr_logs = await db.get_operation_log(operation="qr_login")
+            assert len(qr_logs) == 2
+
+            # Check log content
+            success_log = [l for l in acc_logs if l["success"]][0]
+            assert success_log["operation"] == "qr_login"
+            assert success_log["details"] == "token=abc"
+
+            fail_log = [l for l in acc_logs if not l["success"]][0]
+            assert fail_log["error_message"] == "QR decode failed"
+
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_update_account_new_fields(self, db_path):
+        """Test that new account fields can be updated."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            acc_id = await db.add_account(name="FragTest", session_path="/frag.session")
+
+            # Update fragment_status
+            await db.update_account(acc_id, fragment_status="authorized")
+            await db.update_account(acc_id, auth_ttl_days=30)
+
+            # Verify via raw SQL (AccountRecord doesn't expose new fields yet)
+            async with db._connection.execute(
+                "SELECT fragment_status, auth_ttl_days FROM accounts WHERE id = ?",
+                (acc_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                assert row["fragment_status"] == "authorized"
+                assert row["auth_ttl_days"] == 30
+
+        finally:
+            await db.close()

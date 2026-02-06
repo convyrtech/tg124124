@@ -1,11 +1,21 @@
 """
 Migration State Persistence Module
 
+DEPRECATED: This module is superseded by src/database.py (SQLite).
+Batch state is now tracked in the 'batches' and 'migrations' tables.
+This file is kept for backwards compatibility only.
+
 Provides JSON-based persistence for batch migration state.
 Enables resume after crash and retry of failed accounts.
 
 FIX-004: Atomic writes with file locking to prevent race conditions.
 """
+import warnings
+warnings.warn(
+    "migration_state.py is deprecated. Use src.database.Database batch methods instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 import json
 import sys
 import os

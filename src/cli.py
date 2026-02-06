@@ -125,13 +125,48 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             resume: bool, retry_failed: bool, show_status: bool):
     """Мигрировать аккаунт(ы) из session в browser profile"""
     import signal
+    import sqlite3
     from .telegram_auth import migrate_account, migrate_accounts_batch, ParallelMigrationController
-    from .migration_state import MigrationState
+    from .database import Database
+
+    DB_PATH = Path("data/tgwebauth.db")
+
+    async def _connect_db() -> Database:
+        """Initialize and connect database (async)."""
+        db = Database(DB_PATH)
+        await db.initialize()
+        await db.connect()
+        return db
 
     # Handle --status flag
     if show_status:
-        state = MigrationState()
-        click.echo(state.format_status())
+        async def _show_status():
+            db = await _connect_db()
+            try:
+                batch_status = await db.get_batch_status()
+                stats = await db.get_migration_stats()
+
+                if batch_status is None:
+                    click.echo("No active migration batch")
+                else:
+                    click.echo(f"Batch: {batch_status['batch_id']}")
+                    click.echo(f"Started: {batch_status['started_at']}")
+                    click.echo(f"Progress: {batch_status['completed']}/{batch_status['total']} completed")
+                    click.echo(f"  - Completed: {batch_status['completed']}")
+                    click.echo(f"  - Failed: {batch_status['failed']}")
+                    click.echo(f"  - Pending: {batch_status['pending']}")
+                    if batch_status["is_finished"]:
+                        click.echo(f"Finished: {batch_status['finished_at']}")
+                    else:
+                        click.echo("Status: IN PROGRESS")
+
+                click.echo(f"\nDB Stats: {stats['total']} accounts, "
+                           f"{stats['healthy']} healthy, {stats['error']} error, "
+                           f"{stats['pending']} pending")
+            finally:
+                await db.close()
+
+        asyncio.run(_show_status())
         sys.exit(0)
 
     if not account and not migrate_all and not resume and not retry_failed:
@@ -166,59 +201,90 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             sys.exit(1)
 
     elif migrate_all or resume or retry_failed:
-        # Initialize state tracking
-        state = MigrationState()
+        # Initialize database for batch tracking
+        batch_db_id = None  # Internal DB row ID for batch
 
-        # Determine which accounts to migrate
-        if resume:
-            # Resume: only pending accounts from interrupted batch
-            if not state.has_active_batch:
-                click.echo("Нет прерванной миграции для продолжения")
-                click.echo("Используйте --all для новой миграции")
-                sys.exit(0)
+        async def _resolve_accounts():
+            """Resolve which accounts to migrate and start/resume batch."""
+            nonlocal batch_db_id
+            db = await _connect_db()
+            try:
+                if resume:
+                    active = await db.get_active_batch()
+                    if not active:
+                        click.echo("Нет прерванной миграции для продолжения")
+                        click.echo("Используйте --all для новой миграции")
+                        return None, None
 
-            pending_names = state.get_pending()
-            click.echo(f"Продолжение batch: {state.batch_id}")
-            click.echo(f"Осталось: {len(pending_names)} аккаунтов")
+                    batch_db_id = active["id"]
+                    pending_names = await db.get_batch_pending(batch_db_id)
+                    click.echo(f"Продолжение batch: {active['batch_id']}")
+                    click.echo(f"Осталось: {len(pending_names)} аккаунтов")
 
-            # Find account dirs matching pending names
-            all_accounts = find_account_dirs()
-            accounts = [d for d in all_accounts if d.name in pending_names]
+                    all_accounts = find_account_dirs()
+                    found = [d for d in all_accounts if d.name in pending_names]
+                    if not found:
+                        click.echo("Все pending аккаунты уже обработаны")
+                        return None, None
+                    return found, batch_db_id
 
-            if not accounts:
-                click.echo("Все pending аккаунты уже обработаны")
-                sys.exit(0)
+                elif retry_failed:
+                    batch_status = await db.get_batch_status()
+                    if not batch_status:
+                        click.echo("Нет упавших аккаунтов для повтора")
+                        return None, None
 
-        elif retry_failed:
-            # Retry: only failed accounts from previous batch
-            failed_names = state.get_failed_accounts()
-            if not failed_names:
-                click.echo("Нет упавших аккаунтов для повтора")
-                sys.exit(0)
+                    failed_entries = await db.get_batch_failed(batch_status["batch_db_id"])
+                    if not failed_entries:
+                        click.echo("Нет упавших аккаунтов для повтора")
+                        return None, None
 
-            click.echo(f"Повтор {len(failed_names)} упавших аккаунтов:")
-            for name in failed_names:
-                click.echo(f"  - {name}")
+                    failed_names = [f["account"] for f in failed_entries]
+                    click.echo(f"Повтор {len(failed_names)} упавших аккаунтов:")
+                    for name in failed_names:
+                        click.echo(f"  - {name}")
 
-            # Find account dirs matching failed names
-            all_accounts = find_account_dirs()
-            accounts = [d for d in all_accounts if d.name in failed_names]
+                    all_accounts = find_account_dirs()
+                    found = [d for d in all_accounts if d.name in failed_names]
 
-            # Start a new batch for retry
-            account_names = [d.name for d in accounts]
-            state.start_batch(account_names)
+                    # Start a new batch for retry
+                    names = [d.name for d in found]
+                    new_batch_id = await db.start_batch(names)
+                    # Get the new batch's db id
+                    new_active = await db.get_active_batch()
+                    batch_db_id = new_active["id"] if new_active else None
+                    return found, batch_db_id
 
-        else:
-            # Normal --all: migrate all accounts
-            accounts = find_account_dirs()
-            if not accounts:
-                click.echo("Нет аккаунтов для миграции")
-                sys.exit(0)
+                else:
+                    # Normal --all
+                    found = find_account_dirs()
+                    if not found:
+                        click.echo("Нет аккаунтов для миграции")
+                        return None, None
 
-            # Start a new batch
-            account_names = [d.name for d in accounts]
-            batch_id = state.start_batch(account_names)
-            click.echo(f"Новый batch: {batch_id}")
+                    names = [d.name for d in found]
+                    # Ensure all accounts exist in DB
+                    for d in found:
+                        try:
+                            await db.add_account(
+                                name=d.name,
+                                session_path=str(d / "session.session"),
+                            )
+                        except sqlite3.IntegrityError:
+                            pass  # Account already exists (unique session_path)
+
+                    new_batch_id = await db.start_batch(names)
+                    new_active = await db.get_active_batch()
+                    batch_db_id = new_active["id"] if new_active else None
+                    click.echo(f"Новый batch: {new_batch_id}")
+                    return found, batch_db_id
+            finally:
+                await db.close()
+
+        resolved = asyncio.run(_resolve_accounts())
+        if resolved is None or resolved[0] is None:
+            sys.exit(0)
+        accounts, batch_db_id = resolved
 
         click.echo(f"Аккаунтов для миграции: {len(accounts)}")
 
@@ -255,18 +321,11 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             if hasattr(signal, 'SIGTERM'):
                 signal.signal(signal.SIGTERM, handle_signal)
 
-            # Progress callback with state tracking
+            # Progress callback — UI only (no asyncio.run inside running loop!)
             def on_progress(completed, total, result):
                 status_str = click.style("OK", fg="green") if result and result.success else click.style("FAIL", fg="red")
                 name = result.profile_name if result else "?"
                 click.echo(f"  [{completed}/{total}] {status_str} {name}")
-
-                # Update state
-                if result:
-                    if result.success:
-                        state.mark_completed(result.profile_name)
-                    else:
-                        state.mark_failed(result.profile_name, result.error or "Unknown error")
 
             results = asyncio.run(controller.run(
                 account_dirs=accounts,
@@ -274,6 +333,20 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                 headless=headless,
                 on_progress=on_progress
             ))
+
+            # Update DB after parallel run completes
+            if batch_db_id:
+                async def _update_parallel():
+                    db = await _connect_db()
+                    try:
+                        for r in results:
+                            if r.success:
+                                await db.mark_batch_account_completed(batch_db_id, r.profile_name)
+                            else:
+                                await db.mark_batch_account_failed(batch_db_id, r.profile_name, r.error or "Unknown error")
+                    finally:
+                        await db.close()
+                asyncio.run(_update_parallel())
         else:
             # Последовательный режим (существующий)
             click.echo(f"Режим: ПОСЛЕДОВАТЕЛЬНЫЙ")
@@ -287,12 +360,19 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                 cooldown=cooldown
             ))
 
-            # Update state for sequential mode
-            for result in results:
-                if result.success:
-                    state.mark_completed(result.profile_name)
-                else:
-                    state.mark_failed(result.profile_name, result.error or "Unknown error")
+            # Update state in DB for sequential mode
+            if batch_db_id:
+                async def _update_sequential():
+                    db = await _connect_db()
+                    try:
+                        for result in results:
+                            if result.success:
+                                await db.mark_batch_account_completed(batch_db_id, result.profile_name)
+                            else:
+                                await db.mark_batch_account_failed(batch_db_id, result.profile_name, result.error or "Unknown error")
+                    finally:
+                        await db.close()
+                asyncio.run(_update_sequential())
 
         # Итог
         success = [r for r in results if r.success]
@@ -311,12 +391,23 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                 click.echo(f"  - {result.profile_name}: {result.error}")
             click.echo("\nИспользуйте --retry-failed для повтора упавших")
 
-        # Show state summary
-        click.echo(f"\nСтатус batch: {state.batch_id}")
-        status_info = state.get_status()
-        if status_info["pending"] > 0:
-            click.echo(f"Осталось pending: {status_info['pending']}")
-            click.echo("Используйте --resume для продолжения")
+        # Show batch summary from DB
+        async def _show_batch_summary():
+            db = await _connect_db()
+            try:
+                status_info = await db.get_batch_status()
+                if status_info:
+                    click.echo(f"\nСтатус batch: {status_info['batch_id']}")
+                    if status_info["pending"] > 0:
+                        click.echo(f"Осталось pending: {status_info['pending']}")
+                        click.echo("Используйте --resume для продолжения")
+                    else:
+                        await db.finish_batch(status_info["batch_db_id"])
+                        click.echo("Batch завершён")
+            finally:
+                await db.close()
+
+        asyncio.run(_show_batch_summary())
 
 
 @cli.command(name="open")
