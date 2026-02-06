@@ -1,0 +1,572 @@
+"""
+Asyncio Queue-based worker pool for parallel account migration.
+
+Replaces the sequential _batch_migrate() loop in the GUI with a proper
+producer-consumer pattern supporting:
+- N parallel workers (default 3)
+- Per-worker cooldowns (60-120s random)
+- Global batch pauses (every 10 accounts, 5-10 min)
+- Circuit breaker (5 consecutive failures -> 60s pause)
+- Resource monitoring (RAM/CPU checks before each migration)
+- Retry on transient errors (up to max_retries)
+- FLOOD_WAIT detection (triples cooldown)
+- Graceful shutdown via asyncio.Event
+"""
+
+import asyncio
+import logging
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+from .database import AccountRecord, Database
+from .resource_monitor import ResourceMonitor
+from .telegram_auth import CircuitBreaker, AuthResult, migrate_account
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AccountResult:
+    """Result of a single account migration attempt."""
+    account_id: int
+    account_name: str
+    success: bool
+    error: Optional[str] = None
+    retries_used: int = 0
+
+
+@dataclass
+class PoolResult:
+    """Aggregate result of a worker pool run."""
+    total: int = 0
+    success_count: int = 0
+    error_count: int = 0
+    skipped_count: int = 0
+    results: list[AccountResult] = field(default_factory=list)
+
+
+# Sentinel value to signal workers to stop
+_STOP_SENTINEL = -1
+
+
+class MigrationWorkerPool:
+    """
+    Asyncio Queue-based worker pool for parallel account migration.
+
+    Usage::
+
+        pool = MigrationWorkerPool(db=db, num_workers=3)
+        result = await pool.run(account_ids)
+        # result.success_count, result.error_count, etc.
+
+        # To stop early:
+        pool.request_shutdown()
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        num_workers: int = 3,
+        cooldown_range: tuple[float, float] = (60.0, 120.0),
+        batch_pause_every: int = 10,
+        batch_pause_range: tuple[float, float] = (300.0, 600.0),
+        max_retries: int = 2,
+        task_timeout: float = 300.0,
+        resource_monitor: Optional[ResourceMonitor] = None,
+        circuit_breaker: Optional[CircuitBreaker] = None,
+        password_2fa: Optional[str] = None,
+        headless: bool = True,
+        on_progress: Optional[Callable[[int, int, Optional[AccountResult]], None]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """
+        Args:
+            db: Database instance for account/proxy lookups and status updates.
+            num_workers: Number of parallel worker coroutines (1-8).
+            cooldown_range: (min, max) seconds to sleep between migrations per worker.
+            batch_pause_every: Pause all workers every N completed accounts.
+            batch_pause_range: (min, max) seconds for batch pause.
+            max_retries: Max retry attempts for transient errors per account.
+            task_timeout: Timeout in seconds for a single migration.
+            resource_monitor: Optional ResourceMonitor instance.
+            circuit_breaker: Optional CircuitBreaker instance.
+            password_2fa: 2FA password for accounts that need it.
+            headless: Run browser in headless mode.
+            on_progress: Callback(completed, total, latest_result).
+            on_log: Callback(message) for log output.
+        """
+        self._db = db
+        self._num_workers = max(1, min(num_workers, 8))
+        self._cooldown_range = cooldown_range
+        self._batch_pause_every = batch_pause_every
+        self._batch_pause_range = batch_pause_range
+        self._max_retries = max_retries
+        self._task_timeout = task_timeout
+        self._resource_monitor = resource_monitor or ResourceMonitor()
+        self._circuit_breaker = circuit_breaker or CircuitBreaker(
+            failure_threshold=5, reset_timeout=60.0
+        )
+        self._password_2fa = password_2fa
+        self._headless = headless
+        self._on_progress = on_progress
+        self._on_log = on_log
+
+        self._shutdown_event = asyncio.Event()
+        self._queue: asyncio.Queue[int] = asyncio.Queue(
+            maxsize=self._num_workers * 2
+        )
+
+        # Shared counter for completed items
+        self._completed_count = 0
+
+        # Retry tracking: account_id -> attempts_used
+        self._retry_counts: dict[int, int] = {}
+
+    def request_shutdown(self) -> None:
+        """Request graceful shutdown. Workers finish current task and exit."""
+        self._shutdown_event.set()
+        self._log("[Pool] Shutdown requested - finishing active migrations...")
+
+    async def run(self, account_ids: list[int]) -> PoolResult:
+        """
+        Run the migration pool on the given account IDs.
+
+        Args:
+            account_ids: List of account database IDs to migrate.
+
+        Returns:
+            PoolResult with aggregate statistics.
+        """
+        if not account_ids:
+            return PoolResult()
+
+        self._shutdown_event.clear()
+        self._completed_count = 0
+        self._retry_counts.clear()
+        # Recreate queue to ensure clean state
+        self._queue = asyncio.Queue(maxsize=self._num_workers * 2)
+
+        total = len(account_ids)
+        result = PoolResult(total=total)
+
+        self._log(
+            f"[Pool] Starting migration: {total} accounts, "
+            f"{self._num_workers} workers"
+        )
+
+        # Create producer and worker tasks
+        producer = asyncio.create_task(self._producer(account_ids))
+        workers = [
+            asyncio.create_task(self._worker(i, total, result))
+            for i in range(self._num_workers)
+        ]
+
+        # Wait for producer to finish feeding the queue
+        await producer
+
+        # Wait until all items (including retries) are processed via queue.join()
+        await self._queue.join()
+
+        # Send stop sentinels for each worker
+        for _ in range(self._num_workers):
+            await self._queue.put(_STOP_SENTINEL)
+
+        # Wait for all workers to finish
+        await asyncio.gather(*workers)
+
+        self._log(
+            f"[Pool] Complete: {result.success_count} OK, "
+            f"{result.error_count} errors, "
+            f"{result.skipped_count} skipped, "
+            f"{result.total} total"
+        )
+
+        return result
+
+    async def _producer(self, account_ids: list[int]) -> None:
+        """Feed account IDs into the queue, respecting shutdown."""
+        for account_id in account_ids:
+            if self._shutdown_event.is_set():
+                self._log("[Pool] Producer stopping (shutdown requested)")
+                break
+            await self._queue.put(account_id)
+
+    async def _worker(
+        self, worker_id: int, total: int, result: PoolResult
+    ) -> None:
+        """
+        Worker coroutine: consume account IDs from queue and migrate.
+
+        Args:
+            worker_id: Worker identifier for logging.
+            total: Total number of accounts for progress display.
+            result: Shared PoolResult to record outcomes.
+        """
+        while True:
+            account_id = await self._queue.get()
+
+            if account_id == _STOP_SENTINEL:
+                self._queue.task_done()
+                break
+
+            if self._shutdown_event.is_set():
+                self._queue.task_done()
+                continue  # Drain queue without processing
+
+            try:
+                account_result = await self._process_account(
+                    worker_id, total, account_id
+                )
+            except Exception as exc:
+                logger.error(
+                    "[W%d] Unhandled error processing account %d: %s",
+                    worker_id, account_id, exc,
+                )
+                account_result = AccountResult(
+                    account_id=account_id,
+                    account_name=f"id={account_id}",
+                    success=False,
+                    error=f"Internal error: {exc}",
+                )
+
+            # Record result (only count non-retry results)
+            is_retry = (
+                account_result.error
+                and account_result.error.startswith("RETRY:")
+            )
+            if not is_retry:
+                result.results.append(account_result)
+                if account_result.success:
+                    result.success_count += 1
+                elif account_result.error and account_result.error.startswith("SKIP"):
+                    result.skipped_count += 1
+                else:
+                    result.error_count += 1
+
+            # Update completed count and fire progress callback
+            self._completed_count += 1
+            completed = self._completed_count
+
+            if self._on_progress:
+                try:
+                    self._on_progress(completed, total, account_result)
+                except Exception as exc:
+                    logger.warning("Progress callback error: %s", exc)
+
+            # Cooldown (skip on shutdown and retries)
+            if not self._shutdown_event.is_set() and not is_retry:
+                await self._cooldown(
+                    completed,
+                    is_flood_wait="FLOOD_WAIT" in (account_result.error or ""),
+                )
+
+            self._queue.task_done()
+
+    async def _process_account(
+        self, worker_id: int, total: int, account_id: int
+    ) -> AccountResult:
+        """
+        Process a single account: fetch from DB, migrate, update status.
+
+        Handles circuit breaker, resource checks, retries, and timeouts.
+
+        Args:
+            worker_id: Worker identifier for logging.
+            total: Total number of accounts for progress display.
+            account_id: Database ID of the account to migrate.
+
+        Returns:
+            AccountResult indicating success, failure, skip, or retry.
+        """
+        # Fetch account from DB
+        account = await self._db.get_account(account_id)
+        if not account:
+            return AccountResult(
+                account_id=account_id,
+                account_name=f"id={account_id}",
+                success=False,
+                error="SKIP: Account not found in DB",
+            )
+
+        name = account.name
+
+        # Wait for circuit breaker if open
+        if not self._circuit_breaker.can_proceed():
+            wait_time = self._circuit_breaker.time_until_reset()
+            self._log(
+                f"[W{worker_id}] Circuit breaker open, "
+                f"waiting {wait_time:.0f}s..."
+            )
+            await self._interruptible_sleep(wait_time)
+            if self._shutdown_event.is_set():
+                return AccountResult(
+                    account_id=account_id,
+                    account_name=name,
+                    success=False,
+                    error="SKIP: Shutdown during circuit breaker wait",
+                )
+
+        # Check resource availability
+        if not self._resource_monitor.can_launch_more():
+            self._log(
+                f"[W{worker_id}] Resources exhausted, "
+                f"waiting 30s for {name}..."
+            )
+            await self._interruptible_sleep(30.0)
+            if not self._resource_monitor.can_launch_more():
+                return AccountResult(
+                    account_id=account_id,
+                    account_name=name,
+                    success=False,
+                    error="SKIP: Resources exhausted after wait",
+                )
+
+        # Build proxy string
+        proxy_str = await self._build_proxy_string(account)
+
+        # Validate session dir exists
+        session_path = Path(account.session_path)
+        session_dir = session_path.parent
+        if not session_dir.exists():
+            self._log(f"[W{worker_id}] {name} - SKIP (session dir not found)")
+            try:
+                await self._db.update_account(
+                    account_id, status="error",
+                    error_message="Session dir not found"
+                )
+            except Exception as exc:
+                logger.warning("DB update failed for %s: %s", name, exc)
+            return AccountResult(
+                account_id=account_id,
+                account_name=name,
+                success=False,
+                error="SKIP: Session dir not found",
+            )
+
+        # Start migration tracking in DB
+        retries = self._retry_counts.get(account_id, 0)
+        try:
+            migration_id = await self._db.start_migration(account_id)
+        except Exception as exc:
+            logger.warning("DB start_migration failed for %s: %s", name, exc)
+            return AccountResult(
+                account_id=account_id,
+                account_name=name,
+                success=False,
+                error=f"DB error: {exc}",
+                retries_used=retries,
+            )
+
+        self._log(
+            f"[W{worker_id}] [{self._completed_count + 1}/{total}] "
+            f"{name}{'  (retry #' + str(retries) + ')' if retries else ''}..."
+        )
+
+        # Run migration with timeout
+        try:
+            auth_result: AuthResult = await asyncio.wait_for(
+                migrate_account(
+                    account_dir=session_dir,
+                    password_2fa=self._password_2fa,
+                    headless=self._headless,
+                    proxy_override=proxy_str,
+                ),
+                timeout=self._task_timeout,
+            )
+        except asyncio.TimeoutError:
+            error_msg = f"Timeout after {self._task_timeout:.0f}s"
+            self._log(f"[W{worker_id}] {name} - TIMEOUT")
+            await self._complete_migration_safe(
+                migration_id, name, success=False, error_message=error_msg
+            )
+            self._circuit_breaker.record_failure()
+            return await self._maybe_retry(
+                account_id, name, error_msg, retries
+            )
+        except Exception as exc:
+            error_msg = str(exc)
+            self._log(f"[W{worker_id}] {name} - ERROR: {error_msg}")
+            await self._complete_migration_safe(
+                migration_id, name, success=False, error_message=error_msg
+            )
+            self._circuit_breaker.record_failure()
+            return await self._maybe_retry(
+                account_id, name, error_msg, retries
+            )
+
+        # Process result
+        if auth_result.success:
+            username = (
+                auth_result.user_info.get("username")
+                if auth_result.user_info else None
+            )
+            profile_path = (
+                str(Path("profiles") / auth_result.profile_name)
+                if auth_result.profile_name else None
+            )
+            await self._complete_migration_safe(
+                migration_id, name, success=True, profile_path=profile_path
+            )
+            if username:
+                try:
+                    await self._db.update_account(
+                        account_id, username=username
+                    )
+                except Exception as exc:
+                    logger.warning("DB update username for %s: %s", name, exc)
+            self._circuit_breaker.record_success()
+            self._log(f"[W{worker_id}] {name} - OK")
+            return AccountResult(
+                account_id=account_id,
+                account_name=name,
+                success=True,
+                retries_used=retries,
+            )
+        else:
+            error_msg = auth_result.error or "Unknown error"
+            await self._complete_migration_safe(
+                migration_id, name, success=False, error_message=error_msg
+            )
+            self._circuit_breaker.record_failure()
+            self._log(f"[W{worker_id}] {name} - FAILED: {error_msg}")
+            return await self._maybe_retry(
+                account_id, name, error_msg, retries
+            )
+
+    async def _complete_migration_safe(
+        self,
+        migration_id: int,
+        name: str,
+        success: bool,
+        error_message: Optional[str] = None,
+        profile_path: Optional[str] = None,
+    ) -> None:
+        """Wrapper around db.complete_migration that won't crash the worker."""
+        try:
+            await self._db.complete_migration(
+                migration_id,
+                success=success,
+                error_message=error_message,
+                profile_path=profile_path,
+            )
+        except Exception as exc:
+            logger.error(
+                "DB complete_migration failed for %s (migration_id=%d): %s",
+                name, migration_id, exc,
+            )
+
+    async def _maybe_retry(
+        self,
+        account_id: int,
+        name: str,
+        error: str,
+        retries_used: int,
+    ) -> AccountResult:
+        """Re-enqueue account for retry if under max_retries, else return failure.
+
+        On successful re-enqueue, returns a RETRY:-prefixed result so the worker
+        knows not to count it as final. The re-enqueued item gets its own
+        queue.task_done() call when processed.
+        """
+        if retries_used < self._max_retries and not self._shutdown_event.is_set():
+            self._retry_counts[account_id] = retries_used + 1
+            self._log(
+                f"[Pool] {name} - scheduling retry "
+                f"#{retries_used + 1}/{self._max_retries}"
+            )
+            try:
+                self._queue.put_nowait(account_id)
+            except asyncio.QueueFull:
+                self._log(f"[Pool] {name} - queue full, retry dropped")
+                return AccountResult(
+                    account_id=account_id,
+                    account_name=name,
+                    success=False,
+                    error=error,
+                    retries_used=retries_used,
+                )
+            return AccountResult(
+                account_id=account_id,
+                account_name=name,
+                success=False,
+                error=f"RETRY: {error}",
+                retries_used=retries_used,
+            )
+
+        return AccountResult(
+            account_id=account_id,
+            account_name=name,
+            success=False,
+            error=error,
+            retries_used=retries_used,
+        )
+
+    async def _build_proxy_string(
+        self, account: AccountRecord
+    ) -> Optional[str]:
+        """Build proxy connection string from DB proxy record."""
+        if not account.proxy_id:
+            return None
+        proxy = await self._db.get_proxy(account.proxy_id)
+        if not proxy:
+            return None
+        if proxy.username and proxy.password:
+            return (
+                f"{proxy.protocol}:{proxy.host}:{proxy.port}"
+                f":{proxy.username}:{proxy.password}"
+            )
+        return f"{proxy.protocol}:{proxy.host}:{proxy.port}"
+
+    async def _cooldown(
+        self, completed_total: int, is_flood_wait: bool = False
+    ) -> None:
+        """
+        Apply per-worker cooldown and global batch pause.
+
+        Args:
+            completed_total: Total completed across all workers.
+            is_flood_wait: If True, triple the cooldown.
+        """
+        # Batch pause check (global, every N completed)
+        if (
+            self._batch_pause_every > 0
+            and completed_total > 0
+            and completed_total % self._batch_pause_every == 0
+        ):
+            pause = random.uniform(*self._batch_pause_range)
+            self._log(
+                f"[Pool] Batch pause {pause / 60:.1f} min "
+                f"(every {self._batch_pause_every} accounts)..."
+            )
+            await self._interruptible_sleep(pause)
+            return  # Batch pause replaces regular cooldown
+
+        # Regular per-worker cooldown
+        base = random.uniform(*self._cooldown_range)
+        cooldown = base * 3 if is_flood_wait else base
+        if is_flood_wait:
+            self._log(
+                f"[Pool] FLOOD_WAIT detected - extended cooldown "
+                f"{cooldown:.0f}s"
+            )
+        await self._interruptible_sleep(cooldown)
+
+    async def _interruptible_sleep(self, seconds: float) -> None:
+        """Sleep that can be interrupted by shutdown event."""
+        try:
+            await asyncio.wait_for(
+                self._shutdown_event.wait(), timeout=seconds
+            )
+        except asyncio.TimeoutError:
+            pass  # Normal: timeout means sleep completed without shutdown
+
+    def _log(self, message: str) -> None:
+        """Send message to log callback and logger."""
+        logger.info(message)
+        if self._on_log:
+            try:
+                self._on_log(message)
+            except Exception as exc:
+                logger.warning("Log callback error: %s", exc)

@@ -78,6 +78,7 @@ class TGWebAuthApp:
         self._active_browsers: List = []
         self._shutting_down: bool = False
         self._migration_cancel: bool = False
+        self._active_pool = None
 
     def _start_async_loop(self) -> None:
         """Start async event loop in background thread."""
@@ -1003,100 +1004,39 @@ class TGWebAuthApp:
     def _stop_migration(self, sender=None, app_data=None) -> None:
         """Stop ongoing migration."""
         self._migration_cancel = True
-        self._log("[Migrate] STOP requested - finishing current account...")
+        if hasattr(self, '_active_pool') and self._active_pool:
+            self._active_pool.request_shutdown()
+        self._log("[Migrate] STOP requested - finishing active accounts...")
 
     async def _batch_migrate(self, account_ids: list) -> None:
-        """Batch migrate accounts with cooldowns and batch pauses."""
+        """Batch migrate accounts using parallel worker pool."""
         try:
-            import random
-            from ..telegram_auth import migrate_account
+            from ..worker_pool import MigrationWorkerPool
 
-            total = len(account_ids)
-            success_count = 0
-            error_count = 0
-            batch_pause_every = 10
-            batch_pause_range = (300, 600)  # 5-10 minutes
-            cooldown_range = (60, 120)      # 60-120 seconds
+            pool = MigrationWorkerPool(
+                db=self._controller.db,
+                num_workers=3,
+                password_2fa=self._2fa_password,
+                on_progress=lambda completed, total, result:
+                    self._schedule_ui(lambda: self._refresh_table_async()),
+                on_log=lambda msg: self._log(msg),
+            )
 
-            for i, account_id in enumerate(account_ids):
-                if self._migration_cancel:
-                    self._log(f"[Migrate] Stopped at {i}/{total}")
-                    break
+            self._active_pool = pool
 
-                account = await self._controller.db.get_account(account_id)
-                if not account:
-                    continue
+            result = await pool.run(account_ids)
 
-                self._log(f"[Migrate] [{i+1}/{total}] {account.name}...")
-                await self._controller.db.update_account(account_id, status="migrating")
-                self._schedule_ui(lambda: self._refresh_table_async())
-
-                session_path = Path(account.session_path)
-                session_dir = session_path.parent
-
-                if not session_dir.exists():
-                    self._log(f"[Migrate] {account.name} - SKIP (session not found)")
-                    await self._controller.db.update_account(account_id, status="error",
-                                                             error_message="Session dir not found")
-                    error_count += 1
-                    continue
-
-                try:
-                    # Build proxy string from DB if available
-                    proxy_str = await self._build_proxy_string(account)
-
-                    result = await migrate_account(
-                        account_dir=session_dir,
-                        password_2fa=self._2fa_password,
-                        headless=True,
-                        proxy_override=proxy_str
-                    )
-
-                    if result.success:
-                        await self._controller.db.update_account(
-                            account_id,
-                            status="healthy",
-                            username=result.user_info.get("username") if result.user_info else None,
-                            error_message=None
-                        )
-                        self._log(f"[Migrate] {account.name} - OK")
-                        success_count += 1
-                    else:
-                        await self._controller.db.update_account(
-                            account_id,
-                            status="error",
-                            error_message=result.error
-                        )
-                        self._log(f"[Migrate] {account.name} - FAILED: {result.error}")
-                        error_count += 1
-
-                except Exception as e:
-                    await self._controller.db.update_account(
-                        account_id,
-                        status="error",
-                        error_message=str(e)
-                    )
-                    self._log(f"[Migrate] {account.name} - ERROR: {e}")
-                    error_count += 1
-
-                # Cooldown and batch pause
-                if i < total - 1 and not self._migration_cancel:
-                    # Batch pause every N accounts
-                    if (i + 1) % batch_pause_every == 0:
-                        pause = random.uniform(*batch_pause_range)
-                        self._log(f"[Migrate] Batch pause {pause/60:.1f} min (every {batch_pause_every} accounts)...")
-                        await asyncio.sleep(pause)
-                    else:
-                        cooldown = random.uniform(*cooldown_range)
-                        self._log(f"[Migrate] Cooldown {cooldown:.0f}s...")
-                        await asyncio.sleep(cooldown)
-
-            self._log(f"[Migrate] Done: {success_count} OK, {error_count} errors, {total} total")
+            self._log(
+                f"[Migrate] Done: {result.success_count} OK, "
+                f"{result.error_count} errors, {result.total} total"
+            )
+            self._active_pool = None
             self._schedule_ui(lambda: self._refresh_table_async())
 
         except Exception as e:
             logger.error("Batch migrate error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Batch migrate: {e}")
+            self._active_pool = None
 
     def _auto_assign_proxies(self, sender=None, app_data=None) -> None:
         """Auto-assign free proxies to accounts without proxies."""
