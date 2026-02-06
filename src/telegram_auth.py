@@ -19,6 +19,7 @@ import logging
 import random
 import math
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -32,9 +33,8 @@ try:
     import cv2
     import numpy as np
     from PIL import Image
-except ImportError:
-    logger.error("opencv-python/Pillow not installed. Run: pip install opencv-python Pillow")
-    exit(1)
+except ImportError as e:
+    raise ImportError("opencv-python/Pillow not installed. Run: pip install opencv-python Pillow") from e
 
 # pyzbar is optional - lazy load to avoid DLL errors on Windows
 pyzbar = None
@@ -54,9 +54,8 @@ try:
     from telethon.sessions import SQLiteSession
     from telethon.tl.functions.auth import AcceptLoginTokenRequest
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
-except ImportError:
-    logger.error("telethon not installed. Run: pip install telethon")
-    exit(1)
+except ImportError as e:
+    raise ImportError("telethon not installed. Run: pip install telethon") from e
 
 from .browser_manager import BrowserManager, BrowserProfile, BrowserContext
 
@@ -220,31 +219,34 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
         import tempfile
         import os
 
-        # Save image to temp file
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-            temp_path = f.name
-            image.save(f, 'PNG')
+        temp_path = None
+        try:
+            # Save image to temp file
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                temp_path = f.name
+                image.save(f, 'PNG')
 
-        # Call Node.js decoder
-        script_path = os.path.join(os.path.dirname(__file__), '..', 'decode_qr.js')
-        result = subprocess.run(
-            ['node', script_path, temp_path],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
+            # Call Node.js decoder
+            script_path = os.path.join(os.path.dirname(__file__), '..', 'decode_qr.js')
+            result = subprocess.run(
+                ['node', script_path, temp_path],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
 
-        os.unlink(temp_path)
-
-        if result.returncode == 0 and result.stdout.strip():
-            data = result.stdout.strip()
-            if data != 'QR_NOT_FOUND' and 'tg://login?token=' in data:
-                token_bytes = extract_token(data)
-                if token_bytes:
-                    logger.info("Decoded QR with jsQR (Node.js)")
-                    return token_bytes
+            if result.returncode == 0 and result.stdout.strip():
+                data = result.stdout.strip()
+                if data != 'QR_NOT_FOUND' and 'tg://login?token=' in data:
+                    token_bytes = extract_token(data)
+                    if token_bytes:
+                        logger.info("Decoded QR with jsQR (Node.js)")
+                        return token_bytes
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
     except Exception as e:
-        logger.debug(f"jsQR error: {e}")
+        logger.debug("jsQR error: %s", e)
 
     # Try QRCodeDetectorAruco (more robust than standard detector)
     try:
@@ -958,7 +960,8 @@ class TelegramAuth:
             if retry > 0:
                 logger.info(f"QR retry {retry + 1}/{self.QR_MAX_RETRIES}...")
                 # Сбрасываем флаг jsQR при reload (скрипт теряется)
-                self._jsqr_injected = False
+                if hasattr(self, '_jsqr_injected'):
+                    delattr(self, '_jsqr_injected')
                 # Обновляем страницу для нового QR
                 try:
                     await page.reload(wait_until="domcontentloaded", timeout=30000)
@@ -1182,7 +1185,7 @@ class TelegramAuth:
             # FIX-005: Упрощённый ввод - быстрый но с небольшой задержкой
             # 50ms delay достаточен для большинства сайтов
             await page.keyboard.type(password, delay=50)
-            logger.debug(f"Password typed ({len(password)} chars)")
+            logger.debug("Password typed")
 
             # Короткая пауза перед Enter
             await asyncio.sleep(0.5)
@@ -1438,8 +1441,7 @@ class TelegramAuth:
                 )
 
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            logger.error("Authorization failed for '%s': %s", profile.name, e, exc_info=True)
             return AuthResult(
                 success=False,
                 profile_name=profile.name,
@@ -1480,9 +1482,10 @@ class TelegramAuth:
 
 
 # FIX #6: MULTI-ACCOUNT COOLDOWN
-DEFAULT_ACCOUNT_COOLDOWN = 45  # базовое значение в секундах
-MIN_COOLDOWN = 30  # минимальный cooldown
-MAX_COOLDOWN = 135  # максимальный cooldown
+# Safety: 60-120s random cooldown between accounts (research: 10-20 logins/hour)
+DEFAULT_ACCOUNT_COOLDOWN = 90  # базовое значение в секундах (центр диапазона)
+MIN_COOLDOWN = 60  # минимальный cooldown
+MAX_COOLDOWN = 180  # максимальный cooldown
 
 
 def get_randomized_cooldown(base_cooldown: float = DEFAULT_ACCOUNT_COOLDOWN) -> float:
@@ -1512,7 +1515,8 @@ def get_randomized_cooldown(base_cooldown: float = DEFAULT_ACCOUNT_COOLDOWN) -> 
 async def migrate_account(
     account_dir: Path,
     password_2fa: Optional[str] = None,
-    headless: bool = False
+    headless: bool = False,
+    proxy_override: Optional[str] = None
 ) -> AuthResult:
     """
     Мигрирует один аккаунт из session в browser profile.
@@ -1521,11 +1525,14 @@ async def migrate_account(
         account_dir: Директория с session, api.json, ___config.json
         password_2fa: Пароль 2FA
         headless: Headless режим
+        proxy_override: Прокси строка из БД (перезаписывает ___config.json)
 
     Returns:
         AuthResult
     """
     account = AccountConfig.load(account_dir)
+    if proxy_override is not None:
+        account.proxy = proxy_override
     auth = TelegramAuth(account)
     return await auth.authorize(password_2fa=password_2fa, headless=headless)
 
@@ -1971,8 +1978,8 @@ async def main():
 
     account_path = Path(args.account)
     if not account_path.exists():
-        print(f"Error: Account directory not found: {account_path}")
-        exit(1)
+        logger.error("Account directory not found: %s", account_path)
+        sys.exit(1)
 
     result = await migrate_account(
         account_dir=account_path,
@@ -1980,20 +1987,20 @@ async def main():
         headless=args.headless
     )
 
-    print(f"\n{'='*60}")
-    print("RESULT")
-    print(f"{'='*60}")
-    print(f"Success: {result.success}")
-    print(f"Profile: {result.profile_name}")
-    print(f"Telethon alive: {result.telethon_alive}")
+    logger.info("=" * 60)
+    logger.info("RESULT")
+    logger.info("=" * 60)
+    logger.info("Success: %s", result.success)
+    logger.info("Profile: %s", result.profile_name)
+    logger.info("Telethon alive: %s", result.telethon_alive)
     if result.error:
-        print(f"Error: {result.error}")
+        logger.info("Error: %s", result.error)
     if result.required_2fa:
-        print(f"Required 2FA: Yes")
+        logger.info("Required 2FA: Yes")
     if result.user_info:
-        print(f"User: {result.user_info}")
+        logger.info("User: %s", result.user_info)
 
-    exit(0 if result.success else 1)
+    sys.exit(0 if result.success else 1)
 
 
 if __name__ == "__main__":

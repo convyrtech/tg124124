@@ -34,16 +34,15 @@ if sys.platform == 'win32':
 
 try:
     import click
-except ImportError:
-    print("ERROR: click not installed. Run: pip install click")
-    exit(1)
+except ImportError as e:
+    raise ImportError("click not installed. Run: pip install click") from e
 
 
 ACCOUNTS_DIR = Path("accounts")
 PROFILES_DIR = Path("profiles")
 
-# FIX #6: Default cooldown между аккаунтами
-DEFAULT_COOLDOWN = 45  # секунд
+# FIX #6: Default cooldown между аккаунтами (safe: 60-120s = 10-20 logins/hour)
+DEFAULT_COOLDOWN = 90  # секунд (центр безопасного диапазона 60-120)
 
 
 def find_account_dirs() -> list[Path]:

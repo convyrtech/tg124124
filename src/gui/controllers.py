@@ -119,16 +119,33 @@ class AppController:
                 if api_json.exists():
                     shutil.copy2(api_json, dest_dir / "api.json")
 
-                # Copy ___config.json if exists
+                # Copy ___config.json if exists and parse proxy/name
                 config_json = account_dir / "___config.json"
+                proxy_str = None
                 if config_json.exists():
                     shutil.copy2(config_json, dest_dir / "___config.json")
+                    try:
+                        import json
+                        with open(config_json, 'r', encoding='utf-8') as f:
+                            config = json.load(f)
+                            proxy_str = config.get("Proxy")
+                            config_name = config.get("Name")
+                            if config_name:
+                                name = f"{name} ({config_name})"
+                    except (json.JSONDecodeError, IOError):
+                        pass
 
                 # Add to database
-                await self.db.add_account(
+                account_id = await self.db.add_account(
                     name=name,
                     session_path=str(dest_session)
                 )
+
+                # Auto-link proxy from config if available
+                if proxy_str and account_id:
+                    proxy_id = await self._find_or_create_proxy(proxy_str)
+                    if proxy_id:
+                        await self.db.assign_proxy(account_id, proxy_id)
 
                 imported += 1
 
@@ -140,6 +157,29 @@ class AppController:
                 logger.error("Failed to import %s: %s", session_path, e)
 
         return imported, skipped
+
+    async def _find_or_create_proxy(self, proxy_str: str) -> Optional[int]:
+        """Find existing proxy or create new one from config string. Returns proxy ID."""
+        try:
+            host, port, username, password, protocol = self._parse_proxy_line(proxy_str)
+            if not host or not port:
+                return None
+
+            # Check if proxy already exists
+            existing = await self.db.list_proxies()
+            for p in existing:
+                if p.host == host and p.port == port:
+                    return p.id
+
+            # Create new proxy
+            return await self.db.add_proxy(
+                host=host, port=port,
+                username=username, password=password,
+                protocol=protocol
+            )
+        except Exception as e:
+            logger.warning("Failed to parse/create proxy from config: %s", e)
+            return None
 
     async def import_proxies(self, proxy_list: str) -> int:
         """

@@ -615,3 +615,139 @@ class TestFloodWaitHandling:
 
         # Should abort, not wait 1 hour
         assert result is False
+
+
+class TestCircuitBreaker:
+    """Tests for CircuitBreaker class."""
+
+    def test_initial_state_closed(self):
+        """Circuit should start in closed state."""
+        from src.telegram_auth import CircuitBreaker
+
+        breaker = CircuitBreaker()
+        assert not breaker.is_open
+        assert breaker.can_proceed()
+        assert breaker.consecutive_failures == 0
+
+    def test_opens_after_threshold_failures(self):
+        """Circuit should open after reaching failure threshold."""
+        from src.telegram_auth import CircuitBreaker
+
+        breaker = CircuitBreaker(failure_threshold=3, reset_timeout=60)
+
+        breaker.record_failure()
+        assert not breaker.is_open
+
+        breaker.record_failure()
+        assert not breaker.is_open
+
+        breaker.record_failure()  # Third failure
+        assert breaker.is_open
+        assert not breaker.can_proceed()
+
+    def test_success_resets_failures(self):
+        """Success should reset failure counter and close circuit."""
+        from src.telegram_auth import CircuitBreaker
+
+        breaker = CircuitBreaker(failure_threshold=3)
+
+        breaker.record_failure()
+        breaker.record_failure()
+        assert breaker.consecutive_failures == 2
+
+        breaker.record_success()
+        assert breaker.consecutive_failures == 0
+        assert not breaker.is_open
+
+    def test_success_closes_open_circuit(self):
+        """Success should close an open circuit."""
+        from src.telegram_auth import CircuitBreaker
+
+        breaker = CircuitBreaker(failure_threshold=2)
+
+        breaker.record_failure()
+        breaker.record_failure()
+        assert breaker.is_open
+
+        breaker.record_success()
+        assert not breaker.is_open
+        assert breaker.can_proceed()
+
+    def test_can_proceed_after_reset_timeout(self):
+        """Circuit should allow retry after reset timeout."""
+        from src.telegram_auth import CircuitBreaker
+        import time
+
+        breaker = CircuitBreaker(failure_threshold=1, reset_timeout=0.1)  # 100ms
+
+        breaker.record_failure()
+        assert breaker.is_open
+        assert not breaker.can_proceed()
+
+        time.sleep(0.15)  # Wait past reset timeout
+        assert breaker.can_proceed()  # Should allow retry
+
+    def test_time_until_reset(self):
+        """time_until_reset should return remaining wait time."""
+        from src.telegram_auth import CircuitBreaker
+
+        breaker = CircuitBreaker(failure_threshold=1, reset_timeout=60)
+
+        # Closed circuit
+        assert breaker.time_until_reset() == 0.0
+
+        breaker.record_failure()
+        remaining = breaker.time_until_reset()
+        assert 55 < remaining <= 60  # Approximately 60s remaining
+
+    def test_manual_reset(self):
+        """reset() should restore initial state."""
+        from src.telegram_auth import CircuitBreaker
+
+        breaker = CircuitBreaker(failure_threshold=2)
+
+        breaker.record_failure()
+        breaker.record_failure()
+        assert breaker.is_open
+
+        breaker.reset()
+        assert not breaker.is_open
+        assert breaker.consecutive_failures == 0
+        assert breaker.can_proceed()
+
+    def test_custom_thresholds(self):
+        """Custom threshold values should be respected."""
+        from src.telegram_auth import CircuitBreaker
+
+        breaker = CircuitBreaker(failure_threshold=10, reset_timeout=120)
+
+        for i in range(9):
+            breaker.record_failure()
+            assert not breaker.is_open
+
+        breaker.record_failure()  # 10th failure
+        assert breaker.is_open
+
+
+class TestParallelMigrationControllerWithCircuitBreaker:
+    """Tests for ParallelMigrationController circuit breaker integration."""
+
+    @pytest.mark.asyncio
+    async def test_controller_has_circuit_breaker(self, tmp_path):
+        """Controller should have a circuit breaker."""
+        from src.telegram_auth import ParallelMigrationController
+
+        controller = ParallelMigrationController(max_concurrent=5)
+        assert controller.circuit_breaker is not None
+
+    @pytest.mark.asyncio
+    async def test_controller_accepts_custom_circuit_breaker(self, tmp_path):
+        """Controller should accept custom circuit breaker."""
+        from src.telegram_auth import ParallelMigrationController, CircuitBreaker
+
+        breaker = CircuitBreaker(failure_threshold=10)
+        controller = ParallelMigrationController(
+            max_concurrent=5,
+            circuit_breaker=breaker
+        )
+        assert controller.circuit_breaker is breaker

@@ -4,18 +4,29 @@ Resource Monitor for Parallel Migration.
 Monitors system resources to prevent overload when running
 many browser instances in parallel.
 """
+import logging
 import psutil
 from dataclasses import dataclass
 from typing import Dict
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ResourceLimits:
-    """Resource usage limits."""
-    max_memory_percent: float = 80.0  # Stop launching if memory > 80%
-    max_cpu_percent: float = 90.0      # Stop launching if CPU > 90%
-    min_memory_available_gb: float = 2.0  # Need at least 2GB free
-    memory_per_browser_gb: float = 0.5    # Estimate per Camoufox instance
+    """
+    Resource usage limits for parallel migration.
+
+    Attributes:
+        max_memory_percent: Stop launching if memory usage exceeds this (0-100)
+        max_cpu_percent: Stop launching if CPU usage exceeds this (0-100)
+        min_memory_available_gb: Minimum free memory required in GB
+        memory_per_browser_gb: Estimated memory per Camoufox instance in GB
+    """
+    max_memory_percent: float = 80.0
+    max_cpu_percent: float = 90.0
+    min_memory_available_gb: float = 2.0
+    memory_per_browser_gb: float = 0.5
 
 
 class ResourceMonitor:
@@ -34,7 +45,15 @@ class ResourceMonitor:
         max_memory_percent: float = 80.0,
         max_cpu_percent: float = 90.0,
         min_memory_available_gb: float = 2.0
-    ):
+    ) -> None:
+        """
+        Initialize resource monitor with limits.
+
+        Args:
+            max_memory_percent: Stop launching if memory > this percent (default 80)
+            max_cpu_percent: Stop launching if CPU > this percent (default 90)
+            min_memory_available_gb: Minimum free memory in GB (default 2.0)
+        """
         self.limits = ResourceLimits(
             max_memory_percent=max_memory_percent,
             max_cpu_percent=max_cpu_percent,
@@ -42,30 +61,64 @@ class ResourceMonitor:
         )
 
     def _get_resources(self) -> Dict[str, float]:
-        """Get current resource usage (internal, mockable for tests)."""
+        """
+        Get current resource usage (internal, mockable for tests).
+
+        Returns:
+            Dict with cpu_percent, memory_percent, memory_available_gb, memory_total_gb
+        """
         return self.get_current()
 
     def get_current(self) -> Dict[str, float]:
-        """Get current system resource usage."""
-        memory = psutil.virtual_memory()
-        cpu = psutil.cpu_percent(interval=0.1)
+        """
+        Get current system resource usage.
 
-        return {
-            'cpu_percent': cpu,
-            'memory_percent': memory.percent,
-            'memory_available_gb': memory.available / (1024 ** 3),
-            'memory_total_gb': memory.total / (1024 ** 3),
-        }
+        Returns:
+            Dict with keys: cpu_percent, memory_percent, memory_available_gb, memory_total_gb
+
+        Note:
+            Returns conservative defaults if psutil fails.
+        """
+        try:
+            memory = psutil.virtual_memory()
+            cpu = psutil.cpu_percent(interval=0.1)
+
+            return {
+                'cpu_percent': cpu,
+                'memory_percent': memory.percent,
+                'memory_available_gb': memory.available / (1024 ** 3),
+                'memory_total_gb': memory.total / (1024 ** 3),
+            }
+        except (OSError, AttributeError) as e:
+            logger.warning("Could not read system resources: %s. Using conservative defaults.", e)
+            # Return conservative defaults that will limit concurrency
+            return {
+                'cpu_percent': 50.0,
+                'memory_percent': 50.0,
+                'memory_available_gb': 4.0,
+                'memory_total_gb': 8.0,
+            }
 
     def can_launch_more(self) -> bool:
-        """Check if system can handle more browser instances."""
+        """
+        Check if system can handle more browser instances.
+
+        Returns:
+            True if resources are available, False if limits exceeded.
+        """
         resources = self._get_resources()
 
         if resources['memory_percent'] > self.limits.max_memory_percent:
+            logger.debug("Memory limit reached: %.1f%% > %.1f%%",
+                        resources['memory_percent'], self.limits.max_memory_percent)
             return False
         if resources['cpu_percent'] > self.limits.max_cpu_percent:
+            logger.debug("CPU limit reached: %.1f%% > %.1f%%",
+                        resources['cpu_percent'], self.limits.max_cpu_percent)
             return False
         if resources['memory_available_gb'] < self.limits.min_memory_available_gb:
+            logger.debug("Available memory too low: %.1fGB < %.1fGB",
+                        resources['memory_available_gb'], self.limits.min_memory_available_gb)
             return False
 
         return True
@@ -74,7 +127,12 @@ class ResourceMonitor:
         """
         Recommend number of concurrent browsers based on available resources.
 
-        Returns a conservative estimate based on available memory.
+        Returns:
+            Recommended number of concurrent browsers (1-50).
+
+        Note:
+            Returns conservative estimate based on available memory,
+            reserving 2GB for system operations.
         """
         resources = self._get_resources()
         available_gb = resources['memory_available_gb']
@@ -87,7 +145,12 @@ class ResourceMonitor:
         return max(1, min(recommended, 50))
 
     def format_status(self) -> str:
-        """Format current status for display."""
+        """
+        Format current resource status for display.
+
+        Returns:
+            Human-readable string with CPU, memory percent, and available GB.
+        """
         r = self._get_resources()
         return (
             f"CPU: {r['cpu_percent']:.1f}% | "

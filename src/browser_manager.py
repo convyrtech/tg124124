@@ -10,16 +10,19 @@ Browser Manager Module
 ВАЖНО: Браузеры НЕ поддерживают SOCKS5 с авторизацией напрямую.
 Используем proxy_relay для создания локального HTTP прокси.
 """
+import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 
+logger = logging.getLogger(__name__)
+
 try:
     from camoufox.async_api import AsyncCamoufox
-except ImportError:
-    print("ERROR: camoufox not installed. Run: pip install camoufox && camoufox fetch")
-    exit(1)
+except ImportError as e:
+    raise ImportError("camoufox not installed. Run: pip install camoufox && camoufox fetch") from e
 
 from .proxy_relay import ProxyRelay, needs_relay
 
@@ -48,27 +51,8 @@ class BrowserProfile:
         return self.browser_data_path.exists()
 
 
-def parse_proxy(proxy_str: str) -> Dict[str, Any]:
-    """
-    Парсит прокси из формата 'socks5:host:port:user:pass'
-
-    Форматы:
-    - socks5:host:port:user:pass
-    - socks5:host:port
-    - http:host:port:user:pass
-    """
-    parts = proxy_str.split(":")
-    if len(parts) == 5:
-        proto, host, port, user, pwd = parts
-        return {
-            "server": f"{proto}://{host}:{port}",
-            "username": user,
-            "password": pwd,
-        }
-    elif len(parts) == 3:
-        proto, host, port = parts
-        return {"server": f"{proto}://{host}:{port}"}
-    raise ValueError(f"Invalid proxy format: {proxy_str}. Expected: socks5:host:port:user:pass")
+# Re-export from utils for backwards compatibility
+from .utils import parse_proxy_for_camoufox as parse_proxy
 
 
 class BrowserManager:
@@ -122,9 +106,8 @@ class BrowserManager:
                         with open(config_path, 'r', encoding='utf-8') as f:
                             config = json.load(f)
                             proxy = config.get('proxy')
-                    except (json.JSONDecodeError, IOError):
-                        # Игнорируем битые конфиги
-                        pass
+                    except (json.JSONDecodeError, IOError) as e:
+                        logger.warning("Failed to read profile config %s: %s", config_path, e)
 
                 profiles.append(BrowserProfile(
                     name=path.name,
@@ -143,19 +126,15 @@ class BrowserManager:
         args = {**self.DEFAULT_CONFIG}
         args["headless"] = headless
 
-        # Прокси
         if profile.proxy:
             args["proxy"] = parse_proxy(profile.proxy)
 
-        # Persistent context
         profile.path.mkdir(parents=True, exist_ok=True)
         args["persistent_context"] = True
         args["user_data_dir"] = str(profile.browser_data_path)
 
-        # Сохраняем конфиг профиля
         self._save_profile_config(profile)
 
-        # Extra args
         if extra_args:
             args.update(extra_args)
 
@@ -171,6 +150,9 @@ class BrowserManager:
         with open(profile.config_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
 
+    # FIX-007: Timeout для запуска браузера
+    BROWSER_LAUNCH_TIMEOUT = 60  # секунд
+
     async def launch(
         self,
         profile: BrowserProfile,
@@ -184,25 +166,37 @@ class BrowserManager:
         запускается локальный proxy relay (браузеры не поддерживают
         SOCKS5 auth напрямую).
 
+        FIX-003: Удаляет stale lock файлы перед запуском.
+        FIX-007: Добавлен timeout на запуск браузера.
+
         Returns:
             BrowserContext wrapper с page и методами управления
         """
         proxy_relay = None
 
-        # Проверяем нужен ли proxy relay для SOCKS5 с auth
+        # FIX-003: Очистка stale lock файлов от предыдущего краша
+        browser_data_path = profile.browser_data_path
+        if browser_data_path.exists():
+            lock_patterns = ['*.lock', 'parent.lock', '.parentlock', 'lock']
+            for pattern in lock_patterns:
+                for lock_file in browser_data_path.glob(pattern):
+                    try:
+                        lock_file.unlink()
+                        logger.debug("Removed stale lock file: %s", lock_file)
+                    except Exception as e:
+                        logger.warning("Could not remove lock file %s: %s", lock_file, e)
+
         if profile.proxy and needs_relay(profile.proxy):
-            print(f"[BrowserManager] SOCKS5 with auth detected - starting proxy relay...")
+            logger.info("SOCKS5 with auth detected - starting proxy relay...")
             proxy_relay = ProxyRelay(profile.proxy)
             await proxy_relay.start()
 
-            # Создаём временный профиль с локальным HTTP прокси
             relay_profile = BrowserProfile(
                 name=profile.name,
                 path=profile.path,
-                proxy=None  # Прокси передадим через extra_args
+                proxy=None,
             )
 
-            # Передаём локальный HTTP прокси вместо SOCKS5
             if extra_args is None:
                 extra_args = {}
             extra_args["proxy"] = proxy_relay.browser_proxy_config
@@ -213,19 +207,29 @@ class BrowserManager:
             args = self._build_camoufox_args(profile, headless, extra_args)
             proxy_info = args.get('proxy', {}).get('server', 'no proxy')
 
-        print(f"[BrowserManager] Launching Camoufox for '{profile.name}'")
-        print(f"[BrowserManager] Profile: {profile.browser_data_path}")
-        print(f"[BrowserManager] Proxy: {proxy_info}")
-        print(f"[BrowserManager] Headless: {headless}")
+        logger.info("Launching Camoufox for '%s'", profile.name)
+        logger.info("Profile: %s", profile.browser_data_path)
+        logger.info("Proxy: %s", proxy_info)
+        logger.info("Headless: %s", headless)
 
         camoufox = AsyncCamoufox(**args)
-        browser = await camoufox.__aenter__()
+
+        try:
+            browser = await asyncio.wait_for(
+                camoufox.__aenter__(),
+                timeout=self.BROWSER_LAUNCH_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            if proxy_relay:
+                await proxy_relay.stop()
+            raise RuntimeError(f"Browser launch timeout after {self.BROWSER_LAUNCH_TIMEOUT}s")
 
         ctx = BrowserContext(
             profile=profile,
             browser=browser,
             camoufox=camoufox,
-            proxy_relay=proxy_relay  # Передаём для управления lifecycle
+            proxy_relay=proxy_relay,
+            manager=self,  # Back-reference for cleanup
         )
 
         self._active_browsers[profile.name] = ctx
@@ -237,7 +241,7 @@ class BrowserManager:
             try:
                 await ctx.close()
             except Exception as e:
-                print(f"[BrowserManager] Warning: error closing {name}: {e}")
+                logger.warning("Error closing %s: %s", name, e)
         self._active_browsers.clear()
 
 
@@ -252,12 +256,14 @@ class BrowserContext:
         profile: BrowserProfile,
         browser,
         camoufox,
-        proxy_relay: Optional[ProxyRelay] = None
+        proxy_relay: Optional[ProxyRelay] = None,
+        manager: Optional["BrowserManager"] = None,
     ):
         self.profile = profile
         self.browser = browser
         self._camoufox = camoufox
-        self._proxy_relay = proxy_relay  # Для управления lifecycle
+        self._proxy_relay = proxy_relay
+        self._manager = manager
         self._page = None
         self._closed = False
 
@@ -268,12 +274,8 @@ class BrowserContext:
         В persistent context Camoufox открывает браузер с пустой страницей.
         Мы переиспользуем её вместо создания новой (избегаем двух окон).
         """
-        import asyncio
-
-        # Даём время браузеру инициализироваться
         await asyncio.sleep(0.5)
 
-        # Проверяем существующие страницы
         pages = []
         if hasattr(self.browser, 'pages'):
             pages = self.browser.pages
@@ -283,19 +285,17 @@ class BrowserContext:
                 pages.extend(ctx.pages)
 
         if pages:
-            print(f"[BrowserContext] Found {len(pages)} existing page(s), reusing first one")
+            logger.debug("Found %d existing page(s), reusing first one", len(pages))
             self._page = pages[0]
-            # Закрываем лишние страницы (избегаем двух окон)
             for extra_page in pages[1:]:
                 try:
                     await extra_page.close()
-                    print(f"[BrowserContext] Closed extra page")
+                    logger.debug("Closed extra page")
                 except Exception as e:
-                    print(f"[BrowserContext] Warning: couldn't close extra page: {e}")
+                    logger.warning("Couldn't close extra page: %s", e)
             return self._page
 
-        # Создаём новую только если нет существующих
-        print(f"[BrowserContext] No existing pages, creating new one")
+        logger.debug("No existing pages, creating new one")
         self._page = await self.browser.new_page()
         return self._page
 
@@ -310,33 +310,43 @@ class BrowserContext:
             state = await self._page.context.storage_state()
             with open(self.profile.storage_state_path, 'w', encoding='utf-8') as f:
                 json.dump(state, f, indent=2)
-            print(f"[BrowserContext] Storage state saved: {self.profile.storage_state_path}")
+            logger.info("Storage state saved: %s", self.profile.storage_state_path)
+
+    CLOSE_TIMEOUT = 15  # секунд на закрытие браузера
 
     async def close(self):
-        """Закрывает браузер и останавливает proxy relay"""
+        """Закрывает браузер и останавливает proxy relay с timeout"""
         if self._closed:
             return
         self._closed = True
 
         try:
-            # Сохраняем состояние перед закрытием
-            await self.save_storage_state()
+            await asyncio.wait_for(self.save_storage_state(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.warning("Storage state save timed out for '%s'", self.profile.name)
         except Exception as e:
-            print(f"[BrowserContext] Warning: couldn't save state: {e}")
+            logger.warning("Couldn't save state: %s", e)
 
         try:
-            await self._camoufox.__aexit__(None, None, None)
+            await asyncio.wait_for(
+                self._camoufox.__aexit__(None, None, None),
+                timeout=self.CLOSE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Browser close timed out after %ds for '%s'", self.CLOSE_TIMEOUT, self.profile.name)
         except Exception as e:
-            print(f"[BrowserContext] Warning: error during browser exit: {e}")
+            logger.warning("Error during browser exit: %s", e)
 
-        # Останавливаем proxy relay если был запущен
         if self._proxy_relay:
             try:
                 await self._proxy_relay.stop()
             except Exception as e:
-                print(f"[BrowserContext] Warning: error stopping proxy relay: {e}")
+                logger.warning("Error stopping proxy relay: %s", e)
 
-        print(f"[BrowserContext] Browser closed for '{self.profile.name}'")
+        if self._manager and self.profile.name in self._manager._active_browsers:
+            del self._manager._active_browsers[self.profile.name]
+
+        logger.info("Browser closed for '%s'", self.profile.name)
 
     async def __aenter__(self):
         return self

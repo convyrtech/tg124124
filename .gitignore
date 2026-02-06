@@ -27,6 +27,10 @@ ___config.json
 
 # Debug files
 debug_*.png
+*.png
+
+# Storage analysis (contains auth_key!)
+storage_analysis/
 
 # Logs
 *.log
@@ -48,3 +52,20 @@ package-lock.json
 temp_pyzbar/
 nul
 *.exe
+
+# MCP config (local paths)
+.mcp.json
+
+# Claude local configs
+.claude/settings.local.json
+.claude/ralph-loop.local.md
+.claude/MASTER_PROMPT.md
+.playwright-mcp/
+
+# Data files
+data/
+migration_state.json
+
+# Experimental/dead code
+poc_qr_login.py
+scripts/

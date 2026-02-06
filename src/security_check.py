@@ -6,27 +6,32 @@ Security Check Module
     python -m src.security_check --account "account_name" --proxy "socks5:host:port:user:pass"
 """
 import asyncio
-import json
 import hashlib
-import sys
+import json
+import logging
 import os
+import re
+import sys
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 # FIX: WINDOWS ENCODING
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
-from pathlib import Path
-from datetime import datetime
-from dataclasses import dataclass, asdict
-from typing import Optional
+
+from .utils import parse_proxy_for_camoufox as parse_proxy
+
+logger = logging.getLogger(__name__)
 
 # Camoufox import
 try:
     from camoufox.async_api import AsyncCamoufox
-except ImportError:
-    print("ERROR: camoufox not installed. Run: pip install camoufox && camoufox fetch")
-    exit(1)
+except ImportError as e:
+    raise ImportError("camoufox not installed. Run: pip install camoufox && camoufox fetch") from e
 
 
 @dataclass
@@ -58,29 +63,11 @@ class SecurityCheckResult:
         )
 
 
-def parse_proxy(proxy_str: str) -> dict:
-    """Парсит прокси из формата 'socks5:host:port:user:pass'"""
-    parts = proxy_str.split(":")
-    if len(parts) == 5:
-        proto, host, port, user, pwd = parts
-        return {
-            "server": f"{proto}://{host}:{port}",
-            "username": user,
-            "password": pwd,
-        }
-    elif len(parts) == 3:
-        proto, host, port = parts
-        return {"server": f"{proto}://{host}:{port}"}
-    raise ValueError(f"Invalid proxy format: {proxy_str}")
-
-
 async def check_ip_and_geo(page) -> dict:
     """Проверяет IP и геолокацию через ipapi.co"""
     await page.goto("https://ipapi.co/json/", wait_until="networkidle")
     content = await page.content()
 
-    # Извлекаем JSON из страницы
-    import re
     json_match = re.search(r'\{.*\}', content, re.DOTALL)
     if json_match:
         try:
@@ -209,23 +196,21 @@ async def run_security_check(
     from .proxy_relay import ProxyRelay, needs_relay
 
     proxy_relay = None
-    original_proxy = proxy
 
     # Если SOCKS5 с авторизацией - запускаем proxy relay
     if needs_relay(proxy):
-        print(f"[*] SOCKS5 with auth detected - starting proxy relay...")
+        logger.info("SOCKS5 with auth detected - starting proxy relay")
         proxy_relay = ProxyRelay(proxy)
         await proxy_relay.start()
-        # Используем локальный HTTP прокси
         proxy_config = proxy_relay.browser_proxy_config
     else:
         proxy_config = parse_proxy(proxy)
 
     camoufox_args = {
         "proxy": proxy_config,
-        "geoip": use_geoip,      # Авто timezone/locale по IP (может не работать с некоторыми прокси)
-        "block_webrtc": True,    # Блокируем WebRTC
-        "humanize": True,        # Human-like поведение
+        "geoip": use_geoip,
+        "block_webrtc": True,
+        "humanize": True,
         "headless": headless,
     }
 
@@ -236,59 +221,55 @@ async def run_security_check(
         camoufox_args["user_data_dir"] = str(profile_path / "browser_data")
 
     proxy_info = proxy_config.get('server', 'no proxy')
-    print(f"[*] Starting Camoufox with proxy: {proxy_info}")
+    logger.info("Starting Camoufox with proxy: %s, headless: %s", proxy_info, headless)
     if proxy_relay:
-        print(f"[*] Proxy relay active: {proxy_relay.local_url} -> {original_proxy.split(':')[1]}:***")
-    print(f"[*] Headless: {headless}")
+        logger.info("Proxy relay active: %s", proxy_relay.local_url)
 
     try:
         async with AsyncCamoufox(**camoufox_args) as browser:
             page = await browser.new_page()
 
             # 1. Проверяем IP и геолокацию
-            print("\n[1/4] Checking IP and geolocation...")
+            logger.info("[1/4] Checking IP and geolocation...")
             geo_info = await check_ip_and_geo(page)
             detected_ip = geo_info.get('ip', 'unknown')
             expected_tz = geo_info.get('timezone', 'unknown')
-            print(f"      IP: {detected_ip}")
-            print(f"      Location: {geo_info.get('city', '?')}, {geo_info.get('country_name', '?')}")
-            print(f"      Expected TZ: {expected_tz}")
+            logger.info("IP: %s, Location: %s %s, Expected TZ: %s",
+                        detected_ip, geo_info.get('city', '?'),
+                        geo_info.get('country_name', '?'), expected_tz)
 
             # 2. Проверяем WebRTC leak
-            print("\n[2/4] Checking WebRTC leak...")
+            logger.info("[2/4] Checking WebRTC leak...")
             webrtc_info = await check_webrtc_leak(page)
-            print(f"      Leak detected: {webrtc_info.get('hasLeak', False)}")
+            logger.info("WebRTC leak detected: %s", webrtc_info.get('hasLeak', False))
             if webrtc_info.get('localIPs'):
-                print(f"      Local IPs exposed: {webrtc_info['localIPs']}")
+                logger.warning("Local IPs exposed via WebRTC: %s", webrtc_info['localIPs'])
 
             # 3. Собираем fingerprint
-            print("\n[3/4] Collecting fingerprint...")
+            logger.info("[3/4] Collecting fingerprint...")
             fingerprint = await get_fingerprint(page)
-            print(f"      Platform: {fingerprint['platform']}")
-            print(f"      Screen: {fingerprint['screenResolution']}")
-            print(f"      Timezone: {fingerprint['timezone']}")
-            print(f"      Canvas hash: {fingerprint['canvasHash']}")
-            print(f"      WebGL: {fingerprint['webglVendor'][:30]}...")
-            print(f"      Webdriver: {fingerprint['webdriver']}")
+            logger.info("Platform: %s, Screen: %s, Timezone: %s",
+                        fingerprint['platform'], fingerprint['screenResolution'],
+                        fingerprint['timezone'])
+            logger.info("Canvas hash: %s, WebGL: %s..., Webdriver: %s",
+                        fingerprint['canvasHash'], fingerprint['webglVendor'][:30],
+                        fingerprint['webdriver'])
 
             # 4. Проверяем совпадение timezone
-            print("\n[4/4] Validating timezone match...")
+            logger.info("[4/4] Validating timezone match...")
             tz_match = fingerprint['timezone'] == expected_tz
-            print(f"      Expected: {expected_tz}")
-            print(f"      Detected: {fingerprint['timezone']}")
-            print(f"      Match: {'✓' if tz_match else '✗ MISMATCH!'}")
+            logger.info("TZ match: %s (expected=%s, detected=%s)",
+                        tz_match, expected_tz, fingerprint['timezone'])
 
-            # Собираем результат
-            # Используем оригинальный прокси для IP, не локальный relay
-            original_proxy_parts = original_proxy.split(":")
-            proxy_ip = original_proxy_parts[1] if len(original_proxy_parts) >= 3 else "unknown"
+            proxy_parts = proxy.split(":")
+            proxy_ip = proxy_parts[1] if len(proxy_parts) >= 3 else "unknown"
 
             result = SecurityCheckResult(
                 timestamp=datetime.now().isoformat(),
                 proxy_ip=proxy_ip,
                 detected_ip=detected_ip,
                 webrtc_leak=webrtc_info.get('hasLeak', False),
-                webrtc_local_ip=webrtc_info.get('localIPs', [None])[0] if webrtc_info.get('localIPs') else None,
+                webrtc_local_ip=(webrtc_info.get('localIPs') or [None])[0],
                 timezone_match=tz_match,
                 expected_timezone=expected_tz,
                 detected_timezone=fingerprint['timezone'],
@@ -306,12 +287,11 @@ async def run_security_check(
                 result_path = profile_path / "security_check.json"
                 with open(result_path, 'w', encoding='utf-8') as f:
                     json.dump(asdict(result), f, indent=2, ensure_ascii=False)
-                print(f"\n[*] Results saved to: {result_path}")
+                logger.info("Results saved to: %s", result_path)
 
             return result
 
     finally:
-        # Останавливаем proxy relay если был запущен
         if proxy_relay:
             await proxy_relay.stop()
 
@@ -381,13 +361,11 @@ async def main():
         print_summary(result)
 
         # Exit code based on safety
-        exit(0 if result.is_safe else 1)
+        sys.exit(0 if result.is_safe else 1)
 
     except Exception as e:
-        print(f"\n[!] Error: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+        logger.error("Security check failed: %s", e, exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -12,9 +12,13 @@ Proxy Relay Module
     await relay.stop()
 """
 import asyncio
+import logging
+import os
 import socket
-from typing import Optional, Tuple
 from dataclasses import dataclass
+from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -108,14 +112,9 @@ class ProxyRelay:
 
         self.local_port = find_free_port()
 
-        # pproxy команда:
-        # -l http://127.0.0.1:PORT  - слушаем HTTP на локальном порту
-        # -r socks5://user:pass@host:port  - перенаправляем на SOCKS5
         listen_uri = f"http://{self.local_host}:{self.local_port}"
         remote_uri = self.config.to_pproxy_uri()
 
-        # Запускаем pproxy через wrapper (исправляет Python 3.14+ совместимость)
-        import os
         wrapper_path = os.path.join(os.path.dirname(__file__), "pproxy_wrapper.py")
 
         cmd = [
@@ -125,9 +124,9 @@ class ProxyRelay:
             "-v"  # Verbose для отладки
         ]
 
-        print(f"[ProxyRelay] Starting local HTTP relay...")
-        print(f"[ProxyRelay] Listen: {listen_uri}")
-        print(f"[ProxyRelay] Remote: {self.config.protocol}://{self.config.host}:{self.config.port}")
+        logger.info("Starting local HTTP relay...")
+        logger.debug("Listen: %s", listen_uri)
+        logger.debug("Remote: %s://%s:%s", self.config.protocol, self.config.host, self.config.port)
 
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -135,34 +134,57 @@ class ProxyRelay:
             stderr=asyncio.subprocess.PIPE
         )
 
-        # Ждём запуска
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
 
-        # Проверяем что процесс запустился
         if self._process.returncode is not None:
             stderr = await self._process.stderr.read()
             raise RuntimeError(f"ProxyRelay failed to start: {stderr.decode()}")
 
+        logger.debug("ProxyRelay process started (PID: %d)", self._process.pid)
+
+        # FIX-011: Health check - проверяем что relay слушает на порту
+        for retry in range(10):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(1)
+                    sock.connect((self.local_host, self.local_port))
+                    logger.debug("Relay verified listening on port %d", self.local_port)
+                    break
+            except (socket.error, socket.timeout):
+                if retry < 9:
+                    await asyncio.sleep(0.3)
+                else:
+                    raise RuntimeError(
+                        f"Proxy relay not responding on {self.local_host}:{self.local_port}"
+                    )
+
         self._started = True
-        print(f"[ProxyRelay] Started on {self.local_url}")
+        logger.info("Started on %s", self.local_url)
 
         return self.local_url
 
     async def stop(self):
         """Останавливает proxy relay"""
         if self._process:
+            pid = self._process.pid
             try:
                 self._process.terminate()
                 await asyncio.wait_for(self._process.wait(), timeout=5)
+                logger.debug("ProxyRelay process terminated (PID: %d)", pid)
             except asyncio.TimeoutError:
+                logger.warning("ProxyRelay process did not terminate in 5s, killing (PID: %d)", pid)
                 self._process.kill()
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    logger.error("ProxyRelay process stuck after kill (PID: %d)", pid)
             except ProcessLookupError:
-                pass  # Процесс уже завершён
-
-            self._process = None
+                logger.debug("Process already terminated (PID: %d)", pid)
+            finally:
+                self._process = None
 
         self._started = False
-        print(f"[ProxyRelay] Stopped")
+        logger.info("Stopped")
 
     async def __aenter__(self) -> "ProxyRelay":
         await self.start()
@@ -217,37 +239,41 @@ def needs_relay(proxy_str: str) -> bool:
         return False
 
     config = ProxyConfig.parse(proxy_str)
-    # Браузеры не поддерживают SOCKS5 с auth
     return config.protocol.lower() in ('socks5', 'socks4') and config.has_auth
 
 
-# Тест
 async def test_relay():
     """Тестирование proxy relay"""
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python -m src.proxy_relay socks5:host:port:user:pass")
+        logger.info("Usage: python -m src.proxy_relay socks5:host:port:user:pass")
         return
 
     proxy = sys.argv[1]
-    print(f"Testing proxy: {proxy}")
-    print(f"Needs relay: {needs_relay(proxy)}")
+    # Mask credentials in log output
+    masked = proxy.split(":")
+    if len(masked) == 5:
+        masked = f"{masked[0]}:{masked[1]}:{masked[2]}:***:***"
+    else:
+        masked = proxy
+    logger.info("Testing proxy: %s", masked)
+    logger.info("Needs relay: %s", needs_relay(proxy))
 
     if needs_relay(proxy):
         async with ProxyRelay(proxy) as relay:
-            print(f"Local proxy: {relay.local_url}")
-            print(f"Browser config: {relay.browser_proxy_config}")
+            logger.info("Local proxy: %s", relay.local_url)
+            logger.info("Browser config: %s", relay.browser_proxy_config)
 
             # Держим открытым для теста
-            print("\nRelay running. Press Ctrl+C to stop...")
+            logger.info("Relay running. Press Ctrl+C to stop...")
             try:
                 while True:
                     await asyncio.sleep(1)
             except KeyboardInterrupt:
                 pass
     else:
-        print("Proxy doesn't need relay (no auth or HTTP)")
+        logger.info("Proxy doesn't need relay (no auth or HTTP)")
 
 
 if __name__ == "__main__":

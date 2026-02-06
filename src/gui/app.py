@@ -77,6 +77,7 @@ class TGWebAuthApp:
         # Track active browser contexts for cleanup
         self._active_browsers: List = []
         self._shutting_down: bool = False
+        self._migration_cancel: bool = False
 
     def _start_async_loop(self) -> None:
         """Start async event loop in background thread."""
@@ -286,6 +287,10 @@ class TGWebAuthApp:
                 label="Migrate All",
                 callback=self._migrate_all
             )
+            dpg.add_button(
+                label="STOP",
+                callback=self._stop_migration
+            )
             dpg.add_spacer(width=20)
             dpg.add_button(
                 label="Auto-Assign Proxies",
@@ -392,6 +397,7 @@ class TGWebAuthApp:
                 self._2fa_password = password
                 self._log("[System] 2FA password set for session")
             dpg.delete_item("2fa_dialog")
+            self._initial_load()
         except Exception as e:
             logger.error("2FA submit error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] 2FA: {e}")
@@ -401,8 +407,33 @@ class TGWebAuthApp:
         try:
             dpg.delete_item("2fa_dialog")
             self._log("[System] 2FA password skipped - will prompt when needed")
+            self._initial_load()
         except Exception as e:
             logger.error("2FA skip error: %s", e)
+
+    def _initial_load(self) -> None:
+        """Load accounts, proxies, and stats on startup."""
+        async def do_load():
+            try:
+                # Reset interrupted migrations from previous crash
+                reset_count = await self._controller.db.reset_interrupted_migrations()
+                if reset_count:
+                    self._log(f"[System] Reset {reset_count} interrupted migrations")
+
+                accounts = await self._controller.search_accounts("")
+                stats = await self._controller.get_stats()
+                proxies = await self._controller.db.list_proxies()
+                proxies_map = {p.id: p for p in proxies}
+
+                accounts_map = {a.id: a for a in accounts}
+                self._schedule_ui(lambda: self._update_stats_sync(stats))
+                self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
+                self._schedule_ui(lambda: self._update_proxies_table_sync(proxies, accounts_map))
+            except Exception as e:
+                logger.error("Initial load error: %s", e)
+                self._log(f"[Error] Initial load: {e}")
+
+        self._run_async(do_load())
 
     def _log(self, message: str) -> None:
         """Add message to log (thread-safe)."""
@@ -534,7 +565,7 @@ class TGWebAuthApp:
             logger.error("Update accounts table error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Table update: {e}")
 
-    def _update_proxies_table_sync(self, proxies: list) -> None:
+    def _update_proxies_table_sync(self, proxies: list, accounts_map: dict = None) -> None:
         """Update proxies table on main thread."""
         try:
             # Clear existing rows
@@ -557,8 +588,13 @@ class TGWebAuthApp:
                     elif proxy.status == "dead":
                         dpg.bind_item_theme(status_text, self._status_themes.get("error"))
 
-                    # Assigned To
-                    assigned = str(proxy.assigned_account_id) if proxy.assigned_account_id else "-"
+                    # Assigned To - show account name if available
+                    if proxy.assigned_account_id and accounts_map and proxy.assigned_account_id in accounts_map:
+                        assigned = accounts_map[proxy.assigned_account_id].name
+                    elif proxy.assigned_account_id:
+                        assigned = f"#{proxy.assigned_account_id}"
+                    else:
+                        assigned = "-"
                     dpg.add_text(assigned)
 
                     # Actions
@@ -586,7 +622,9 @@ class TGWebAuthApp:
                 # Refresh UI
                 proxies = await self._controller.db.list_proxies()
                 stats = await self._controller.get_stats()
-                self._schedule_ui(lambda: self._update_proxies_table_sync(proxies))
+                accounts = await self._controller.search_accounts("")
+                accounts_map = {a.id: a for a in accounts}
+                self._schedule_ui(lambda: self._update_proxies_table_sync(proxies, accounts_map))
                 self._schedule_ui(lambda: self._update_stats_sync(stats))
 
             except Exception as e:
@@ -705,12 +743,16 @@ class TGWebAuthApp:
                     self._schedule_ui(lambda: self._refresh_table_async())
                     return
 
+                # Build proxy string from DB if available
+                proxy_str = await self._build_proxy_string(account)
+
                 # Call migrate_account directly (not via CLI!)
                 try:
                     result = await migrate_account(
                         account_dir=session_dir,
                         password_2fa=self._2fa_password,
-                        headless=True  # GUI mode uses headless by default
+                        headless=True,  # GUI mode uses headless by default
+                        proxy_override=proxy_str
                     )
 
                     if result.success:
@@ -746,7 +788,7 @@ class TGWebAuthApp:
                 self._log(f"[Error] Migrate: {e}")
                 try:
                     await self._controller.db.update_account(account_id, status="error")
-                except:
+                except Exception:
                     pass
                 self._schedule_ui(lambda: self._refresh_table_async())
 
@@ -796,6 +838,18 @@ class TGWebAuthApp:
                 self._log(f"[Error] Fragment: {e}")
 
         self._run_async(do_fragment())
+
+    async def _build_proxy_string(self, account: AccountRecord) -> Optional[str]:
+        """Build proxy string from DB ProxyRecord for migrate_account()."""
+        if not account.proxy_id:
+            return None
+        proxy = await self._controller.db.get_proxy(account.proxy_id)
+        if not proxy:
+            return None
+        # Format: socks5:host:port:user:pass or socks5:host:port
+        if proxy.username and proxy.password:
+            return f"{proxy.protocol}:{proxy.host}:{proxy.port}:{proxy.username}:{proxy.password}"
+        return f"{proxy.protocol}:{proxy.host}:{proxy.port}"
 
     def _refresh_table_async(self) -> None:
         """Trigger async table refresh from UI thread."""
@@ -923,87 +977,126 @@ class TGWebAuthApp:
                 self._log("[Warning] No accounts selected")
                 return
 
-            self._log(f"[Migrate] Starting migration of {len(selected_ids)} accounts...")
-            # TODO: integrate with telegram_auth
+            self._log(f"[Migrate] Starting migration of {len(selected_ids)} selected accounts...")
+            self._migration_cancel = False
+            self._run_async(self._batch_migrate(selected_ids))
         except Exception as e:
             logger.error("Migrate selected error: %s", e)
             self._log(f"[Error] Migrate: {e}")
 
     def _migrate_all(self, sender=None, app_data=None) -> None:
         """Migrate all pending accounts."""
-        self._log("[Migrate] Starting batch migration...")
+        self._log("[Migrate] Starting batch migration of all pending...")
+        self._migration_cancel = False
 
-        async def do_migrate_all():
-            try:
-                from ..telegram_auth import migrate_account, get_randomized_cooldown
+        async def get_pending_ids():
+            accounts = await self._controller.db.list_accounts(status="pending")
+            if not accounts:
+                self._log("[Migrate] No pending accounts")
+                return
+            ids = [a.id for a in accounts]
+            self._log(f"[Migrate] {len(ids)} accounts to migrate...")
+            await self._batch_migrate(ids)
 
-                accounts = await self._controller.db.list_accounts(status="pending")
-                if not accounts:
-                    self._log("[Migrate] No pending accounts")
-                    return
+        self._run_async(get_pending_ids())
 
-                self._log(f"[Migrate] {len(accounts)} accounts to migrate...")
+    def _stop_migration(self, sender=None, app_data=None) -> None:
+        """Stop ongoing migration."""
+        self._migration_cancel = True
+        self._log("[Migrate] STOP requested - finishing current account...")
 
-                for i, account in enumerate(accounts):
-                    self._log(f"[Migrate] [{i+1}/{len(accounts)}] {account.name}...")
-                    await self._controller.db.update_account(account.id, status="migrating")
-                    self._schedule_ui(lambda: self._refresh_table_async())
+    async def _batch_migrate(self, account_ids: list) -> None:
+        """Batch migrate accounts with cooldowns and batch pauses."""
+        try:
+            import random
+            from ..telegram_auth import migrate_account
 
-                    # Get session directory
-                    session_path = Path(account.session_path)
-                    session_dir = session_path.parent
+            total = len(account_ids)
+            success_count = 0
+            error_count = 0
+            batch_pause_every = 10
+            batch_pause_range = (300, 600)  # 5-10 minutes
+            cooldown_range = (60, 120)      # 60-120 seconds
 
-                    if not session_dir.exists():
-                        self._log(f"[Migrate] {account.name} - SKIP (session not found)")
-                        await self._controller.db.update_account(account.id, status="error",
-                                                                 error_message="Session dir not found")
-                        continue
+            for i, account_id in enumerate(account_ids):
+                if self._migration_cancel:
+                    self._log(f"[Migrate] Stopped at {i}/{total}")
+                    break
 
-                    try:
-                        result = await migrate_account(
-                            account_dir=session_dir,
-                            password_2fa=self._2fa_password,
-                            headless=True
-                        )
+                account = await self._controller.db.get_account(account_id)
+                if not account:
+                    continue
 
-                        if result.success:
-                            await self._controller.db.update_account(
-                                account.id,
-                                status="healthy",
-                                username=result.user_info.get("username") if result.user_info else None,
-                                error_message=None
-                            )
-                            self._log(f"[Migrate] {account.name} - OK")
-                        else:
-                            await self._controller.db.update_account(
-                                account.id,
-                                status="error",
-                                error_message=result.error
-                            )
-                            self._log(f"[Migrate] {account.name} - FAILED: {result.error}")
-
-                    except Exception as e:
-                        await self._controller.db.update_account(
-                            account.id,
-                            status="error",
-                            error_message=str(e)
-                        )
-                        self._log(f"[Migrate] {account.name} - ERROR: {e}")
-
-                    # Randomized cooldown between accounts (anti-detection)
-                    if i < len(accounts) - 1:
-                        cooldown = get_randomized_cooldown()
-                        self._log(f"[Migrate] Cooldown {cooldown:.1f}s...")
-                        await asyncio.sleep(cooldown)
-
-                self._log("[Migrate] Batch complete")
+                self._log(f"[Migrate] [{i+1}/{total}] {account.name}...")
+                await self._controller.db.update_account(account_id, status="migrating")
                 self._schedule_ui(lambda: self._refresh_table_async())
 
-            except Exception as e:
-                logger.error("Migrate all error: %s\n%s", e, traceback.format_exc())
-                self._log(f"[Error] Migrate all: {e}")
+                session_path = Path(account.session_path)
+                session_dir = session_path.parent
 
-        self._run_async(do_migrate_all())
+                if not session_dir.exists():
+                    self._log(f"[Migrate] {account.name} - SKIP (session not found)")
+                    await self._controller.db.update_account(account_id, status="error",
+                                                             error_message="Session dir not found")
+                    error_count += 1
+                    continue
+
+                try:
+                    # Build proxy string from DB if available
+                    proxy_str = await self._build_proxy_string(account)
+
+                    result = await migrate_account(
+                        account_dir=session_dir,
+                        password_2fa=self._2fa_password,
+                        headless=True,
+                        proxy_override=proxy_str
+                    )
+
+                    if result.success:
+                        await self._controller.db.update_account(
+                            account_id,
+                            status="healthy",
+                            username=result.user_info.get("username") if result.user_info else None,
+                            error_message=None
+                        )
+                        self._log(f"[Migrate] {account.name} - OK")
+                        success_count += 1
+                    else:
+                        await self._controller.db.update_account(
+                            account_id,
+                            status="error",
+                            error_message=result.error
+                        )
+                        self._log(f"[Migrate] {account.name} - FAILED: {result.error}")
+                        error_count += 1
+
+                except Exception as e:
+                    await self._controller.db.update_account(
+                        account_id,
+                        status="error",
+                        error_message=str(e)
+                    )
+                    self._log(f"[Migrate] {account.name} - ERROR: {e}")
+                    error_count += 1
+
+                # Cooldown and batch pause
+                if i < total - 1 and not self._migration_cancel:
+                    # Batch pause every N accounts
+                    if (i + 1) % batch_pause_every == 0:
+                        pause = random.uniform(*batch_pause_range)
+                        self._log(f"[Migrate] Batch pause {pause/60:.1f} min (every {batch_pause_every} accounts)...")
+                        await asyncio.sleep(pause)
+                    else:
+                        cooldown = random.uniform(*cooldown_range)
+                        self._log(f"[Migrate] Cooldown {cooldown:.0f}s...")
+                        await asyncio.sleep(cooldown)
+
+            self._log(f"[Migrate] Done: {success_count} OK, {error_count} errors, {total} total")
+            self._schedule_ui(lambda: self._refresh_table_async())
+
+        except Exception as e:
+            logger.error("Batch migrate error: %s\n%s", e, traceback.format_exc())
+            self._log(f"[Error] Batch migrate: {e}")
 
     def _auto_assign_proxies(self, sender=None, app_data=None) -> None:
         """Auto-assign free proxies to accounts without proxies."""
@@ -1072,9 +1165,11 @@ class TGWebAuthApp:
                     # Refresh UI
                     stats = await self._controller.get_stats()
                     proxies = await self._controller.db.list_proxies()
+                    accounts = await self._controller.search_accounts("")
+                    accounts_map = {a.id: a for a in accounts}
 
                     self._schedule_ui(lambda: self._update_stats_sync(stats))
-                    self._schedule_ui(lambda: self._update_proxies_table_sync(proxies))
+                    self._schedule_ui(lambda: self._update_proxies_table_sync(proxies, accounts_map))
                 except Exception as e:
                     logger.error("Proxy import error: %s\n%s", e, traceback.format_exc())
                     self._log(f"[Error] Proxy import: {e}")
@@ -1093,14 +1188,26 @@ class TGWebAuthApp:
             try:
                 proxies = await self._controller.db.list_proxies()
                 total = len(proxies)
+                self._log(f"[Proxies] Checking {total} proxies (50 concurrent)...")
+
                 alive = 0
                 dead = 0
+                sem = asyncio.Semaphore(50)
 
-                for i, proxy in enumerate(proxies):
-                    self._log(f"[Proxies] Checking {i+1}/{total}: {proxy.host}:{proxy.port}")
+                async def check_one(proxy):
+                    async with sem:
+                        return proxy, await self._controller.check_proxy(proxy)
 
-                    is_alive = await self._controller.check_proxy(proxy)
+                results = await asyncio.gather(
+                    *(check_one(p) for p in proxies),
+                    return_exceptions=True
+                )
 
+                for result in results:
+                    if isinstance(result, Exception):
+                        dead += 1
+                        continue
+                    proxy, is_alive = result
                     if is_alive:
                         alive += 1
                         await self._controller.db.update_proxy(proxy.id, status="active")
@@ -1113,7 +1220,9 @@ class TGWebAuthApp:
                 # Refresh UI
                 proxies = await self._controller.db.list_proxies()
                 stats = await self._controller.get_stats()
-                self._schedule_ui(lambda: self._update_proxies_table_sync(proxies))
+                accounts = await self._controller.search_accounts("")
+                accounts_map = {a.id: a for a in accounts}
+                self._schedule_ui(lambda: self._update_proxies_table_sync(proxies, accounts_map))
                 self._schedule_ui(lambda: self._update_stats_sync(stats))
 
             except Exception as e:
@@ -1123,7 +1232,7 @@ class TGWebAuthApp:
         self._run_async(do_check())
 
     def _replace_dead_proxies(self, sender=None, app_data=None) -> None:
-        """Delete dead proxies from database."""
+        """Delete dead proxies from database, unlinking accounts first."""
         async def do_replace():
             try:
                 proxies = await self._controller.db.list_proxies(status="dead")
@@ -1133,6 +1242,12 @@ class TGWebAuthApp:
 
                 count = 0
                 for proxy in proxies:
+                    # Unlink any account that references this proxy
+                    if proxy.assigned_account_id:
+                        await self._controller.db.update_account(
+                            proxy.assigned_account_id, proxy_id=None
+                        )
+                        self._log(f"[Proxies] Unlinked account {proxy.assigned_account_id} from dead proxy {proxy.host}:{proxy.port}")
                     await self._controller.db.delete_proxy(proxy.id)
                     count += 1
 
@@ -1141,8 +1256,11 @@ class TGWebAuthApp:
                 # Refresh UI
                 proxies = await self._controller.db.list_proxies()
                 stats = await self._controller.get_stats()
-                self._schedule_ui(lambda: self._update_proxies_table_sync(proxies))
+                accounts = await self._controller.search_accounts("")
+                accounts_map = {a.id: a for a in accounts}
+                self._schedule_ui(lambda: self._update_proxies_table_sync(proxies, accounts_map))
                 self._schedule_ui(lambda: self._update_stats_sync(stats))
+                self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, {p.id: p for p in proxies}))
 
             except Exception as e:
                 logger.error("Replace dead proxies error: %s", e)

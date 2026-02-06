@@ -77,7 +77,7 @@ class FragmentAuth:
         self.browser_manager = browser_manager or BrowserManager()
         self._client: Optional[TelegramClient] = None
         self._verification_code: Optional[str] = None
-        self._code_event = asyncio.Event()
+        self._code_event: Optional[asyncio.Event] = None  # Created lazily in running loop
 
     async def _create_telethon_client(self) -> TelegramClient:
         """
@@ -154,13 +154,15 @@ class FragmentAuth:
     async def _setup_code_handler(self, client: TelegramClient) -> None:
         """Устанавливает обработчик для перехвата кода от Telegram (user 777000)."""
         self._verification_code = None
+        # Create Event in the running event loop to avoid loop mismatch
+        self._code_event = asyncio.Event()
         self._code_event.clear()
 
         @client.on(events.NewMessage(from_users=TELEGRAM_SERVICE_USER_ID))
         async def _on_login_code(event):
             code = self._extract_code_from_message(event.raw_text)
             if code:
-                logger.info("Intercepted verification code: %s***", code[:2])
+                logger.info("Intercepted verification code (length=%d)", len(code))
                 self._verification_code = code
                 self._code_event.set()
 
@@ -181,6 +183,9 @@ class FragmentAuth:
         Returns:
             Код подтверждения или None если timeout
         """
+        # Ensure event exists (creates in current event loop if needed)
+        if self._code_event is None:
+            self._code_event = asyncio.Event()
         try:
             await asyncio.wait_for(self._code_event.wait(), timeout=timeout)
             return self._verification_code

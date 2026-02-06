@@ -1,5 +1,15 @@
 # TG Web Auth Migration Tool
 
+## MANDATORY: Read Before ANY Work
+**ALWAYS read `.claude/MASTER_PROMPT.md` at the start of EVERY session or after context loss.**
+It contains: project context, all available tools, work methodology, safety rules, progress tracker, and context recovery protocol.
+
+**Key documents:**
+- `.claude/MASTER_PROMPT.md` - Master operating guide (READ FIRST)
+- `docs/ACTION_PLAN_2026-02-06.md` - Current implementation plan
+- `docs/research_project_audit_2026-02-06.md` - Full project audit
+- `PROMPTS.md` - Prompt generator and plugin guide
+
 ## Project Goal
 Автоматическая миграция Telegram session файлов (Telethon/Pyrogram) в браузерные профили для:
 - **web.telegram.org** - основной веб-клиент
