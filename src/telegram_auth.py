@@ -53,6 +53,7 @@ try:
     from telethon import TelegramClient
     from telethon.sessions import SQLiteSession
     from telethon.tl.functions.auth import AcceptLoginTokenRequest
+    from telethon.tl.functions.account import SetAuthorizationTTLRequest
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
 except ImportError as e:
     raise ImportError("telethon not installed. Run: pip install telethon") from e
@@ -499,6 +500,28 @@ class TelegramAuth:
         except Exception as e:
             logger.warning(f"Session verification failed: {e}")
         return False
+
+    AUTH_TTL_DAYS = 365  # Maximum authorization lifetime
+
+    async def _set_authorization_ttl(self, client: TelegramClient) -> bool:
+        """
+        Set authorization TTL to maximum (365 days) for all sessions.
+
+        This extends the web session lifetime so it doesn't auto-expire.
+        Non-fatal: failure here doesn't affect the migration result.
+
+        Returns:
+            True if TTL was set successfully
+        """
+        try:
+            result = await client(SetAuthorizationTTLRequest(
+                authorization_ttl_days=self.AUTH_TTL_DAYS
+            ))
+            logger.info("Authorization TTL set to %d days", self.AUTH_TTL_DAYS)
+            return bool(result)
+        except Exception as e:
+            logger.warning("Failed to set authorization TTL: %s", e)
+            return False
 
     async def _check_page_state(self, page) -> str:
         """
@@ -1337,6 +1360,7 @@ class TelegramAuth:
 
             if current_state == "authorized":
                 logger.info("Already authorized! Skipping QR login.")
+                await self._set_authorization_ttl(client)
                 return AuthResult(
                     success=True,
                     profile_name=profile.name,
@@ -1351,6 +1375,7 @@ class TelegramAuth:
                     if fa_success:
                         success, _ = await self._wait_for_auth_complete(page, timeout=30)
                         if success:
+                            await self._set_authorization_ttl(client)
                             return AuthResult(
                                 success=True,
                                 profile_name=profile.name,
@@ -1360,6 +1385,8 @@ class TelegramAuth:
                 else:
                     logger.info("2FA password not provided, waiting for manual input...")
                     success, _ = await self._wait_for_auth_complete(page)
+                    if success:
+                        await self._set_authorization_ttl(client)
                     return AuthResult(
                         success=success,
                         profile_name=profile.name,
@@ -1421,6 +1448,8 @@ class TelegramAuth:
             telethon_alive = await self._verify_telethon_session(client)
 
             if success:
+                await self._set_authorization_ttl(client)
+
                 # Получаем инфо о пользователе из браузера
                 user_info = await self._get_browser_user_info(page)
 

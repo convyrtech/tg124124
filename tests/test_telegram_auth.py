@@ -617,6 +617,47 @@ class TestFloodWaitHandling:
         assert result is False
 
 
+class TestSetAuthorizationTTL:
+    """Tests for _set_authorization_ttl method."""
+
+    @pytest.fixture
+    def telegram_auth(self, tmp_path):
+        """Create TelegramAuth instance with mocked config."""
+        from src.telegram_auth import TelegramAuth, AccountConfig, DeviceConfig
+        config = AccountConfig(
+            name="test",
+            session_path=tmp_path / "test.session",
+            api_id=12345,
+            api_hash="test_hash",
+            proxy=None,
+            device=DeviceConfig()
+        )
+        return TelegramAuth(config)
+
+    @pytest.mark.asyncio
+    async def test_set_ttl_success(self, telegram_auth):
+        """Should call SetAuthorizationTTLRequest with 365 days."""
+        mock_client = AsyncMock()
+        mock_client.return_value = True
+
+        result = await telegram_auth._set_authorization_ttl(mock_client)
+
+        assert result is True
+        mock_client.assert_called_once()
+        call_args = mock_client.call_args[0][0]
+        assert call_args.authorization_ttl_days == 365
+
+    @pytest.mark.asyncio
+    async def test_set_ttl_failure_non_fatal(self, telegram_auth):
+        """Should handle errors gracefully and return False."""
+        mock_client = AsyncMock()
+        mock_client.side_effect = Exception("API error")
+
+        result = await telegram_auth._set_authorization_ttl(mock_client)
+
+        assert result is False
+
+
 class TestCircuitBreaker:
     """Tests for CircuitBreaker class."""
 
