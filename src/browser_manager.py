@@ -13,6 +13,11 @@ Browser Manager Module
 import asyncio
 import json
 import logging
+import os
+import shutil
+import stat
+import sys
+import zipfile
 from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
@@ -55,6 +60,183 @@ class BrowserProfile:
 from .utils import parse_proxy_for_camoufox as parse_proxy
 
 
+def _on_rmtree_error(func, path, _):
+    """Handle read-only files on Windows (Firefox lock/cache files)."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def _rmtree_force(path: Path) -> None:
+    """Remove directory tree, handling read-only files (Windows PermissionError)."""
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_on_rmtree_error)
+    else:
+        shutil.rmtree(path, onerror=_on_rmtree_error)
+
+
+class ProfileLifecycleManager:
+    """
+    Manages hot/cold tiering of browser profiles.
+
+    Hot profiles are decompressed directories ready for browser launch.
+    Cold profiles are compressed .zip files saving ~50% disk space.
+    LRU eviction keeps at most max_hot profiles decompressed at a time.
+
+    Args:
+        profiles_dir: Directory containing all profiles.
+        max_hot: Maximum number of decompressed profiles at a time.
+    """
+
+    def __init__(self, profiles_dir: Path, max_hot: int = 20):
+        self.profiles_dir = profiles_dir
+        self.max_hot = max_hot
+        self._access_order: list[str] = []
+        self._sync_access_order()
+
+    def _sync_access_order(self) -> None:
+        """Rebuild LRU access order from filesystem modification times.
+
+        Scans for hot profiles (dirs with browser_data/ subdir) and sorts
+        by mtime, oldest first. Called on init to recover from crashes.
+        """
+        hot_profiles: list[tuple[float, str]] = []
+        if not self.profiles_dir.exists():
+            return
+        for entry in self.profiles_dir.iterdir():
+            if entry.is_dir() and (entry / "browser_data").exists():
+                mtime = entry.stat().st_mtime
+                hot_profiles.append((mtime, entry.name))
+        hot_profiles.sort(key=lambda x: x[0])
+        self._access_order = [name for _, name in hot_profiles]
+
+    def is_hot(self, name: str) -> bool:
+        """Check if profile is decompressed and ready for use."""
+        return (self.profiles_dir / name / "browser_data").exists()
+
+    def is_cold(self, name: str) -> bool:
+        """Check if profile is compressed as a zip file."""
+        return (self.profiles_dir / f"{name}.zip").exists() and not self.is_hot(name)
+
+    def ensure_active(self, name: str, protected: Optional[set[str]] = None) -> Path:
+        """Ensure profile is hot (decompressed). Decompress from zip if needed.
+
+        Args:
+            name: Profile name.
+            protected: Set of profile names that must NOT be evicted.
+
+        Returns:
+            Path to the profile directory.
+        """
+        profile_path = self.profiles_dir / name
+        zip_path = self.profiles_dir / f"{name}.zip"
+
+        if self.is_hot(name):
+            self._touch(name)
+            return profile_path
+
+        if zip_path.exists():
+            self._evict_if_needed(protected)
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    zf.extractall(profile_path)
+                logger.info("Decompressed cold profile '%s'", name)
+            except zipfile.BadZipFile:
+                logger.error("Corrupt zip for profile '%s', creating fresh profile", name)
+            try:
+                if zip_path.exists():
+                    zip_path.unlink()
+            except OSError as e:
+                logger.warning("Could not delete zip for '%s': %s", name, e)
+            self._touch(name)
+            return profile_path
+
+        # New profile — dir will be created later by _build_camoufox_args
+        self._evict_if_needed(protected)
+        self._touch(name)
+        return profile_path
+
+    def hibernate(self, name: str) -> Optional[Path]:
+        """Compress a hot profile to zip and remove the directory.
+
+        Args:
+            name: Profile name.
+
+        Returns:
+            Path to the created zip file, or None if profile was not hot.
+        """
+        profile_path = self.profiles_dir / name
+        zip_path = self.profiles_dir / f"{name}.zip"
+
+        if not self.is_hot(name):
+            return None
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for file_path in profile_path.rglob('*'):
+                if file_path.is_file():
+                    arcname = file_path.relative_to(profile_path)
+                    zf.write(file_path, arcname)
+
+        _rmtree_force(profile_path)
+
+        if name in self._access_order:
+            self._access_order.remove(name)
+
+        logger.info("Hibernated profile '%s' -> %s", name, zip_path.name)
+        return zip_path
+
+    def _touch(self, name: str) -> None:
+        """Move profile to end of LRU (most recently used)."""
+        if name in self._access_order:
+            self._access_order.remove(name)
+        self._access_order.append(name)
+
+    def _hot_count(self) -> int:
+        """Count currently hot profiles by scanning filesystem."""
+        if not self.profiles_dir.exists():
+            return 0
+        count = 0
+        for entry in self.profiles_dir.iterdir():
+            if entry.is_dir() and (entry / "browser_data").exists():
+                count += 1
+        return count
+
+    def _evict_if_needed(self, protected: Optional[set[str]] = None) -> None:
+        """Evict LRU profiles until under max_hot capacity."""
+        protected = protected or set()
+        while self._hot_count() >= self.max_hot:
+            evicted = False
+            for name in list(self._access_order):
+                if name not in protected and self.is_hot(name):
+                    logger.info("Evicting LRU profile '%s' (capacity %d/%d)",
+                                name, self._hot_count(), self.max_hot)
+                    self.hibernate(name)
+                    evicted = True
+                    break
+            if not evicted:
+                logger.warning(
+                    "Cannot evict: all %d hot profiles are protected. "
+                    "Temporarily exceeding max_hot=%d",
+                    self._hot_count(), self.max_hot
+                )
+                break
+
+    def get_stats(self) -> dict:
+        """Return profile storage statistics.
+
+        Returns:
+            Dict with hot, cold, total, and max_hot counts.
+        """
+        hot = 0
+        cold = 0
+        if self.profiles_dir.exists():
+            for entry in self.profiles_dir.iterdir():
+                if entry.is_dir() and (entry / "browser_data").exists():
+                    hot += 1
+                elif entry.suffix == '.zip' and entry.is_file():
+                    cold += 1
+        return {"hot": hot, "cold": cold, "total": hot + cold, "max_hot": self.max_hot}
+
+
 class BrowserManager:
     """
     Менеджер Camoufox браузеров.
@@ -81,6 +263,7 @@ class BrowserManager:
         self.profiles_dir = profiles_dir or self.PROFILES_DIR
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
         self._active_browsers: Dict[str, Any] = {}
+        self.lifecycle = ProfileLifecycleManager(self.profiles_dir)
 
     def get_profile(self, name: str, proxy: Optional[str] = None) -> BrowserProfile:
         """Получает или создаёт профиль"""
@@ -172,6 +355,11 @@ class BrowserManager:
         Returns:
             BrowserContext wrapper с page и методами управления
         """
+        # Hot/cold lifecycle: decompress if needed, evict LRU if at capacity
+        # Protected set includes active browsers AND the current profile being launched
+        protected = set(self._active_browsers.keys()) | {profile.name}
+        self.lifecycle.ensure_active(profile.name, protected=protected)
+
         proxy_relay = None
 
         # FIX-003: Очистка stale lock файлов от предыдущего краша
