@@ -96,7 +96,6 @@ class TestFragmentAuth:
         """Test FragmentAuth initialization."""
         assert fragment_auth.account == mock_account
         assert fragment_auth._client is None
-        assert fragment_auth._verification_code is None
 
     def test_extract_code_english(self, fragment_auth):
         """Test code extraction from English message."""
@@ -128,66 +127,6 @@ class TestFragmentAuth:
         assert fragment_auth._extract_code_from_message(None) is None
 
     @pytest.mark.asyncio
-    async def test_check_fragment_state_authorized(self, fragment_auth):
-        """Test detecting authorized state."""
-        page = AsyncMock()
-        # Simulate My Assets link found
-        page.query_selector = AsyncMock(side_effect=[
-            MagicMock(),  # my-assets found
-        ])
-        state = await fragment_auth._check_fragment_state(page)
-        assert state == "authorized"
-
-    @pytest.mark.asyncio
-    async def test_check_fragment_state_not_authorized(self, fragment_auth):
-        """Test detecting not_authorized state."""
-        page = AsyncMock()
-        page.query_selector = AsyncMock(side_effect=[
-            None,  # no my-assets
-            MagicMock(),  # connect telegram button found
-        ])
-        state = await fragment_auth._check_fragment_state(page)
-        assert state == "not_authorized"
-
-    @pytest.mark.asyncio
-    async def test_check_fragment_state_from_text(self, fragment_auth):
-        """Test detecting state from page text."""
-        page = AsyncMock()
-        page.query_selector = AsyncMock(return_value=None)
-        page.evaluate = AsyncMock(return_value="Connect TON and Telegram to view your bids")
-        state = await fragment_auth._check_fragment_state(page)
-        assert state == "not_authorized"
-
-    @pytest.mark.asyncio
-    async def test_check_fragment_state_loading(self, fragment_auth):
-        """Test detecting loading state."""
-        page = AsyncMock()
-        page.query_selector = AsyncMock(return_value=None)
-        page.evaluate = AsyncMock(return_value="")
-        page.title = AsyncMock(return_value="Loading...")
-        state = await fragment_auth._check_fragment_state(page)
-        assert state == "loading"
-
-    @pytest.mark.asyncio
-    async def test_wait_for_code_timeout(self, fragment_auth):
-        """Test code wait timeout."""
-        code = await fragment_auth._wait_for_code(timeout=1)
-        assert code is None
-
-    @pytest.mark.asyncio
-    async def test_wait_for_code_received(self, fragment_auth):
-        """Test code received before timeout."""
-        # Simulate code arrival
-        async def set_code():
-            await asyncio.sleep(0.1)
-            fragment_auth._verification_code = "12345"
-            fragment_auth._code_event.set()
-
-        asyncio.create_task(set_code())
-        code = await fragment_auth._wait_for_code(timeout=5)
-        assert code == "12345"
-
-    @pytest.mark.asyncio
     async def test_human_delay(self, fragment_auth):
         """Test human delay is within bounds."""
         import time
@@ -195,6 +134,327 @@ class TestFragmentAuth:
         await fragment_auth._human_delay(0.1, 0.2)
         elapsed = time.monotonic() - start
         assert 0.1 <= elapsed <= 0.5  # Some tolerance
+
+    # --- _check_fragment_state tests (new evaluate-based approach) ---
+
+    @pytest.mark.asyncio
+    async def test_check_fragment_state_authorized_via_js(self, fragment_auth):
+        """Test detecting authorized state via Aj.state.unAuth === false."""
+        page = AsyncMock()
+        page.evaluate = AsyncMock(return_value=False)  # Aj.state.unAuth = false
+        state = await fragment_auth._check_fragment_state(page)
+        assert state == "authorized"
+
+    @pytest.mark.asyncio
+    async def test_check_fragment_state_not_authorized_via_js(self, fragment_auth):
+        """Test detecting not_authorized state via Aj.state.unAuth === true."""
+        page = AsyncMock()
+        page.evaluate = AsyncMock(return_value=True)  # Aj.state.unAuth = true
+        state = await fragment_auth._check_fragment_state(page)
+        assert state == "not_authorized"
+
+    @pytest.mark.asyncio
+    async def test_check_fragment_state_fallback_login_btn(self, fragment_auth):
+        """Test fallback: detect not_authorized via button.login-link presence."""
+        page = AsyncMock()
+        # First evaluate returns None (Aj not loaded), second returns True (button exists)
+        page.evaluate = AsyncMock(side_effect=[None, True])
+        state = await fragment_auth._check_fragment_state(page)
+        assert state == "not_authorized"
+
+    @pytest.mark.asyncio
+    async def test_check_fragment_state_fallback_logout_link(self, fragment_auth):
+        """Test fallback: detect authorized via .logout-link presence."""
+        page = AsyncMock()
+        # Aj not loaded, no login-link, but .logout-link exists
+        page.evaluate = AsyncMock(side_effect=[None, False, True])
+        state = await fragment_auth._check_fragment_state(page)
+        assert state == "authorized"
+
+    @pytest.mark.asyncio
+    async def test_check_fragment_state_loading(self, fragment_auth):
+        """Test loading state when nothing is detected."""
+        page = AsyncMock()
+        # Aj not loaded, no login-link, no logout-link
+        page.evaluate = AsyncMock(side_effect=[None, False, False])
+        state = await fragment_auth._check_fragment_state(page)
+        assert state == "loading"
+
+    @pytest.mark.asyncio
+    async def test_check_fragment_state_exception(self, fragment_auth):
+        """Test unknown state on exception."""
+        page = AsyncMock()
+        page.evaluate = AsyncMock(side_effect=Exception("page crashed"))
+        state = await fragment_auth._check_fragment_state(page)
+        assert state == "unknown"
+
+    # --- _open_oauth_popup tests ---
+
+    @pytest.mark.asyncio
+    async def test_open_oauth_popup(self, fragment_auth):
+        """Test popup is opened by clicking button.login-link."""
+        page = AsyncMock()
+        mock_popup = AsyncMock()
+        mock_popup.url = "https://oauth.telegram.org/auth?..."
+        mock_popup.wait_for_load_state = AsyncMock()
+
+        async def _return_popup():
+            return mock_popup
+
+        page.wait_for_event = MagicMock(return_value=_return_popup())
+        page.click = AsyncMock()
+
+        popup = await fragment_auth._open_oauth_popup(page)
+        assert popup == mock_popup
+        page.wait_for_event.assert_called_once_with('popup', timeout=10000)
+        page.click.assert_awaited_once_with('button.login-link')
+        mock_popup.wait_for_load_state.assert_awaited_once_with('domcontentloaded')
+
+    # --- _submit_phone_on_popup tests ---
+
+    @pytest.mark.asyncio
+    async def test_submit_phone_on_popup_success(self, fragment_auth):
+        """Test phone submission on OAuth popup - success case."""
+        popup = AsyncMock()
+        popup.evaluate = AsyncMock()
+        popup.click = AsyncMock()
+        popup.wait_for_selector = AsyncMock()  # success — form appeared
+
+        result = await fragment_auth._submit_phone_on_popup(popup, "79991234567")
+        assert result is True
+
+        # Verify evaluate was called with phone
+        popup.evaluate.assert_awaited()
+        call_args = popup.evaluate.call_args_list[0]
+        assert "+79991234567" in str(call_args)
+
+        # Verify submit button was clicked
+        popup.click.assert_awaited_once_with('form#send-form button[type="submit"]')
+
+    @pytest.mark.asyncio
+    async def test_submit_phone_on_popup_already_formatted(self, fragment_auth):
+        """Test phone submission when phone already has + prefix."""
+        popup = AsyncMock()
+        popup.evaluate = AsyncMock()
+        popup.click = AsyncMock()
+        popup.wait_for_selector = AsyncMock()
+
+        result = await fragment_auth._submit_phone_on_popup(popup, "+79991234567")
+        assert result is True
+        call_args = popup.evaluate.call_args_list[0]
+        # Should not double the +
+        assert "++79991234567" not in str(call_args)
+
+    @pytest.mark.asyncio
+    async def test_submit_phone_on_popup_error(self, fragment_auth):
+        """Test phone submission failure with error alert."""
+        popup = AsyncMock()
+        popup.evaluate = AsyncMock(side_effect=[
+            None,  # first call: set phone value
+            "Invalid phone number",  # second call: get error alert
+        ])
+        popup.click = AsyncMock()
+        popup.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
+
+        result = await fragment_auth._submit_phone_on_popup(popup, "invalid")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_submit_phone_on_popup_empty_phone(self, fragment_auth):
+        """Test phone submission rejects empty phone."""
+        popup = AsyncMock()
+        assert await fragment_auth._submit_phone_on_popup(popup, "") is False
+        assert await fragment_auth._submit_phone_on_popup(popup, "   ") is False
+
+    # --- _confirm_via_telethon tests ---
+
+    @pytest.mark.asyncio
+    async def test_confirm_via_telethon_button(self, fragment_auth):
+        """Test confirmation via inline button click."""
+        client = MagicMock()
+        handlers = []
+
+        def mock_on(event_filter):
+            def decorator(func):
+                handlers.append(func)
+                return func
+            return decorator
+
+        client.on = mock_on
+        client.remove_event_handler = MagicMock()
+
+        async def simulate_button_message():
+            await asyncio.sleep(0.05)
+            # Create mock message with Confirm button
+            mock_btn = MagicMock()
+            mock_btn.text = "Confirm"
+            mock_msg = MagicMock()
+            mock_msg.buttons = [[mock_btn]]
+            mock_msg.click = AsyncMock()
+
+            mock_event = MagicMock()
+            mock_event.message = mock_msg
+            mock_event.raw_text = ""
+
+            for h in handlers:
+                await h(mock_event)
+
+        asyncio.create_task(simulate_button_message())
+        result = await fragment_auth._confirm_via_telethon(client, timeout=5)
+        assert result is True
+        client.remove_event_handler.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_confirm_via_telethon_accept_button(self, fragment_auth):
+        """Test confirmation via Accept button (Russian)."""
+        client = MagicMock()
+        handlers = []
+
+        def mock_on(event_filter):
+            def decorator(func):
+                handlers.append(func)
+                return func
+            return decorator
+
+        client.on = mock_on
+        client.remove_event_handler = MagicMock()
+
+        async def simulate():
+            await asyncio.sleep(0.05)
+            mock_btn = MagicMock()
+            mock_btn.text = "Подтвердить"
+            mock_msg = MagicMock()
+            mock_msg.buttons = [[mock_btn]]
+            mock_msg.click = AsyncMock()
+
+            mock_event = MagicMock()
+            mock_event.message = mock_msg
+            mock_event.raw_text = ""
+            for h in handlers:
+                await h(mock_event)
+
+        asyncio.create_task(simulate())
+        result = await fragment_auth._confirm_via_telethon(client, timeout=5)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_confirm_via_telethon_text_code(self, fragment_auth):
+        """Test confirmation via text code (no buttons)."""
+        client = MagicMock()
+        handlers = []
+
+        def mock_on(event_filter):
+            def decorator(func):
+                handlers.append(func)
+                return func
+            return decorator
+
+        client.on = mock_on
+        client.remove_event_handler = MagicMock()
+
+        async def simulate():
+            await asyncio.sleep(0.05)
+            mock_msg = MagicMock()
+            mock_msg.buttons = None
+
+            mock_event = MagicMock()
+            mock_event.message = mock_msg
+            mock_event.raw_text = "Login code: 12345. Do not share."
+            for h in handlers:
+                await h(mock_event)
+
+        asyncio.create_task(simulate())
+        result = await fragment_auth._confirm_via_telethon(client, timeout=5)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_confirm_via_telethon_unknown_button(self, fragment_auth):
+        """Test confirmation fallback: clicks first button when no keyword match."""
+        client = MagicMock()
+        handlers = []
+
+        def mock_on(event_filter):
+            def decorator(func):
+                handlers.append(func)
+                return func
+            return decorator
+
+        client.on = mock_on
+        client.remove_event_handler = MagicMock()
+
+        async def simulate():
+            await asyncio.sleep(0.05)
+            mock_btn = MagicMock()
+            mock_btn.text = "SomeUnknownAction"
+            mock_msg = MagicMock()
+            mock_msg.buttons = [[mock_btn]]
+            mock_msg.click = AsyncMock()
+
+            mock_event = MagicMock()
+            mock_event.message = mock_msg
+            mock_event.raw_text = ""
+            for h in handlers:
+                await h(mock_event)
+
+        asyncio.create_task(simulate())
+        result = await fragment_auth._confirm_via_telethon(client, timeout=5)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_confirm_via_telethon_timeout(self, fragment_auth):
+        """Test confirmation timeout when no message arrives."""
+        client = MagicMock()
+        client.on = MagicMock(return_value=lambda f: f)
+        client.remove_event_handler = MagicMock()
+
+        result = await fragment_auth._confirm_via_telethon(client, timeout=0.1)
+        assert result is False
+        client.remove_event_handler.assert_called()
+
+    # --- _wait_for_fragment_auth tests ---
+
+    @pytest.mark.asyncio
+    async def test_wait_for_fragment_auth_success(self, fragment_auth):
+        """Test waiting for fragment auth - becomes authorized."""
+        page = AsyncMock()
+        call_count = 0
+
+        async def mock_check(p):
+            nonlocal call_count
+            call_count += 1
+            return "authorized" if call_count >= 2 else "not_authorized"
+
+        with patch.object(fragment_auth, '_check_fragment_state', side_effect=mock_check):
+            result = await fragment_auth._wait_for_fragment_auth(page, timeout=5)
+            assert result is True
+
+    @pytest.mark.asyncio
+    async def test_wait_for_fragment_auth_timeout(self, fragment_auth):
+        """Test waiting for fragment auth - stays not_authorized."""
+        page = AsyncMock()
+
+        with patch.object(fragment_auth, '_check_fragment_state', return_value="not_authorized"):
+            result = await fragment_auth._wait_for_fragment_auth(page, timeout=2)
+            assert result is False
+
+    @pytest.mark.asyncio
+    async def test_wait_for_fragment_auth_exception_resilient(self, fragment_auth):
+        """Test that _wait_for_fragment_auth handles exceptions gracefully."""
+        page = AsyncMock()
+        call_count = 0
+
+        async def mock_check(p):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise Exception("page reloading")
+            return "authorized"
+
+        with patch.object(fragment_auth, '_check_fragment_state', side_effect=mock_check):
+            result = await fragment_auth._wait_for_fragment_auth(page, timeout=5)
+            assert result is True
+
+    # --- connect() integration tests ---
 
     @pytest.mark.asyncio
     async def test_connect_returns_error_on_session_failure(self, fragment_auth):
@@ -210,20 +470,14 @@ class TestFragmentAuth:
     @pytest.mark.asyncio
     async def test_connect_already_authorized(self, fragment_auth):
         """Test connect when already authorized on Fragment."""
-        # Mock Telethon client
         mock_client = MagicMock()
         mock_me = MagicMock()
         mock_me.phone = "79991234567"
         mock_me.first_name = "Test"
         mock_me.id = 12345
         mock_client.get_me = AsyncMock(return_value=mock_me)
-        mock_client.is_user_authorized = AsyncMock(return_value=True)
         mock_client.disconnect = AsyncMock()
-        # Make client.on() return a proper decorator (not a coroutine)
-        mock_client.on = MagicMock(return_value=lambda f: f)
-        mock_client.remove_event_handler = MagicMock()
 
-        # Mock browser
         mock_page = AsyncMock()
         mock_browser_ctx = AsyncMock()
         mock_browser_ctx.new_page = AsyncMock(return_value=mock_page)
@@ -242,6 +496,168 @@ class TestFragmentAuth:
             result = await fragment_auth.connect(headless=True)
             assert result.success
             assert result.already_authorized
+
+    @pytest.mark.asyncio
+    async def test_connect_full_flow(self, fragment_auth):
+        """Test full connect flow: popup → phone → confirm → auth."""
+        # Mock Telethon client
+        mock_client = MagicMock()
+        mock_me = MagicMock()
+        mock_me.phone = "79991234567"
+        mock_me.first_name = "Test"
+        mock_me.id = 12345
+        mock_client.get_me = AsyncMock(return_value=mock_me)
+        mock_client.disconnect = AsyncMock()
+
+        # Mock browser
+        mock_page = AsyncMock()
+        mock_popup = AsyncMock()
+        mock_browser_ctx = AsyncMock()
+        mock_browser_ctx.new_page = AsyncMock(return_value=mock_page)
+        mock_browser_ctx.close = AsyncMock()
+
+        fragment_auth.browser_manager.get_profile = MagicMock()
+        fragment_auth.browser_manager.launch = AsyncMock(return_value=mock_browser_ctx)
+
+        with patch.object(
+            fragment_auth, '_create_telethon_client', return_value=mock_client
+        ), patch.object(
+            fragment_auth, '_check_fragment_state', side_effect=["not_authorized", "authorized"]
+        ), patch.object(
+            fragment_auth, '_open_oauth_popup', return_value=mock_popup
+        ), patch.object(
+            fragment_auth, '_submit_phone_on_popup', return_value=True
+        ), patch.object(
+            fragment_auth, '_confirm_via_telethon', return_value=True
+        ), patch.object(
+            fragment_auth, '_wait_for_fragment_auth', return_value=True
+        ), patch.object(
+            fragment_auth, '_human_delay', return_value=None
+        ):
+            result = await fragment_auth.connect(headless=True)
+            assert result.success
+            assert result.telegram_connected
+            assert not result.already_authorized
+
+    @pytest.mark.asyncio
+    async def test_connect_popup_failure(self, fragment_auth):
+        """Test connect when OAuth popup fails to open."""
+        mock_client = MagicMock()
+        mock_me = MagicMock()
+        mock_me.phone = "79991234567"
+        mock_client.get_me = AsyncMock(return_value=mock_me)
+        mock_client.disconnect = AsyncMock()
+
+        mock_page = AsyncMock()
+        mock_browser_ctx = AsyncMock()
+        mock_browser_ctx.new_page = AsyncMock(return_value=mock_page)
+        mock_browser_ctx.close = AsyncMock()
+
+        fragment_auth.browser_manager.get_profile = MagicMock()
+        fragment_auth.browser_manager.launch = AsyncMock(return_value=mock_browser_ctx)
+
+        with patch.object(
+            fragment_auth, '_create_telethon_client', return_value=mock_client
+        ), patch.object(
+            fragment_auth, '_check_fragment_state', return_value="not_authorized"
+        ), patch.object(
+            fragment_auth, '_open_oauth_popup', side_effect=Exception("Popup timeout")
+        ):
+            result = await fragment_auth.connect(headless=True)
+            assert not result.success
+            assert "popup" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_connect_phone_submission_failure(self, fragment_auth):
+        """Test connect when phone submission fails."""
+        mock_client = MagicMock()
+        mock_me = MagicMock()
+        mock_me.phone = "79991234567"
+        mock_client.get_me = AsyncMock(return_value=mock_me)
+        mock_client.disconnect = AsyncMock()
+
+        mock_page = AsyncMock()
+        mock_popup = AsyncMock()
+        mock_browser_ctx = AsyncMock()
+        mock_browser_ctx.new_page = AsyncMock(return_value=mock_page)
+        mock_browser_ctx.close = AsyncMock()
+
+        fragment_auth.browser_manager.get_profile = MagicMock()
+        fragment_auth.browser_manager.launch = AsyncMock(return_value=mock_browser_ctx)
+
+        with patch.object(
+            fragment_auth, '_create_telethon_client', return_value=mock_client
+        ), patch.object(
+            fragment_auth, '_check_fragment_state', return_value="not_authorized"
+        ), patch.object(
+            fragment_auth, '_open_oauth_popup', return_value=mock_popup
+        ), patch.object(
+            fragment_auth, '_submit_phone_on_popup', return_value=False
+        ), patch.object(
+            fragment_auth, '_human_delay', return_value=None
+        ):
+            result = await fragment_auth.connect(headless=True)
+            assert not result.success
+            assert "phone" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_connect_confirmation_timeout(self, fragment_auth):
+        """Test connect when Telethon confirmation times out."""
+        mock_client = MagicMock()
+        mock_me = MagicMock()
+        mock_me.phone = "79991234567"
+        mock_client.get_me = AsyncMock(return_value=mock_me)
+        mock_client.disconnect = AsyncMock()
+
+        mock_page = AsyncMock()
+        mock_popup = AsyncMock()
+        mock_browser_ctx = AsyncMock()
+        mock_browser_ctx.new_page = AsyncMock(return_value=mock_page)
+        mock_browser_ctx.close = AsyncMock()
+
+        fragment_auth.browser_manager.get_profile = MagicMock()
+        fragment_auth.browser_manager.launch = AsyncMock(return_value=mock_browser_ctx)
+
+        with patch.object(
+            fragment_auth, '_create_telethon_client', return_value=mock_client
+        ), patch.object(
+            fragment_auth, '_check_fragment_state', return_value="not_authorized"
+        ), patch.object(
+            fragment_auth, '_open_oauth_popup', return_value=mock_popup
+        ), patch.object(
+            fragment_auth, '_submit_phone_on_popup', return_value=True
+        ), patch.object(
+            fragment_auth, '_confirm_via_telethon', return_value=False
+        ), patch.object(
+            fragment_auth, '_human_delay', return_value=None
+        ):
+            result = await fragment_auth.connect(headless=True)
+            assert not result.success
+            assert "timeout" in result.error.lower() or "confirmation" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_connect_no_phone(self, fragment_auth):
+        """Test connect when phone is not available from session."""
+        mock_client = MagicMock()
+        mock_me = MagicMock()
+        mock_me.phone = None
+        mock_client.get_me = AsyncMock(return_value=mock_me)
+        mock_client.disconnect = AsyncMock()
+
+        mock_page = AsyncMock()
+        mock_browser_ctx = AsyncMock()
+        mock_browser_ctx.new_page = AsyncMock(return_value=mock_page)
+        mock_browser_ctx.close = AsyncMock()
+
+        fragment_auth.browser_manager.get_profile = MagicMock()
+        fragment_auth.browser_manager.launch = AsyncMock(return_value=mock_browser_ctx)
+
+        with patch.object(
+            fragment_auth, '_create_telethon_client', return_value=mock_client
+        ):
+            result = await fragment_auth.connect(headless=True)
+            assert not result.success
+            assert "phone" in result.error.lower()
 
 
 class TestCodeExtraction:

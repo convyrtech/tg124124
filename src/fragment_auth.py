@@ -1,15 +1,15 @@
 """
 Fragment.com Authorization Module
-Авторизация на fragment.com через существующий Telegram профиль и Telethon сессию.
+Авторизация на fragment.com через OAuth popup на oauth.telegram.org + Telethon подтверждение.
 
-Принцип работы:
-1. Открываем fragment.com в существующем Camoufox профиле
-2. Проверяем: уже авторизован на fragment.com?
-3. Если нет — нажимаем "Connect Telegram"
-4. Вводим номер телефона
-5. Telethon перехватывает код подтверждения из сообщения от user 777000
-6. Playwright вводит код в browser
-7. Профиль авторизован на fragment.com
+Flow:
+1. Открываем fragment.com в Camoufox browser profile
+2. Проверяем: уже авторизован? (через Aj.state.unAuth JS)
+3. Если нет — кликаем "Connect Telegram" (button.login-link)
+4. Ловим popup на oauth.telegram.org
+5. Вводим номер телефона в popup форму
+6. Telethon перехватывает сообщение от user 777000 и подтверждает (кнопка/код)
+7. Popup закрывается, fragment.com авторизован
 
 ВАЖНО: НЕ логировать auth_key, api_hash, phone numbers полностью!
 """
@@ -18,15 +18,14 @@ import logging
 import random
 import re
 import sqlite3
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 
 from .browser_manager import BrowserManager, BrowserContext
-from .telegram_auth import AccountConfig, AuthResult, parse_telethon_proxy
+from .telegram_auth import AccountConfig, parse_telethon_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +36,8 @@ TELEGRAM_SERVICE_USER_ID = 777000
 
 # Timeouts
 PAGE_LOAD_TIMEOUT = 60000  # ms
-CODE_WAIT_TIMEOUT = 120  # seconds
-AUTH_COMPLETE_TIMEOUT = 30  # seconds
+CONFIRM_TIMEOUT = 60  # seconds - wait for Telethon confirmation
+AUTH_COMPLETE_TIMEOUT = 30  # seconds - wait for fragment.com state change
 
 
 def _mask_phone(phone: str) -> str:
@@ -60,11 +59,11 @@ class FragmentResult:
 
 class FragmentAuth:
     """
-    Авторизация на fragment.com через существующий Telegram профиль.
+    Авторизация на fragment.com через OAuth popup + Telethon.
 
     Использует:
     - Существующий Camoufox browser profile (тот же что для web.telegram.org)
-    - Telethon client для перехвата кода подтверждения
+    - Telethon client для подтверждения login request
     - Тот же прокси что у аккаунта
     """
 
@@ -76,13 +75,16 @@ class FragmentAuth:
         self.account = account
         self.browser_manager = browser_manager or BrowserManager()
         self._client: Optional[TelegramClient] = None
-        self._verification_code: Optional[str] = None
-        self._code_event: Optional[asyncio.Event] = None  # Created lazily in running loop
 
     async def _create_telethon_client(self) -> TelegramClient:
         """
         Создаёт Telethon client из существующей сессии.
-        Reuses the same logic as TelegramAuth._create_telethon_client.
+
+        Returns:
+            Connected and authorized TelegramClient
+
+        Raises:
+            RuntimeError: If connection or authorization fails
         """
         proxy = parse_telethon_proxy(self.account.proxy)
         device = self.account.device
@@ -128,19 +130,20 @@ class FragmentAuth:
         """
         Извлекает код подтверждения из сообщения Telegram.
 
-        Telegram Login Widget отправляет сообщение вида:
-        "Login code: 12345. Do not give this code to anyone..."
+        Args:
+            text: Raw text of the message
+
+        Returns:
+            Extracted code string or None
         """
         if not text:
             return None
 
-        # Pattern: "Login code: XXXXX" or "Код входа: XXXXX"
         patterns = [
             r'Login code:\s*(\d{5,6})',
             r'Код входа:\s*(\d{5,6})',
             r'login code[:\s]+(\d{5,6})',
             r'code[:\s]+(\d{5,6})',
-            # Generic: standalone 5-6 digit number
             r'\b(\d{5,6})\b',
         ]
 
@@ -151,305 +154,206 @@ class FragmentAuth:
 
         return None
 
-    async def _setup_code_handler(self, client: TelegramClient) -> None:
-        """Устанавливает обработчик для перехвата кода от Telegram (user 777000)."""
-        self._verification_code = None
-        # Create Event in the running event loop to avoid loop mismatch
-        self._code_event = asyncio.Event()
-        self._code_event.clear()
-
-        @client.on(events.NewMessage(from_users=TELEGRAM_SERVICE_USER_ID))
-        async def _on_login_code(event):
-            code = self._extract_code_from_message(event.raw_text)
-            if code:
-                logger.info("Intercepted verification code (length=%d)", len(code))
-                self._verification_code = code
-                self._code_event.set()
-
-        self._code_handler = _on_login_code
-
-    async def _remove_code_handler(self, client: TelegramClient) -> None:
-        """Удаляет обработчик кода."""
-        if hasattr(self, '_code_handler'):
-            client.remove_event_handler(self._code_handler)
-
-    async def _wait_for_code(self, timeout: int = CODE_WAIT_TIMEOUT) -> Optional[str]:
-        """
-        Ждёт получения кода подтверждения через Telethon.
-
-        Args:
-            timeout: Максимальное время ожидания в секундах
-
-        Returns:
-            Код подтверждения или None если timeout
-        """
-        # Ensure event exists (creates in current event loop if needed)
-        if self._code_event is None:
-            self._code_event = asyncio.Event()
-        try:
-            await asyncio.wait_for(self._code_event.wait(), timeout=timeout)
-            return self._verification_code
-        except asyncio.TimeoutError:
-            logger.warning("Verification code timeout after %ds", timeout)
-            return None
-
-    async def _check_fragment_state(self, page) -> str:
-        """
-        Определяет текущее состояние на fragment.com.
-
-        Returns:
-            "authorized" - уже авторизован в Telegram на fragment.com
-            "not_authorized" - не авторизован, нужно Connect Telegram
-            "loading" - страница ещё загружается
-            "unknown" - неизвестное состояние
-        """
-        try:
-            # Check for "My Assets" or user menu - indicates Telegram is connected
-            my_assets = await page.query_selector(
-                'a[href*="my-assets"], a[href*="my_assets"], '
-                '[class*="my-assets"], [class*="user-menu"], '
-                '[class*="avatar"]'
-            )
-            if my_assets:
-                return "authorized"
-
-            # Check for "Connect Telegram" button - indicates not authorized
-            connect_btn = await page.query_selector(
-                'button:has-text("Connect Telegram"), '
-                'a:has-text("Connect Telegram"), '
-                '[class*="connect"]:has-text("Telegram")'
-            )
-            if connect_btn:
-                return "not_authorized"
-
-            # Check page text content
-            body_text = await page.evaluate("() => document.body?.innerText || ''")
-            if 'Connect TON and Telegram' in body_text:
-                return "not_authorized"
-            if 'My Assets' in body_text or 'My Numbers' in body_text:
-                return "authorized"
-
-            # Check if page has loaded at all
-            title = await page.title()
-            if 'Fragment' in title:
-                return "not_authorized"  # Page loaded but no clear state
-
-            return "loading"
-
-        except Exception as e:
-            logger.debug("Error checking fragment state: %s", e)
-            return "unknown"
-
     async def _human_delay(self, min_sec: float = 0.5, max_sec: float = 2.0) -> None:
         """Human-like random delay."""
         await asyncio.sleep(random.uniform(min_sec, max_sec))
 
-    async def _click_connect_telegram(self, page) -> bool:
+    async def _check_fragment_state(self, page: Any) -> str:
         """
-        Находит и нажимает кнопку "Connect Telegram" на fragment.com.
+        Определяет состояние авторизации на fragment.com.
+
+        Uses real JS API (Aj.state.unAuth) and DOM selectors confirmed via Playwright MCP.
+
+        Args:
+            page: Playwright page object
 
         Returns:
-            True если кнопка найдена и нажата
+            "authorized", "not_authorized", "loading", or "unknown"
         """
-        selectors = [
-            'button:has-text("Connect Telegram")',
-            'a:has-text("Connect Telegram")',
-            '[class*="connect"]:has-text("Telegram")',
-            'text="Connect Telegram"',
-            # Mobile menu
-            'a:has-text("Connect")',
-        ]
-
-        for selector in selectors:
-            try:
-                btn = await page.query_selector(selector)
-                if btn and await btn.is_visible():
-                    await self._human_delay(0.3, 0.8)
-                    await btn.click()
-                    logger.info("Clicked 'Connect Telegram' button")
-                    return True
-            except Exception as e:
-                logger.debug("Selector %s failed: %s", selector, e)
-                continue
-
-        # Fallback: try page.click with text matching
         try:
-            await page.click('text="Connect Telegram"', timeout=5000)
-            logger.info("Clicked 'Connect Telegram' via text match")
+            # Primary: check Aj.state.unAuth JS variable
+            is_unauth = await page.evaluate(
+                "() => (typeof Aj !== 'undefined' && Aj.state) ? Aj.state.unAuth : null"
+            )
+            if is_unauth is False:
+                return "authorized"
+            if is_unauth is True:
+                return "not_authorized"
+
+            # Fallback: check for Connect Telegram button
+            has_login_btn = await page.evaluate(
+                "() => !!document.querySelector('button.login-link')"
+            )
+            if has_login_btn:
+                return "not_authorized"
+
+            # Fallback: check for logout link (means logged in)
+            has_logout = await page.evaluate(
+                "() => !!document.querySelector('.logout-link')"
+            )
+            if has_logout:
+                return "authorized"
+
+            return "loading"
+        except Exception as e:
+            logger.debug("Error checking fragment state: %s", e)
+            return "unknown"
+
+    async def _open_oauth_popup(self, page: Any) -> Any:
+        """
+        Кликает Connect Telegram и перехватывает popup окно oauth.telegram.org.
+
+        Args:
+            page: Playwright page on fragment.com
+
+        Returns:
+            Popup page object (oauth.telegram.org)
+
+        Raises:
+            RuntimeError: If popup doesn't appear or button not found
+        """
+        popup_promise = page.wait_for_event('popup', timeout=10000)
+        await page.click('button.login-link')
+        popup = await popup_promise
+        await popup.wait_for_load_state('domcontentloaded')
+        logger.info("OAuth popup opened: %s", popup.url)
+        return popup
+
+    async def _submit_phone_on_popup(self, popup: Any, phone: str) -> bool:
+        """
+        Заполняет телефон на oauth.telegram.org popup и сабмитит.
+
+        Args:
+            popup: Playwright page (oauth.telegram.org popup)
+            phone: Phone number without + (e.g. "79991234567")
+
+        Returns:
+            True if phone was accepted and confirmation form appeared
+        """
+        if not phone or not phone.strip():
+            logger.error("Cannot submit empty phone number")
+            return False
+
+        formatted = f'+{phone}' if not phone.startswith('+') else phone
+        logger.info("Submitting phone: %s", _mask_phone(formatted))
+
+        # Set phone value via JS (bypasses country code selection complexity)
+        await popup.evaluate("""(phone) => {
+            const codeEl = document.getElementById('login-phone-code');
+            const phoneEl = document.getElementById('login-phone');
+            if (codeEl) codeEl.value = '';
+            if (phoneEl) phoneEl.value = phone;
+        }""", formatted)
+
+        # Click submit
+        await popup.click('form#send-form button[type="submit"]')
+
+        # Wait for confirmation form to appear (#login-form loses .hide class)
+        try:
+            await popup.wait_for_selector('#login-form:not(.hide)', timeout=15000)
+            logger.info("Phone accepted, confirmation form visible")
             return True
-        except Exception:
-            pass
-
-        logger.warning("Could not find 'Connect Telegram' button")
-        return False
-
-    async def _enter_phone_number(self, page, phone: str) -> bool:
-        """
-        Вводит номер телефона в форму Telegram Login Widget.
-
-        Args:
-            phone: Номер телефона (e.g., "79991234567")
-
-        Returns:
-            True если номер введён и отправлен
-        """
-        # Wait for phone input to appear
-        phone_selectors = [
-            'input[type="tel"]',
-            'input[placeholder*="phone"]',
-            'input[placeholder*="Phone"]',
-            'input[name="phone"]',
-            '#phone',
-            'input.phone-input',
-        ]
-
-        phone_input = None
-        for selector in phone_selectors:
-            try:
-                phone_input = await page.wait_for_selector(
-                    selector, timeout=10000, state="visible"
-                )
-                if phone_input:
-                    break
-            except Exception:
-                continue
-
-        if not phone_input:
-            logger.warning("Phone input not found on page")
+        except Exception as e:
+            logger.debug("Phone submission wait failed: %s", e)
+            # Check for error message
+            error = await popup.evaluate(
+                "() => document.getElementById('login-alert')?.textContent || ''"
+            )
+            if error:
+                logger.error("OAuth phone error: %s", error)
             return False
 
-        # Format phone: ensure it starts with +
-        formatted_phone = phone if phone.startswith('+') else f'+{phone}'
-        logger.info("Entering phone: %s", _mask_phone(formatted_phone))
-
-        # Clear and type phone number with human-like delay
-        await phone_input.click()
-        await self._human_delay(0.2, 0.5)
-
-        # Clear existing content
-        await phone_input.fill('')
-        await self._human_delay(0.1, 0.3)
-
-        # Type character by character for more human-like behavior
-        for char in formatted_phone:
-            await phone_input.type(char, delay=random.randint(50, 150))
-
-        await self._human_delay(0.5, 1.0)
-
-        # Submit: click Next/Continue button or press Enter
-        submit_selectors = [
-            'button:has-text("Next")',
-            'button:has-text("Continue")',
-            'button:has-text("Send")',
-            'button[type="submit"]',
-            'input[type="submit"]',
-        ]
-
-        for selector in submit_selectors:
-            try:
-                submit_btn = await page.query_selector(selector)
-                if submit_btn and await submit_btn.is_visible():
-                    await submit_btn.click()
-                    logger.info("Submitted phone number")
-                    return True
-            except Exception:
-                continue
-
-        # Fallback: press Enter
-        await phone_input.press('Enter')
-        logger.info("Submitted phone via Enter")
-        return True
-
-    async def _enter_verification_code(self, page, code: str) -> bool:
+    async def _confirm_via_telethon(self, client: TelegramClient, timeout: int = CONFIRM_TIMEOUT) -> bool:
         """
-        Вводит код подтверждения.
+        Перехватывает и подтверждает login request через Telethon.
+
+        Handles multiple confirmation types:
+        - Inline button (KeyboardButtonCallback): clicks Confirm/Accept
+        - Text code: extracts and logs (popup auto-confirms on read in some cases)
+        - URL auth button: logs for investigation
 
         Args:
-            code: Код подтверждения (5-6 цифр)
+            client: Connected TelegramClient
+            timeout: Max seconds to wait for confirmation message
 
         Returns:
-            True если код введён
+            True if confirmation was handled
         """
-        code_selectors = [
-            'input[type="text"]',
-            'input[type="number"]',
-            'input[placeholder*="code"]',
-            'input[placeholder*="Code"]',
-            'input[name="code"]',
-            '#code',
-        ]
+        confirmed = asyncio.Event()
 
-        code_input = None
-        for selector in code_selectors:
-            try:
-                code_input = await page.wait_for_selector(
-                    selector, timeout=10000, state="visible"
-                )
-                if code_input:
-                    break
-            except Exception:
-                continue
+        @client.on(events.NewMessage(from_users=TELEGRAM_SERVICE_USER_ID))
+        async def handler(event):
+            msg = event.message
 
-        if not code_input:
-            logger.warning("Code input not found on page")
+            # Variant A: inline button (Confirm / Accept / Подтвердить)
+            if msg.buttons:
+                for row_idx, row in enumerate(msg.buttons):
+                    for col_idx, btn in enumerate(row):
+                        btn_text = btn.text.lower()
+                        if any(kw in btn_text for kw in ('confirm', 'accept', 'подтвердить', 'принять')):
+                            logger.info("Clicking confirmation button: %r", btn.text)
+                            try:
+                                await msg.click(row_idx, col_idx)
+                            except Exception as e:
+                                logger.error("Failed to click confirmation button: %s", e)
+                            confirmed.set()
+                            return
+                # If buttons exist but none matched keywords, click first button
+                logger.warning("Unknown button layout, clicking first button")
+                try:
+                    await msg.click(0, 0)
+                except Exception as e:
+                    logger.error("Failed to click fallback button: %s", e)
+                confirmed.set()
+                return
+
+            # Variant B: text code (fallback)
+            code = self._extract_code_from_message(event.raw_text)
+            if code:
+                logger.info("Received text code (length=%d) — auto-confirm may apply", len(code))
+                confirmed.set()
+                return
+
+            # Variant C: unknown message format
+            logger.warning("Unknown message from 777000: %s", event.raw_text[:100])
+            confirmed.set()
+
+        try:
+            await asyncio.wait_for(confirmed.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning("Confirmation timeout after %ds", timeout)
             return False
+        finally:
+            client.remove_event_handler(handler)
 
-        logger.info("Entering verification code")
-        await code_input.click()
-        await self._human_delay(0.2, 0.5)
-        await code_input.fill('')
-
-        # Type code character by character
-        for char in code:
-            await code_input.type(char, delay=random.randint(80, 200))
-
-        await self._human_delay(0.5, 1.0)
-
-        # Submit code
-        submit_selectors = [
-            'button:has-text("Sign In")',
-            'button:has-text("Confirm")',
-            'button:has-text("Submit")',
-            'button:has-text("Next")',
-            'button[type="submit"]',
-        ]
-
-        for selector in submit_selectors:
-            try:
-                submit_btn = await page.query_selector(selector)
-                if submit_btn and await submit_btn.is_visible():
-                    await submit_btn.click()
-                    logger.info("Submitted verification code")
-                    return True
-            except Exception:
-                continue
-
-        # Fallback: press Enter
-        await code_input.press('Enter')
-        logger.info("Submitted code via Enter")
-        return True
-
-    async def _wait_for_auth_complete(
-        self,
-        page,
-        timeout: int = AUTH_COMPLETE_TIMEOUT
-    ) -> bool:
+    async def _wait_for_fragment_auth(self, page: Any, timeout: int = AUTH_COMPLETE_TIMEOUT) -> bool:
         """
-        Ждёт завершения авторизации на fragment.com.
+        Ждёт пока fragment.com покажет авторизованное состояние.
+
+        After Telethon confirms, the oauth popup polls /auth/login and eventually
+        redirects fragment.com to authorized state.
+
+        Args:
+            page: Playwright page on fragment.com
+            timeout: Max seconds to wait
 
         Returns:
-            True если авторизация успешна
+            True if authorized state detected
         """
         for i in range(timeout):
             await asyncio.sleep(1)
-            state = await self._check_fragment_state(page)
-            if state == "authorized":
-                logger.info("Fragment authorization complete!")
-                return True
+            try:
+                state = await self._check_fragment_state(page)
+                if state == "authorized":
+                    logger.info("Fragment authorization complete!")
+                    return True
+            except Exception as e:
+                logger.debug("State check error (page may be reloading): %s", e)
             if i % 5 == 0 and i > 0:
-                logger.debug("Waiting for auth completion... (%ds)", i)
+                logger.debug("Waiting for fragment auth... (%ds)", i)
 
-        logger.warning("Auth completion timeout after %ds", timeout)
+        logger.warning("Fragment auth timeout after %ds", timeout)
         return False
 
     async def connect(
@@ -459,16 +363,18 @@ class FragmentAuth:
         """
         Полный цикл авторизации на fragment.com.
 
-        1. Открыть fragment.com в существующем browser profile
-        2. Если уже авторизован — вернуть success
-        3. Если нет — нажать Connect Telegram, ввести телефон, перехватить код
-        4. Вернуть результат
+        1. Telethon connect + get phone
+        2. Browser launch + open fragment.com
+        3. Check if already authorized
+        4. Open oauth popup + submit phone
+        5. Confirm via Telethon
+        6. Wait for fragment.com authorized state
 
         Args:
-            headless: Headless режим браузера
+            headless: Run browser in headless mode
 
         Returns:
-            FragmentResult с результатом
+            FragmentResult with outcome
         """
         profile = self.browser_manager.get_profile(
             self.account.name,
@@ -486,11 +392,10 @@ class FragmentAuth:
 
         try:
             # 1. Connect Telethon client
-            logger.info("[1/5] Connecting Telethon client...")
+            logger.info("[1/6] Connecting Telethon client...")
             client = await self._create_telethon_client()
             self._client = client
 
-            # Get phone number for login
             me = await client.get_me()
             phone = me.phone
             if not phone:
@@ -500,11 +405,8 @@ class FragmentAuth:
                     error="Phone number not available from Telethon session"
                 )
 
-            # Setup code interception handler
-            await self._setup_code_handler(client)
-
             # 2. Launch browser
-            logger.info("[2/5] Launching browser...")
+            logger.info("[2/6] Launching browser...")
             browser_extra_args = {
                 "os": self.account.device.browser_os_list,
             }
@@ -517,17 +419,19 @@ class FragmentAuth:
             await page.set_viewport_size({"width": 1280, "height": 800})
 
             # 3. Open fragment.com
-            logger.info("[3/5] Opening fragment.com...")
+            logger.info("[3/6] Opening fragment.com...")
             try:
                 await page.goto(FRAGMENT_URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
             except Exception as e:
                 logger.warning("Page load warning: %s", e)
 
-            # Wait for page to stabilize
-            await asyncio.sleep(3)
-
-            # Check current state
-            state = await self._check_fragment_state(page)
+            # Wait for page JS to initialize
+            state = "loading"
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                state = await self._check_fragment_state(page)
+                if state != "loading":
+                    break
             logger.info("Current fragment state: %s", state)
 
             if state == "authorized":
@@ -539,64 +443,49 @@ class FragmentAuth:
                     telegram_connected=True
                 )
 
-            # 4. Connect Telegram
-            logger.info("[4/5] Connecting Telegram on fragment.com...")
-
-            # Click "Connect Telegram"
-            if not await self._click_connect_telegram(page):
-                # Try scrolling or looking in a menu
-                await page.evaluate("window.scrollTo(0, 0)")
-                await asyncio.sleep(1)
-                if not await self._click_connect_telegram(page):
-                    return FragmentResult(
-                        success=False,
-                        account_name=self.account.name,
-                        error="Could not find 'Connect Telegram' button"
-                    )
-
-            await self._human_delay(1.0, 2.0)
-
-            # Enter phone number
-            if not await self._enter_phone_number(page, phone):
+            # 5. Open OAuth popup
+            logger.info("[4/6] Opening OAuth popup...")
+            try:
+                popup = await self._open_oauth_popup(page)
+            except Exception as e:
                 return FragmentResult(
                     success=False,
                     account_name=self.account.name,
-                    error="Could not enter phone number"
+                    error=f"Failed to open OAuth popup: {e}"
                 )
 
-            await self._human_delay(1.0, 2.0)
+            await self._human_delay(0.5, 1.0)
 
-            # 5. Wait for and enter verification code
-            logger.info("[5/5] Waiting for verification code...")
-
-            code = await self._wait_for_code(timeout=CODE_WAIT_TIMEOUT)
-            if not code:
+            # 6. Submit phone on popup
+            logger.info("[5/6] Submitting phone on OAuth popup...")
+            if not await self._submit_phone_on_popup(popup, phone):
                 return FragmentResult(
                     success=False,
                     account_name=self.account.name,
-                    error="Verification code not received within timeout"
+                    error="Phone submission failed on OAuth popup"
                 )
 
-            # Enter the code
-            if not await self._enter_verification_code(page, code):
+            # 7. Confirm via Telethon (Telethon listens, popup polls /auth/login)
+            logger.info("[6/6] Waiting for Telethon confirmation...")
+            if not await self._confirm_via_telethon(client, timeout=CONFIRM_TIMEOUT):
                 return FragmentResult(
                     success=False,
                     account_name=self.account.name,
-                    error="Could not enter verification code"
+                    error="Confirmation timeout — no message from Telegram"
                 )
 
-            # Wait for auth completion
-            if await self._wait_for_auth_complete(page):
+            # 8. Wait for fragment.com to show authorized
+            if not await self._wait_for_fragment_auth(page, timeout=AUTH_COMPLETE_TIMEOUT):
                 return FragmentResult(
-                    success=True,
+                    success=False,
                     account_name=self.account.name,
-                    telegram_connected=True
+                    error="Fragment auth did not complete after confirmation"
                 )
 
             return FragmentResult(
-                success=False,
+                success=True,
                 account_name=self.account.name,
-                error="Authorization did not complete within timeout"
+                telegram_connected=True
             )
 
         except FloodWaitError as e:
@@ -614,13 +503,6 @@ class FragmentAuth:
                 error=str(e)
             )
         finally:
-            # Cleanup code handler
-            if client:
-                try:
-                    await self._remove_code_handler(client)
-                except Exception:
-                    pass
-
             # Close browser
             if browser_ctx:
                 try:
@@ -632,5 +514,5 @@ class FragmentAuth:
             if client:
                 try:
                     await client.disconnect()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Error disconnecting Telethon: %s", e)
