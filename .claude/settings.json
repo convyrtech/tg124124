@@ -3,6 +3,13 @@
     "superpowers@claude-plugins-official": true,
     "playwright@claude-plugins-official": true,
     "context7@claude-plugins-official": true,
-    "feature-dev@claude-plugins-official": true
+    "feature-dev@claude-plugins-official": true,
+    "python-development@claude-code-workflows": true,
+    "security-scanning@claude-code-workflows": true,
+    "developer-essentials@claude-code-workflows": true,
+    "code-review@claude-plugins-official": true,
+    "pr-review-toolkit@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true,
+    "think-through@ilia-izmailov-plugins": true
   }
 }

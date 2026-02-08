@@ -172,11 +172,29 @@ class TestFragmentAuth:
         assert state == "authorized"
 
     @pytest.mark.asyncio
-    async def test_check_fragment_state_loading(self, fragment_auth):
-        """Test loading state when nothing is detected."""
+    async def test_check_fragment_state_cookie_fallback(self, fragment_auth):
+        """Test detecting authorized state via stel_ssid cookie."""
         page = AsyncMock()
         # Aj not loaded, no login-link, no logout-link
         page.evaluate = AsyncMock(side_effect=[None, False, False])
+        # But stel_ssid cookie exists
+        mock_context = MagicMock()
+        mock_context.cookies = AsyncMock(return_value=[
+            {"name": "stel_ssid", "value": "abc123", "domain": "fragment.com"}
+        ])
+        page.context = mock_context
+        state = await fragment_auth._check_fragment_state(page)
+        assert state == "authorized"
+
+    @pytest.mark.asyncio
+    async def test_check_fragment_state_loading(self, fragment_auth):
+        """Test loading state when nothing is detected (no cookies either)."""
+        page = AsyncMock()
+        # Aj not loaded, no login-link, no logout-link, no cookies
+        page.evaluate = AsyncMock(side_effect=[None, False, False])
+        mock_context = MagicMock()
+        mock_context.cookies = AsyncMock(return_value=[])
+        page.context = mock_context
         state = await fragment_auth._check_fragment_state(page)
         assert state == "loading"
 
@@ -265,6 +283,115 @@ class TestFragmentAuth:
         popup = AsyncMock()
         assert await fragment_auth._submit_phone_on_popup(popup, "") is False
         assert await fragment_auth._submit_phone_on_popup(popup, "   ") is False
+
+    # --- _check_popup_already_logged_in tests ---
+
+    @pytest.mark.asyncio
+    async def test_check_popup_already_logged_in_true(self, fragment_auth):
+        """Test detecting already-logged-in oauth popup (ACCEPT/DECLINE)."""
+        popup = AsyncMock()
+        popup.evaluate = AsyncMock(side_effect=[
+            False,  # no login-phone element
+            "LOG OUT\nfragment.com requests access\nDECLINE\nACCEPT",
+        ])
+        result = await fragment_auth._check_popup_already_logged_in(popup)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_check_popup_already_logged_in_false(self, fragment_auth):
+        """Test normal phone-input popup is not flagged as already logged in."""
+        popup = AsyncMock()
+        popup.evaluate = AsyncMock(return_value=True)  # has login-phone
+        result = await fragment_auth._check_popup_already_logged_in(popup)
+        assert result is False
+
+    # --- _accept_existing_session tests ---
+
+    @pytest.mark.asyncio
+    async def test_accept_existing_session_success(self, fragment_auth):
+        """Test clicking ACCEPT via JS evaluate on existing session popup."""
+        popup = AsyncMock()
+        # JS evaluate finds and clicks ACCEPT, returns 'clicked:ACCEPT'
+        popup.evaluate = AsyncMock(return_value="clicked:ACCEPT")
+        result = await fragment_auth._accept_existing_session(popup)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_accept_existing_session_via_get_by_text(self, fragment_auth):
+        """Test fallback to get_by_text when JS evaluate returns None."""
+        popup = AsyncMock()
+        # JS evaluate returns None (no element found via JS)
+        # Then get_by_text("ACCEPT") finds it
+        mock_locator = MagicMock()
+        mock_locator.count = AsyncMock(return_value=1)
+        mock_locator.first = AsyncMock()
+        mock_locator.first.click = AsyncMock()
+        popup.evaluate = AsyncMock(return_value=None)
+        popup.get_by_text = MagicMock(return_value=mock_locator)
+        result = await fragment_auth._accept_existing_session(popup)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_accept_existing_session_failure(self, fragment_auth):
+        """Test returns False when no accept button found anywhere."""
+        popup = AsyncMock()
+        # JS evaluate returns None (no element found)
+        # get_by_text also returns count 0
+        mock_locator = MagicMock()
+        mock_locator.count = AsyncMock(return_value=0)
+        popup.get_by_text = MagicMock(return_value=mock_locator)
+        # Use side_effect to return None for JS click, then HTML for debug
+        popup.evaluate = AsyncMock(side_effect=[None, "<p>No buttons</p>"])
+        result = await fragment_auth._accept_existing_session(popup)
+        assert result is False
+
+    # --- connect with existing session test ---
+
+    @pytest.mark.asyncio
+    async def test_connect_existing_oauth_session(self, fragment_auth):
+        """Test connect flow when oauth popup shows ACCEPT (already logged in)."""
+        mock_client = MagicMock()
+        mock_me = MagicMock()
+        mock_me.phone = "79991234567"
+        mock_me.first_name = "Test"
+        mock_me.id = 12345
+        mock_client.get_me = AsyncMock(return_value=mock_me)
+        mock_client.disconnect = AsyncMock()
+
+        mock_page = AsyncMock()
+        mock_popup = AsyncMock()
+        mock_browser_ctx = AsyncMock()
+        mock_browser_ctx.new_page = AsyncMock(return_value=mock_page)
+        mock_browser_ctx.close = AsyncMock()
+
+        fragment_auth.browser_manager.get_profile = MagicMock()
+        fragment_auth.browser_manager.launch = AsyncMock(return_value=mock_browser_ctx)
+
+        with patch.object(
+            fragment_auth, '_create_telethon_client', return_value=mock_client
+        ), patch.object(
+            fragment_auth, '_check_fragment_state', side_effect=["not_authorized", "authorized"]
+        ), patch.object(
+            fragment_auth, '_open_oauth_popup', return_value=mock_popup
+        ), patch.object(
+            fragment_auth, '_check_popup_already_logged_in', return_value=True
+        ), patch.object(
+            fragment_auth, '_accept_existing_session', return_value=True
+        ), patch.object(
+            fragment_auth, '_wait_for_fragment_auth', return_value=True
+        ), patch.object(
+            fragment_auth, '_human_delay', return_value=None
+        ) as mock_delay, patch.object(
+            fragment_auth, '_submit_phone_on_popup'
+        ) as mock_submit, patch.object(
+            fragment_auth, '_confirm_via_telethon'
+        ) as mock_confirm:
+            result = await fragment_auth.connect(headless=True)
+            assert result.success
+            assert result.telegram_connected
+            # Phone submission and Telethon confirmation should NOT be called
+            mock_submit.assert_not_called()
+            mock_confirm.assert_not_called()
 
     # --- _confirm_via_telethon tests ---
 
@@ -430,12 +557,29 @@ class TestFragmentAuth:
 
     @pytest.mark.asyncio
     async def test_wait_for_fragment_auth_timeout(self, fragment_auth):
-        """Test waiting for fragment auth - stays not_authorized."""
+        """Test waiting for fragment auth - stays not_authorized, no cookies."""
         page = AsyncMock()
+        mock_context = MagicMock()
+        mock_context.cookies = AsyncMock(return_value=[])
+        page.context = mock_context
 
         with patch.object(fragment_auth, '_check_fragment_state', return_value="not_authorized"):
             result = await fragment_auth._wait_for_fragment_auth(page, timeout=2)
             assert result is False
+
+    @pytest.mark.asyncio
+    async def test_wait_for_fragment_auth_cookie_fallback(self, fragment_auth):
+        """Test cookie-based auth detection when JS state is unavailable."""
+        page = AsyncMock()
+        mock_context = MagicMock()
+        mock_context.cookies = AsyncMock(return_value=[
+            {"name": "stel_ssid", "value": "abc123", "domain": "fragment.com"}
+        ])
+        page.context = mock_context
+
+        with patch.object(fragment_auth, '_check_fragment_state', return_value="loading"):
+            result = await fragment_auth._wait_for_fragment_auth(page, timeout=2)
+            assert result is True
 
     @pytest.mark.asyncio
     async def test_wait_for_fragment_auth_exception_resilient(self, fragment_auth):

@@ -74,6 +74,32 @@ def _rmtree_force(path: Path) -> None:
         shutil.rmtree(path, onerror=_on_rmtree_error)
 
 
+def _clean_session_restore(browser_data_path: Path) -> None:
+    """Delete Firefox session restore files that cause launch_persistent_context hangs.
+
+    Firefox stores session state in these files. On subsequent launches,
+    Firefox tries to restore the session and hangs before sending the
+    "ready" signal to Playwright via Juggler pipe.
+
+    See: https://github.com/microsoft/playwright/issues/12632
+    See: https://github.com/microsoft/playwright/issues/12830
+    """
+    targets = [
+        "sessionstore.jsonlz4",
+        "sessionstore-backups",
+        "sessionCheckpoints.json",
+    ]
+    for target in targets:
+        full_path = browser_data_path / target
+        try:
+            if full_path.is_dir():
+                shutil.rmtree(full_path, ignore_errors=True)
+            elif full_path.exists():
+                full_path.unlink()
+        except OSError:
+            pass
+
+
 class ProfileLifecycleManager:
     """
     Manages hot/cold tiering of browser profiles.
@@ -311,10 +337,24 @@ class BrowserManager:
 
         if profile.proxy:
             args["proxy"] = parse_proxy(profile.proxy)
+        else:
+            # geoip requires proxy to work — without proxy it hangs
+            # trying to determine geolocation via external HTTP request
+            args["geoip"] = False
 
         profile.path.mkdir(parents=True, exist_ok=True)
         args["persistent_context"] = True
         args["user_data_dir"] = str(profile.browser_data_path)
+
+        # Disable Firefox session restore to prevent launch hangs
+        # See: https://github.com/microsoft/playwright/issues/12632
+        args["firefox_user_prefs"] = {
+            "browser.sessionstore.resume_from_crash": False,
+            "browser.sessionstore.max_resumed_crashes": 0,
+            "browser.sessionstore.max_tabs_undo": 0,
+            "browser.sessionstore.max_windows_undo": 0,
+            "toolkit.startup.max_resumed_crashes": -1,
+        }
 
         self._save_profile_config(profile)
 
@@ -335,6 +375,83 @@ class BrowserManager:
 
     # FIX-007: Timeout для запуска браузера
     BROWSER_LAUNCH_TIMEOUT = 60  # секунд
+
+    @staticmethod
+    async def _kill_zombie_browser(camoufox: "AsyncCamoufox") -> None:
+        """Kill a Camoufox process that didn't start properly.
+
+        When AsyncCamoufox.__aenter__() times out, the underlying
+        camoufox.exe process may still be running. This method attempts
+        to close it gracefully, then forcefully kills camoufox.exe by PID.
+
+        IMPORTANT: Only kills the specific camoufox.exe process, NOT
+        regular firefox.exe (user's browser).
+        """
+        import subprocess
+
+        try:
+            # Try graceful exit via Playwright context manager
+            try:
+                await asyncio.wait_for(camoufox.__aexit__(None, None, None), timeout=10)
+                logger.debug("Zombie browser cleaned up gracefully")
+                return
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug("Graceful cleanup failed: %s", e)
+
+        # Fallback: kill camoufox.exe processes (NOT firefox.exe!)
+        try:
+            if sys.platform == 'win32':
+                subprocess.run(
+                    ['taskkill', '/F', '/IM', 'camoufox.exe'],
+                    capture_output=True, timeout=5
+                )
+            else:
+                subprocess.run(
+                    ['pkill', '-f', 'camoufox'],
+                    capture_output=True, timeout=5
+                )
+            logger.info("Killed zombie camoufox.exe processes")
+        except Exception as e:
+            logger.debug("Fallback kill camoufox failed: %s", e)
+
+        # Also kill zombie Playwright node.exe driver processes.
+        # Each failed launch leaves a node.exe (~40-60MB) that never exits.
+        # Identify by 'playwright' in command line to avoid killing other node processes.
+        try:
+            if sys.platform == 'win32':
+                # Use PowerShell Get-CimInstance (wmic is deprecated)
+                ps_cmd = (
+                    "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" "
+                    "| Where-Object { $_.CommandLine -like '*playwright*' } "
+                    "| ForEach-Object { $_.ProcessId }"
+                )
+                result = subprocess.run(
+                    ['powershell', '-NoProfile', '-Command', ps_cmd],
+                    capture_output=True, text=True, timeout=15
+                )
+                pids = [
+                    line.strip() for line in result.stdout.splitlines()
+                    if line.strip().isdigit()
+                ]
+                for pid in pids:
+                    subprocess.run(
+                        ['taskkill', '/F', '/PID', pid],
+                        capture_output=True, timeout=5
+                    )
+                if pids:
+                    logger.info("Killed %d zombie Playwright node.exe processes", len(pids))
+            else:
+                subprocess.run(
+                    ['pkill', '-f', 'node.*playwright'],
+                    capture_output=True, timeout=5
+                )
+        except Exception as e:
+            logger.debug("Fallback kill playwright node failed: %s", e)
+
+        # Wait for file locks to release
+        await asyncio.sleep(1)
 
     async def launch(
         self,
@@ -365,6 +482,10 @@ class BrowserManager:
         # FIX-003: Очистка stale lock файлов от предыдущего краша
         browser_data_path = profile.browser_data_path
         if browser_data_path.exists():
+            # FIX: Delete session restore files that cause Firefox launch hangs
+            # https://github.com/microsoft/playwright/issues/12632
+            _clean_session_restore(browser_data_path)
+
             lock_patterns = ['*.lock', 'parent.lock', '.parentlock', 'lock']
             for pattern in lock_patterns:
                 for lock_file in browser_data_path.glob(pattern):
@@ -408,9 +529,44 @@ class BrowserManager:
                 timeout=self.BROWSER_LAUNCH_TIMEOUT
             )
         except asyncio.TimeoutError:
-            if proxy_relay:
-                await proxy_relay.stop()
-            raise RuntimeError(f"Browser launch timeout after {self.BROWSER_LAUNCH_TIMEOUT}s")
+            # Kill the zombie Firefox process left by the timed-out launch
+            await self._kill_zombie_browser(camoufox)
+
+            # Retry once with a fresh profile (delete corrupted browser_data)
+            logger.warning(
+                "Browser launch timeout for '%s' — retrying with fresh profile...",
+                profile.name
+            )
+            if browser_data_path.exists():
+                try:
+                    _rmtree_force(browser_data_path)
+                    logger.info("Deleted corrupted browser_data for '%s'", profile.name)
+                except OSError as e:
+                    logger.warning(
+                        "Could not fully delete browser_data for '%s': %s",
+                        profile.name, e
+                    )
+
+            # Rebuild args (profile dir will be recreated)
+            if profile.proxy and needs_relay(profile.proxy):
+                args = self._build_camoufox_args(relay_profile, headless, extra_args)
+            else:
+                args = self._build_camoufox_args(profile, headless, extra_args)
+
+            camoufox = AsyncCamoufox(**args)
+            try:
+                browser = await asyncio.wait_for(
+                    camoufox.__aenter__(),
+                    timeout=self.BROWSER_LAUNCH_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                await self._kill_zombie_browser(camoufox)
+                if proxy_relay:
+                    await proxy_relay.stop()
+                raise RuntimeError(
+                    f"Browser launch timeout after {self.BROWSER_LAUNCH_TIMEOUT}s "
+                    f"(retried with fresh profile)"
+                )
 
         ctx = BrowserContext(
             profile=profile,

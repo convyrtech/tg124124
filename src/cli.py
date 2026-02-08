@@ -679,10 +679,10 @@ def health(account: str):
 @cli.command()
 @click.option("--account", "-a", help="Имя аккаунта для авторизации на Fragment")
 @click.option("--all", "fragment_all", is_flag=True, help="Авторизовать все аккаунты")
-@click.option("--headless", is_flag=True, help="Запуск без GUI")
+@click.option("--headed", is_flag=True, help="Запуск с GUI (по умолчанию headless)")
 @click.option("--cooldown", "-c", default=DEFAULT_COOLDOWN, type=int,
               help=f"Секунды между аккаунтами при --all (default: {DEFAULT_COOLDOWN})")
-def fragment(account: Optional[str], fragment_all: bool, headless: bool, cooldown: int):
+def fragment(account: Optional[str], fragment_all: bool, headed: bool, cooldown: int):
     """Авторизация на fragment.com через Telegram Login Widget"""
     from .telegram_auth import AccountConfig
     from .fragment_auth import FragmentAuth
@@ -690,17 +690,21 @@ def fragment(account: Optional[str], fragment_all: bool, headless: bool, cooldow
 
     setup_logging(level=logging.INFO)
 
+    # Headless by default — headed Camoufox hangs on some systems,
+    # and Fragment auth works fully in headless (popup is intercepted by Playwright).
+    headless = not headed
+
     if not account and not fragment_all:
         click.echo("Укажите --account или --all")
         return
 
-    async def _run_single(account_dir: Path) -> bool:
-        """Запускает fragment auth для одного аккаунта."""
+    async def _run_single(account_dir: Path) -> Optional["FragmentResult"]:
+        """Запускает fragment auth для одного аккаунта. Returns result or None on config error."""
         try:
             config = AccountConfig.load(account_dir)
         except Exception as e:
-            click.echo(f"  FAIL {account_dir.name}: {e}")
-            return False
+            click.echo(click.style(f"  SKIP {account_dir.name}: {e}", fg="yellow"))
+            return None
 
         browser_manager = BrowserManager()
         auth = FragmentAuth(config, browser_manager)
@@ -709,10 +713,9 @@ def fragment(account: Optional[str], fragment_all: bool, headless: bool, cooldow
         if result.success:
             status = "already authorized" if result.already_authorized else "connected"
             click.echo(click.style(f"  OK {config.name}: {status}", fg="green"))
-            return True
         else:
             click.echo(click.style(f"  FAIL {config.name}: {result.error}", fg="red"))
-            return False
+        return result
 
     async def _run():
         if account:
@@ -727,26 +730,223 @@ def fragment(account: Optional[str], fragment_all: bool, headless: bool, cooldow
                 click.echo(f"Нет аккаунтов в {ACCOUNTS_DIR}/")
                 return
 
-            click.echo(f"Fragment auth для {len(account_dirs)} аккаунтов")
-            ok = 0
-            fail = 0
+            click.echo(f"Fragment auth для {len(account_dirs)} аккаунтов (headless={headless})")
+            results = []
 
             for i, account_dir in enumerate(account_dirs):
                 click.echo(f"\n[{i+1}/{len(account_dirs)}] {account_dir.name}")
-                success = await _run_single(account_dir)
-                if success:
-                    ok += 1
-                else:
-                    fail += 1
+                result = await _run_single(account_dir)
+                results.append((account_dir.name, result))
 
-                # Cooldown between accounts
+                # Cooldown between accounts (skip after last)
                 if i < len(account_dirs) - 1:
                     actual_cooldown = cooldown + random.randint(-10, 10)
                     actual_cooldown = max(10, actual_cooldown)
                     await asyncio.sleep(actual_cooldown)
 
+            # Categorized summary
+            ok_new = []
+            ok_existing = []
+            fail_session = []
+            fail_ip = []
+            fail_timeout = []
+            fail_other = []
+            skipped = []
+
+            for name, r in results:
+                if r is None:
+                    skipped.append(name)
+                elif r.success and r.already_authorized:
+                    ok_existing.append(name)
+                elif r.success:
+                    ok_new.append(name)
+                elif r.error and "not authorized" in r.error.lower():
+                    fail_session.append(name)
+                elif r.error and "AuthKeyDuplicated" in (r.error or ""):
+                    fail_ip.append(name)
+                elif r.error and ("timeout" in r.error.lower() or "Timeout" in (r.error or "")):
+                    fail_timeout.append(name)
+                else:
+                    fail_other.append((name, r.error))
+
+            total_ok = len(ok_new) + len(ok_existing)
+            total_fail = len(fail_session) + len(fail_ip) + len(fail_timeout) + len(fail_other)
+
             click.echo(f"\n{'=' * 50}")
-            click.echo(f"ИТОГ: Успешно: {ok}, Ошибки: {fail}")
+            click.echo("ИТОГ FRAGMENT AUTH")
+            click.echo(f"{'=' * 50}")
+            click.echo(click.style(f"  OK: {total_ok}/{len(results)}", fg="green"))
+            if ok_new:
+                click.echo(f"    Новых: {len(ok_new)}")
+            if ok_existing:
+                click.echo(f"    Уже авторизованы: {len(ok_existing)}")
+            if total_fail > 0:
+                click.echo(click.style(f"  FAIL: {total_fail}", fg="red"))
+                if fail_session:
+                    click.echo(f"    Мёртвые сессии ({len(fail_session)}): {', '.join(fail_session)}")
+                if fail_ip:
+                    click.echo(f"    Конфликт IP ({len(fail_ip)}): {', '.join(fail_ip)}")
+                if fail_timeout:
+                    click.echo(f"    Таймауты ({len(fail_timeout)}): {', '.join(fail_timeout)}")
+                if fail_other:
+                    for name, err in fail_other:
+                        click.echo(f"    {name}: {err}")
+            if skipped:
+                click.echo(click.style(f"  SKIP: {len(skipped)}", fg="yellow"))
+
+    asyncio.run(_run())
+
+
+@cli.command("check-proxies")
+@click.option("--concurrency", "-j", default=50, type=int, help="Concurrent checks")
+@click.option("--timeout", "-t", default=5.0, type=float, help="Timeout per check (seconds)")
+@click.option("--db-path", default="data/tgwebauth.db", help="Database path")
+def check_proxies(concurrency: int, timeout: float, db_path: str):
+    """Batch check all proxies for connectivity."""
+    from .database import Database
+    from .proxy_health import check_proxy_batch
+
+    async def _run() -> None:
+        db = Database(Path(db_path))
+        await db.initialize()
+        await db.connect()
+        try:
+            proxies = await db.list_proxies()
+            count = len(proxies)
+            if count == 0:
+                click.echo("No proxies in database.")
+                return
+
+            click.echo(f"Checking {count} proxies with concurrency={concurrency}...")
+
+            def on_progress(completed: int, total: int, result) -> None:
+                if completed % 50 == 0 or completed == total:
+                    click.echo(f"  [{completed}/{total}] checked...")
+
+            summary = await check_proxy_batch(
+                db, concurrency=concurrency, timeout=timeout,
+                progress_callback=on_progress,
+            )
+            click.echo(
+                f"Results: {summary['alive']} alive, {summary['dead']} dead, "
+                f"{summary['changed']} changed"
+            )
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@cli.command("proxy-refresh")
+@click.option("--file", "-f", "proxy_file", required=True, type=click.Path(exists=True),
+              help="Файл со свежими прокси (по одному на строку)")
+@click.option("--auto", is_flag=True, help="Без подтверждения (для автоматизации)")
+@click.option("--check-only", is_flag=True, help="Только проверить, не заменять")
+@click.option("--db-path", default="data/tgwebauth.db", help="Путь к базе данных")
+def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str):
+    """Проверить прокси аккаунтов и заменить мёртвые из файла."""
+    from .database import Database
+    from .proxy_manager import ProxyManager, proxy_record_to_string
+
+    async def _run() -> None:
+        db = Database(Path(db_path))
+        await db.initialize()
+        await db.connect()
+        try:
+            manager = ProxyManager(db, accounts_dir=ACCOUNTS_DIR)
+
+            # Step 1: Sync accounts to DB
+            click.echo("1. Синхронизация аккаунтов с БД...")
+            sync = await manager.sync_accounts_to_db()
+            click.echo(f"   Найдено: {sync['synced']}, новых: {sync['created']}, "
+                       f"привязано прокси: {sync['proxy_linked']}")
+
+            # Step 2: Import fresh proxies
+            click.echo(f"\n2. Импорт свежих прокси из {proxy_file}...")
+            imp = await manager.import_from_file(Path(proxy_file))
+            click.echo(f"   Импортировано: {imp['imported']}, дубликатов: {imp['duplicates']}, "
+                       f"ошибок: {imp['errors']}")
+
+            # Step 3: Health check assigned proxies
+            click.echo("\n3. Проверка прокси аккаунтов...")
+            check = await manager.check_assigned_proxies()
+            alive_count = len(check["alive"])
+            dead_count = len(check["dead"])
+            no_proxy_count = len(check["no_proxy"])
+            total_checked = alive_count + dead_count
+
+            click.echo(f"   Проверено: {total_checked}")
+            click.echo(click.style(f"   Живых: {alive_count}", fg="green"))
+            if dead_count > 0:
+                click.echo(click.style(f"   Мёртвых: {dead_count}", fg="red"))
+            else:
+                click.echo(f"   Мёртвых: 0")
+
+            # Count free proxies in pool
+            free_proxies = await db.list_proxies(status="active", unassigned_only=True)
+            click.echo(f"   Свежих в пуле: {len(free_proxies)}")
+
+            if no_proxy_count > 0:
+                click.echo(click.style(f"   Аккаунты без прокси: {no_proxy_count} (пропускаются)",
+                                       fg="yellow"))
+
+            if dead_count == 0:
+                click.echo(click.style("\nВсе прокси живы!", fg="green"))
+                return
+
+            # Step 4: Generate replacement plan
+            click.echo(f"\n4. План замены:")
+            plan = await manager.generate_replacement_plan(check["dead"])
+
+            if not plan:
+                click.echo(click.style("   Нет свободных прокси для замены!", fg="red"))
+                return
+
+            # Unreserve helper — only unreserves proxies still in "reserved" status
+            async def _unreserve_plan() -> None:
+                for entry in plan:
+                    proxy = await db.get_proxy(entry["new_proxy"].id)
+                    if proxy and proxy.status == "reserved":
+                        await db.update_proxy(proxy.id, status="active")
+
+            try:
+                for entry in plan:
+                    old_p = entry["old_proxy"]
+                    new_p = entry["new_proxy"]
+                    click.echo(f"   {entry['account_name']}: "
+                               f"{old_p.host}:{old_p.port} -> {new_p.host}:{new_p.port}")
+
+                not_replaced = dead_count - len(plan)
+                if not_replaced > 0:
+                    click.echo(click.style(
+                        f"\n   Не хватает прокси для {not_replaced} аккаунтов", fg="yellow"))
+
+                if check_only:
+                    click.echo("\n--check-only: замена не выполнена")
+                    await _unreserve_plan()
+                    return
+
+                # Step 5: Confirm
+                if not auto:
+                    if not click.confirm(f"\nЗаменить {len(plan)} прокси?"):
+                        click.echo("Отменено")
+                        await _unreserve_plan()
+                        return
+
+                # Step 6: Execute
+                click.echo(f"\n5. Замена...")
+                result = await manager.execute_replacements(plan)
+                click.echo(click.style(
+                    f"\n   Заменено: {result['replaced']}, ошибок: {result['errors']}",
+                    fg="green" if result["errors"] == 0 else "yellow",
+                ))
+            except (KeyboardInterrupt, Exception):
+                click.echo("\nОтмена, возвращаю зарезервированные прокси в пул...")
+                await _unreserve_plan()
+                raise
+
+        finally:
+            await db.close()
 
     asyncio.run(_run())
 

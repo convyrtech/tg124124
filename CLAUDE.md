@@ -6,29 +6,42 @@ It contains: project context, all available tools, work methodology, safety rule
 
 **Key documents:**
 - `.claude/MASTER_PROMPT.md` - Master operating guide (READ FIRST)
-- `docs/ACTION_PLAN_2026-02-06.md` - Current implementation plan
-- `docs/research_project_audit_2026-02-06.md` - Full project audit
+- `docs/ACTION_PLAN_2026-02-08.md` - Current implementation plan
 - `PROMPTS.md` - Prompt generator and plugin guide
 
 ## Project Goal
-Автоматическая миграция Telegram session файлов (Telethon/Pyrogram) в браузерные профили для:
-- **web.telegram.org** - основной веб-клиент
-- **fragment.com** - NFT usernames, Telegram Stars (планируется)
+Автоматическая миграция Telegram session файлов (Telethon) в браузерные профили для:
+- **web.telegram.org** - основной веб-клиент (QR Login)
+- **fragment.com** - NFT usernames, Telegram Stars (OAuth popup)
 
 Масштаб: **1000 аккаунтов**, переносимость между ПК.
 
-## Current Status
+## Current Status (2026-02-08)
 
 ### Что работает
 - Programmatic QR Login (без ручного сканирования)
 - Multi-decoder QR (jsQR, OpenCV, pyzbar)
 - Camoufox antidetect browser с persistent profiles
 - SOCKS5 proxy с auth через pproxy relay
-- Batch миграция с cooldown 45 сек
-- 81 тест проходит
+- Batch миграция (sequential + parallel через ParallelMigrationController)
+- Fragment.com OAuth popup flow (переписан, требует тестирования на реальных аккаунтах)
+- SQLite metadata (accounts, proxies, migrations, batches, operation_log)
+- Worker pool (asyncio queue, retry, circuit breaker) - реализован, интегрирован в GUI
+- Profile lifecycle (hot/cold tiering, LRU eviction, zip compression)
+- Proxy management (import, health check, auto-replace dead)
+- Auth TTL 365 days (SetAuthorizationTTLRequest после миграции)
+- Resource monitor (CPU/RAM, adaptive concurrency)
+- GUI (DearPyGui, 80% complete)
+- CLI: 9 команд (migrate, open, list, check, health, fragment, check-proxies, proxy-refresh, init)
+- 255 тестов проходят
 
-### Что НЕ работает
-- **Direct Session Injection** - Telegram Web валидирует сессии на сервере, просто записать auth_key в localStorage/IndexedDB недостаточно
+### Что НЕ работает / НЕ доделано
+- **Resource leaks** - зомби-процессы pproxy/Camoufox при таймаутах/крашах
+- **Fragment auth** - переписан, но CSS-селекторы не проверены на реальном сайте, 11 багов из аудита
+- **Worker pool не в CLI** - CLI использует ParallelMigrationController, а не worker_pool.py
+- **FIX-001..007** - QR decode grey zone, SQLite lock в parallel, зависания без таймаутов
+- **GUI polish** - запускается, но не все кнопки протестированы
+- **migration_state.py** - deprecated, но CLI всё ещё импортирует для --resume/--retry-failed
 
 ## Architecture
 
@@ -58,78 +71,76 @@ It contains: project context, all available tools, work methodology, safety rule
        │                   │  7. Session authorized
        │                   │<─────────────────────│
        │                   │                      │
-       │  8. Save browser profile                 │
+       │  8. SetAuthorizationTTL(365 days)        │
+       │─────────────────────────────────────────>│
+       │                   │                      │
+       │  9. Save browser profile                 │
        │<──────────────────│                      │
+```
+
+### Fragment.com OAuth Flow
+```
+Camoufox → fragment.com → Click "Log in"
+  → popup: oauth.telegram.org
+    → Already logged in? → Click "ACCEPT" → done
+    → Not logged in? → Enter phone → Telethon listens for code from 777000
+      → Enter code → Authorized → popup closes
+  → fragment.com gets stel_ssid cookie → done
 ```
 
 ### Proxy Relay (для SOCKS5 auth)
 ```
 Browser ──HTTP──> pproxy (localhost:random) ──SOCKS5+auth──> Remote Proxy
 ```
-Браузеры не поддерживают SOCKS5 с auth напрямую, поэтому pproxy создаёт локальный HTTP relay.
 
-## Technical Context
-
-### Session File Format (Telethon v7)
-```
-SQLite database:
-- sessions: dc_id, server_address, port, auth_key (256 bytes BLOB)
-- entities: id, hash, username, phone, name
-- version: 7
-```
-
-### API Config Format (api.json)
-```json
-{
-  "api_id": 2040,
-  "api_hash": "...",
-  "device_model": "Desktop",
-  "system_version": "Windows 10"
-}
-```
-
-### Account Config Format (___config.json)
-```json
-{
-  "Name": "Account Name",
-  "Proxy": "socks5:host:port:user:pass"
-}
-```
-
-## File Structure
+## File Structure (9366 строк src/, 255 тестов)
 ```
 tg-web-auth/
-├── accounts/               # Исходные session файлы (в .gitignore)
+├── accounts/                # Исходные session файлы (.gitignore)
 │   └── account_name/
 │       ├── session.session
 │       ├── api.json
 │       └── ___config.json
-├── profiles/               # Browser profiles (в .gitignore)
-│   └── account_name/
-│       ├── config.json
-│       └── browser_data/
-├── src/
-│   ├── telegram_auth.py    # Основная логика QR auth (1266 строк)
-│   ├── browser_manager.py  # Camoufox управление
-│   ├── proxy_relay.py      # SOCKS5 → HTTP relay
-│   ├── pproxy_wrapper.py   # pproxy process wrapper
-│   ├── cli.py              # CLI интерфейс
-│   ├── utils.py            # Утилиты
-│   └── security_check.py   # Проверка безопасности
-├── tests/                  # 81 тест
+├── profiles/                # Browser profiles (.gitignore)
+├── data/                    # SQLite database (.gitignore)
+│   └── tgwebauth.db
+├── src/                     # 9366 строк
+│   ├── telegram_auth.py     # QR auth + AcceptLoginToken (2036 строк)
+│   ├── fragment_auth.py     # Fragment.com OAuth popup (655 строк)
+│   ├── browser_manager.py   # Camoufox + ProfileLifecycleManager (718 строк)
+│   ├── worker_pool.py       # Asyncio queue pool (572 строк, GUI only)
+│   ├── cli.py               # CLI 9 команд (978 строк)
+│   ├── database.py          # SQLite: accounts, proxies, migrations (905 строк)
+│   ├── proxy_manager.py     # Import, health check, auto-replace (442 строк)
+│   ├── proxy_relay.py       # SOCKS5→HTTP relay via pproxy (280 строк)
+│   ├── proxy_health.py      # Batch TCP check (103 строк)
+│   ├── resource_monitor.py  # CPU/RAM monitoring (159 строк)
+│   ├── security_check.py    # Fingerprint/WebRTC check (372 строк)
+│   ├── migration_state.py   # DEPRECATED JSON state (321 строк)
+│   ├── utils.py             # Proxy parsing helpers (103 строк)
+│   ├── logger.py            # Logging setup (83 строк)
+│   ├── pproxy_wrapper.py    # pproxy process (23 строк)
+│   └── gui/
+│       ├── app.py           # DearPyGui main window (1224 строк)
+│       ├── controllers.py   # GUI business logic (278 строк)
+│       └── theme.py         # Hacker dark green theme (99 строк)
+├── tests/                   # 255 тестов
 │   ├── test_telegram_auth.py
+│   ├── test_fragment_auth.py
 │   ├── test_browser_manager.py
+│   ├── test_proxy_manager.py
+│   ├── test_proxy_health.py
 │   ├── test_proxy_relay.py
-│   ├── test_utils.py
+│   ├── test_worker_pool.py
+│   ├── test_resource_monitor.py
+│   ├── test_database.py
+│   ├── test_migration_state.py
 │   ├── test_integration.py
+│   ├── test_utils.py
 │   └── conftest.py
-├── scripts/                # Эксперименты (не в git)
-│   ├── extract_tg_storage.py
-│   ├── session_converter.py
-│   └── inject_session.py
-├── docs/
-│   └── SESSION_NOTES_*.md  # Заметки сессий разработки
-├── decode_qr.js            # Node.js jsQR decoder
+├── scripts/                 # Эксперименты (не в git, dead code)
+├── docs/                    # Документация
+├── decode_qr.js             # Node.js jsQR decoder
 ├── package.json
 ├── requirements.txt
 ├── CLAUDE.md
@@ -137,109 +148,108 @@ tg-web-auth/
 ```
 
 ## Technical Stack
-- **Python 3.11+**
+- **Python 3.11+** (async/await, asyncio)
 - **Telethon** - MTProto client для AcceptLoginToken
 - **Camoufox** - Antidetect browser (Firefox-based)
-- **Playwright** - Browser automation fallback
+- **Playwright** - Browser automation
 - **pproxy** - SOCKS5 auth relay
-- **OpenCV/pyzbar/jsQR** - QR decoding
+- **OpenCV/pyzbar/jsQR** - QR decoding (3 fallback decoders)
 - **Click** - CLI
+- **aiosqlite** - Async SQLite
+- **DearPyGui** - GUI
+- **psutil** - Resource monitoring
 
 ## Commands
 
 ### Установка
 ```bash
 pip install -r requirements.txt
-playwright install chromium  # fallback browser
 npm install                  # для jsQR decoder
 ```
 
 ### Миграция
 ```bash
-# Один аккаунт
-python -m src.cli migrate --account "Name"
-
-# Все аккаунты
-python -m src.cli migrate --all
-
-# С паролем 2FA
-python -m src.cli migrate --account "Name" --password "2fa_pass"
+python -m src.cli migrate --account "Name"             # Один аккаунт
+python -m src.cli migrate --all                        # Все аккаунты
+python -m src.cli migrate --all --parallel 5           # Параллельно
+python -m src.cli migrate --all --auto-scale           # Авто-параллельность
+python -m src.cli migrate --resume                     # Продолжить прерванную
+python -m src.cli migrate --retry-failed               # Повторить упавшие
+python -m src.cli migrate --status                     # Статус batch
+python -m src.cli migrate --account "Name" -p "2fa"    # С 2FA паролем
 ```
 
-### Управление профилями
+### Fragment
 ```bash
-python -m src.cli open --account "Name"  # Открыть профиль
-python -m src.cli list                   # Список профилей
+python -m src.cli fragment --account "Name"            # Один аккаунт
+python -m src.cli fragment --all                       # Все аккаунты
+python -m src.cli fragment --all --headed              # С GUI браузером
+```
+
+### Прокси
+```bash
+python -m src.cli check-proxies                        # Проверить все прокси в БД
+python -m src.cli proxy-refresh -f proxies.txt         # Заменить мёртвые прокси
+python -m src.cli proxy-refresh -f proxies.txt --auto  # Без подтверждения
+python -m src.cli proxy-refresh -f proxies.txt --check-only  # Только проверить
+```
+
+### Другое
+```bash
+python -m src.cli open --account "Name"                # Открыть профиль в браузере
+python -m src.cli list                                 # Список аккаунтов/профилей
+python -m src.cli health --account "Name"              # Проверка здоровья аккаунта
+python -m src.cli check -p "socks5:h:p:u:p"           # Fingerprint/WebRTC check
+python -m src.cli init                                 # Инициализация директорий
+```
+
+### GUI
+```bash
+python -m src.gui.app                                  # Запуск GUI
 ```
 
 ### Тесты
 ```bash
-pytest              # Все тесты
-pytest -v           # Verbose
-pytest tests/test_integration.py  # Только интеграционные
+pytest                    # Все 255 тестов
+pytest -v                 # Verbose
+pytest tests/test_proxy_manager.py -v  # Конкретный файл
 ```
 
-## Scaling для 1000 аккаунтов
+## Database Schema (SQLite WAL)
 
-### Ресурсы
+```sql
+accounts    (id, name, phone, username, session_path, proxy_id, status,
+             last_check, error_message, created_at,
+             fragment_status, web_last_verified, auth_ttl_days)
+
+proxies     (id, host, port, username, password, protocol, status,
+             assigned_account_id, last_check, created_at)
+             UNIQUE(host, port)
+
+migrations  (id, account_id, started_at, completed_at, success,
+             error_message, profile_path, batch_id)
+
+batches     (id, batch_id, total_count, started_at, finished_at)
+
+operation_log (id, account_id, operation, success, error_message,
+               details, created_at)
 ```
-┌─────────────────────────┬───────────┬───────────┬────────────┐
-│         Метрика         │ 100 акков │ 500 акков │ 1000 акков │
-├─────────────────────────┼───────────┼───────────┼────────────┤
-│ RAM (batch 10 parallel) │ ~2 GB     │ ~2 GB     │ ~2 GB      │
-├─────────────────────────┼───────────┼───────────┼────────────┤
-│ Disk (profiles)         │ ~10 GB    │ ~50 GB    │ ~100 GB    │
-├─────────────────────────┼───────────┼───────────┼────────────┤
-│ Time (sequential, 45s)  │ ~1.5 ч    │ ~6 ч      │ ~12 ч      │
-├─────────────────────────┼───────────┼───────────┼────────────┤
-│ Time (10 parallel)      │ ~10 мин   │ ~40 мин   │ ~1.5 ч     │
-└─────────────────────────┴───────────┴───────────┴────────────┘
-```
-
-### Переносимость между ПК
-- **Session файлы** (~50MB для 1000) - синхронизируем между ПК
-- **Browser profiles** (~100GB) - создаём локально по требованию
-- Миграция на новом ПК: `python -m src.cli migrate --all`
-
-## Roadmap
-
-### Phase 1: Core (DONE)
-- [x] Programmatic QR Login
-- [x] Multi-decoder QR
-- [x] Camoufox antidetect
-- [x] SOCKS5 proxy relay
-- [x] Batch миграция
-- [x] 81 тест
-
-### Phase 2: Parallel Migration (TODO)
-- [ ] 10-50 параллельных браузеров
-- [ ] Semaphore для контроля concurrency
-- [ ] Progress reporting
-- [ ] Error recovery & retry
-
-### Phase 3: Fragment.com (TODO)
-- [ ] Исследовать auth flow Fragment
-- [ ] Интеграция с существующими профилями
-- [ ] TON wallet НЕ нужен (только Telegram auth)
-
-### Phase 4: Health & Monitoring (TODO)
-- [ ] Session health check
-- [ ] Auto-refresh истекающих сессий
-- [ ] Dashboard со статусами
 
 ## Security Constraints
 
 ### ОБЯЗАТЕЛЬНО
-- НЕ логировать auth_key, api_hash, passwords, tokens
+- НЕ логировать auth_key, api_hash, passwords, tokens, phone numbers
 - Изолированные browser profiles для каждого аккаунта
-- Прокси обязателен для каждого аккаунта
+- 1 выделенный прокси на аккаунт (НИКОГДА не шарить)
 - Graceful shutdown - корректно закрывать все ресурсы
+- Cooldown 60-120s между аккаунтами (anti-ban)
 
 ### ЗАПРЕЩЕНО
 - Hardcoded credentials
 - `print()` вместо `logging`
 - Bare `except:` (только `except Exception as e:`)
 - Игнорирование возвращаемых ошибок
+- Использование одной session из двух клиентов одновременно
 
 ## GUI Testing Rules (ОБЯЗАТЕЛЬНО)
 
@@ -257,7 +267,7 @@ pytest tests/test_integration.py  # Только интеграционные
 ## Quality Gates
 
 ### Перед завершением любой задачи
-1. [ ] `pytest` проходит без ошибок
+1. [ ] `pytest` проходит без ошибок (255 тестов)
 2. [ ] Self-review на типичные ошибки
 3. [ ] Нет секретов в логах
 4. [ ] Все ресурсы закрываются (async with, try/finally)
@@ -274,9 +284,21 @@ pytest tests/test_integration.py  # Только интеграционные
 ## Known Issues
 
 ### Direct Session Injection (НЕ РАБОТАЕТ)
-Попытки напрямую инжектить auth_key в браузер не работают:
-- Telegram Web K валидирует сессии на сервере
-- authState в IndexedDB сбрасывается приложением
-- **Единственный рабочий путь - Programmatic QR Login**
+Telegram Web K валидирует сессии на сервере. Единственный рабочий путь - **Programmatic QR Login**.
 
-Экспериментальный код в `scripts/` - только для исследования.
+### Resource Leaks (КРИТИЧНО для 1000 аккаунтов)
+- proxy_relay не закрывается при TimeoutError browser launch
+- pproxy process leak при race condition
+- Нет shutdown handler для дочерних процессов
+
+### Fragment Auth (требует тестирования)
+- CSS-селекторы не проверены на реальном fragment.com
+- asyncio.Event race condition в GUI context
+- Regex ловит любые 5-6 цифр как код подтверждения
+
+### Unfixed Bugs (FIX-001..007)
+- QR decode grey zone (len check)
+- SQLite "database is locked" в parallel mode
+- Telethon connect() зависает 180s без timeout
+- Browser launch зависает без timeout
+- 2FA selector hardcoded

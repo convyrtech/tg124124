@@ -194,6 +194,14 @@ class FragmentAuth:
             if has_logout:
                 return "authorized"
 
+            # Fallback: check stel_ssid cookie (works even when JS doesn't init)
+            try:
+                cookies = await page.context.cookies(["https://fragment.com"])
+                if any(c["name"] == "stel_ssid" for c in cookies):
+                    return "authorized"
+            except Exception:
+                pass
+
             return "loading"
         except Exception as e:
             logger.debug("Error checking fragment state: %s", e)
@@ -218,6 +226,105 @@ class FragmentAuth:
         await popup.wait_for_load_state('domcontentloaded')
         logger.info("OAuth popup opened: %s", popup.url)
         return popup
+
+    async def _check_popup_already_logged_in(self, popup: Any) -> bool:
+        """
+        Checks if oauth.telegram.org popup shows 'already logged in' form.
+
+        When the user has an existing stel_ssid cookie on oauth.telegram.org,
+        the popup shows ACCEPT/DECLINE buttons instead of the phone input form.
+
+        Args:
+            popup: Playwright page (oauth.telegram.org popup)
+
+        Returns:
+            True if already-logged-in form is shown (no phone input needed)
+        """
+        has_phone = await popup.evaluate(
+            "() => !!document.getElementById('login-phone')"
+        )
+        if has_phone:
+            return False
+
+        # Check for ACCEPT button (already logged in flow)
+        body_text = await popup.evaluate(
+            "() => document.body.innerText"
+        )
+        if 'ACCEPT' in body_text and 'DECLINE' in body_text:
+            logger.info("Popup shows already-logged-in form (ACCEPT/DECLINE)")
+            return True
+
+        return False
+
+    async def _accept_existing_session(self, popup: Any) -> bool:
+        """
+        Clicks ACCEPT on the already-logged-in oauth popup.
+
+        When the user has a valid stel_ssid cookie, oauth.telegram.org
+        shows a permission confirmation instead of the phone input form.
+        Clicking ACCEPT grants Fragment access without Telethon confirmation.
+
+        Args:
+            popup: Playwright page (oauth.telegram.org popup)
+
+        Returns:
+            True if ACCEPT was clicked successfully
+        """
+        try:
+            # Wait for popup content to load
+            await popup.wait_for_load_state("domcontentloaded", timeout=5000)
+            await asyncio.sleep(1)
+
+            # Primary: find ACCEPT via JS and click it directly.
+            # oauth.telegram.org uses <a> elements with various classes —
+            # Playwright's get_by_text can miss them due to text casing/structure.
+            clicked = await popup.evaluate("""() => {
+                // Strategy 1: find all clickable elements containing target text
+                const targets = ['ACCEPT', 'Accept', 'Log In', 'Confirm'];
+                const elements = document.querySelectorAll('a, button, div[role="button"], span[role="button"]');
+                for (const el of elements) {
+                    const text = (el.textContent || '').trim();
+                    for (const target of targets) {
+                        if (text === target) {
+                            el.click();
+                            return 'clicked:' + target;
+                        }
+                    }
+                }
+                // Strategy 2: look for submit button in any form
+                const submit = document.querySelector('button[type="submit"], input[type="submit"]');
+                if (submit) {
+                    submit.click();
+                    return 'clicked:submit';
+                }
+                return null;
+            }""")
+
+            if clicked:
+                logger.info("Clicked accept via JS evaluate: %s", clicked)
+                return True
+
+            # Fallback: Playwright locator-based search
+            for text in ("ACCEPT", "Accept", "Log In", "LOG IN", "Confirm"):
+                try:
+                    btn = popup.get_by_text(text, exact=True)
+                    if await btn.count() > 0:
+                        await btn.first.click(timeout=5000)
+                        logger.info("Clicked '%s' via get_by_text", text)
+                        return True
+                except Exception:
+                    continue
+
+            # Debug: log popup HTML for investigation
+            try:
+                html = await popup.evaluate("document.body.innerHTML")
+                logger.warning("Could not find ACCEPT button. HTML: %s", html[:500])
+            except Exception:
+                pass
+            return False
+        except Exception as e:
+            logger.error("Failed to click ACCEPT: %s", e)
+            return False
 
     async def _submit_phone_on_popup(self, popup: Any, phone: str) -> bool:
         """
@@ -353,6 +460,18 @@ class FragmentAuth:
             if i % 5 == 0 and i > 0:
                 logger.debug("Waiting for fragment auth... (%ds)", i)
 
+        # Fallback: check if stel_ssid cookie exists on fragment.com
+        # JS state (Aj.state.unAuth) may not initialize properly in headless mode,
+        # but cookies are a reliable indicator of server-side auth success.
+        try:
+            cookies = await page.context.cookies(["https://fragment.com"])
+            has_ssid = any(c["name"] == "stel_ssid" for c in cookies)
+            if has_ssid:
+                logger.info("Fragment auth detected via stel_ssid cookie (JS state unavailable)")
+                return True
+        except Exception as e:
+            logger.debug("Cookie check failed: %s", e)
+
         logger.warning("Fragment auth timeout after %ds", timeout)
         return False
 
@@ -456,25 +575,43 @@ class FragmentAuth:
 
             await self._human_delay(0.5, 1.0)
 
-            # 6. Submit phone on popup
-            logger.info("[5/6] Submitting phone on OAuth popup...")
-            if not await self._submit_phone_on_popup(popup, phone):
-                return FragmentResult(
-                    success=False,
-                    account_name=self.account.name,
-                    error="Phone submission failed on OAuth popup"
-                )
+            # Check if popup shows already-logged-in form (ACCEPT/DECLINE)
+            if await self._check_popup_already_logged_in(popup):
+                logger.info("[5/6] Already logged in on oauth — clicking ACCEPT...")
+                if not await self._accept_existing_session(popup):
+                    return FragmentResult(
+                        success=False,
+                        account_name=self.account.name,
+                        error="Failed to click ACCEPT on existing session popup"
+                    )
+                logger.info("[6/6] Skipping Telethon confirmation (existing session)")
+            else:
+                # 6. Submit phone on popup
+                logger.info("[5/6] Submitting phone on OAuth popup...")
+                if not await self._submit_phone_on_popup(popup, phone):
+                    return FragmentResult(
+                        success=False,
+                        account_name=self.account.name,
+                        error="Phone submission failed on OAuth popup"
+                    )
 
-            # 7. Confirm via Telethon (Telethon listens, popup polls /auth/login)
-            logger.info("[6/6] Waiting for Telethon confirmation...")
-            if not await self._confirm_via_telethon(client, timeout=CONFIRM_TIMEOUT):
-                return FragmentResult(
-                    success=False,
-                    account_name=self.account.name,
-                    error="Confirmation timeout — no message from Telegram"
-                )
+                # 7. Confirm via Telethon (Telethon listens, popup polls /auth/login)
+                logger.info("[6/6] Waiting for Telethon confirmation...")
+                if not await self._confirm_via_telethon(client, timeout=CONFIRM_TIMEOUT):
+                    return FragmentResult(
+                        success=False,
+                        account_name=self.account.name,
+                        error="Confirmation timeout — no message from Telegram"
+                    )
 
             # 8. Wait for fragment.com to show authorized
+            # After OAuth confirmation, popup may close and redirect.
+            # Give it a moment then reload to pick up the new auth state.
+            await self._human_delay(2.0, 3.0)
+            try:
+                await page.reload(timeout=15000)
+            except Exception:
+                pass  # Page might have already navigated
             if not await self._wait_for_fragment_auth(page, timeout=AUTH_COMPLETE_TIMEOUT):
                 return FragmentResult(
                     success=False,

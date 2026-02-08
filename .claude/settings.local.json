@@ -59,7 +59,12 @@
       "Bash(python:*)",
       "Bash(\"C:\\\\Users\\\\paxalb\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\python.exe\" -m pip install opencv-python)",
       "Bash(git init:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial commit: TG Web Auth Migration Tool\n\nFeatures:\n- Telegram session to web.telegram.org browser profile migration\n- QR code auto-login via Telethon + Playwright/Camoufox\n- SOCKS5 proxy support with auth \\(via pproxy relay\\)\n- 2FA password auto-entry\n- Persistent browser profiles\n- Security check module \\(WebRTC leak, fingerprint\\)\n\n81 tests passing\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(gh auth:*)",
+      "Bash(git remote add:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)"
     ]
   }
 }
