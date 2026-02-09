@@ -448,3 +448,153 @@ class TestProgressCallback:
         # Completed counts should be 1, 2, 3 (in some order)
         completed_values = sorted(c for c, t in progress_calls)
         assert completed_values == [1, 2, 3]
+
+
+class TestFragmentMode:
+    """Tests for mode='fragment' dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_fragment_mode_calls_fragment_account(self, tmp_path):
+        """mode='fragment' dispatches to fragment_account instead of migrate_account."""
+        accounts = {}
+        for i in range(1, 3):
+            d = tmp_path / f"account_{i}"
+            d.mkdir()
+            (d / "session.session").touch()
+            accounts[i] = _make_account(i, name=f"Acc{i}", session_dir=d)
+
+        db = _mock_db(accounts)
+
+        with (
+            patch("src.worker_pool.fragment_account", new_callable=AsyncMock) as mock_frag,
+            patch("src.worker_pool.migrate_account", new_callable=AsyncMock) as mock_migrate,
+        ):
+            mock_frag.return_value = _make_auth_result(success=True)
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                resource_monitor=_always_can_launch(),
+                mode="fragment",
+            )
+            result = await pool.run([1, 2])
+
+        assert result.success_count == 2
+        assert mock_frag.call_count == 2
+        assert mock_migrate.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_fragment_mode_skips_migration_tracking(self, tmp_path):
+        """mode='fragment' must NOT call start_migration/complete_migration."""
+        d = tmp_path / "account_1"
+        d.mkdir()
+        (d / "session.session").touch()
+        accounts = {1: _make_account(1, name="Acc1", session_dir=d)}
+        db = _mock_db(accounts)
+
+        with patch("src.worker_pool.fragment_account", new_callable=AsyncMock) as mock_frag:
+            mock_frag.return_value = _make_auth_result(success=True)
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                resource_monitor=_always_can_launch(),
+                mode="fragment",
+            )
+            await pool.run([1])
+
+        # Fragment mode must NOT touch migrations table or account status
+        db.start_migration.assert_not_called()
+        db.complete_migration.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fragment_mode_updates_fragment_status(self, tmp_path):
+        """mode='fragment' updates fragment_status on success."""
+        d = tmp_path / "account_1"
+        d.mkdir()
+        (d / "session.session").touch()
+        accounts = {1: _make_account(1, name="Acc1", session_dir=d)}
+        db = _mock_db(accounts)
+
+        with patch("src.worker_pool.fragment_account", new_callable=AsyncMock) as mock_frag:
+            mock_frag.return_value = _make_auth_result(success=True)
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                resource_monitor=_always_can_launch(),
+                mode="fragment",
+            )
+            await pool.run([1])
+
+        # Check that fragment_status was updated
+        db.update_account.assert_any_call(1, fragment_status="authorized")
+
+    @pytest.mark.asyncio
+    async def test_web_mode_does_not_call_fragment(self, tmp_path):
+        """Default mode='web' uses migrate_account, not fragment_account."""
+        d = tmp_path / "account_1"
+        d.mkdir()
+        (d / "session.session").touch()
+        accounts = {1: _make_account(1, name="Acc1", session_dir=d)}
+        db = _mock_db(accounts)
+
+        with (
+            patch("src.worker_pool.fragment_account", new_callable=AsyncMock) as mock_frag,
+            patch("src.worker_pool.migrate_account", new_callable=AsyncMock) as mock_migrate,
+        ):
+            mock_migrate.return_value = _make_auth_result(success=True)
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                resource_monitor=_always_can_launch(),
+            )
+            await pool.run([1])
+
+        assert mock_migrate.call_count == 1
+        assert mock_frag.call_count == 0
+
+
+class TestSharedBrowserManager:
+    """Tests for shared BrowserManager in pool."""
+
+    def test_pool_creates_browser_manager(self):
+        """Pool creates a shared BrowserManager on init."""
+        db = _mock_db()
+        pool = MigrationWorkerPool(db=db)
+        assert pool._browser_manager is not None
+
+    @pytest.mark.asyncio
+    async def test_browser_manager_passed_to_migrate(self, tmp_path):
+        """Shared browser_manager is passed through to migrate_account."""
+        d = tmp_path / "account_1"
+        d.mkdir()
+        (d / "session.session").touch()
+        accounts = {1: _make_account(1, name="Acc1", session_dir=d)}
+        db = _mock_db(accounts)
+
+        with patch("src.worker_pool.migrate_account", new_callable=AsyncMock) as mock_migrate:
+            mock_migrate.return_value = _make_auth_result(success=True)
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                resource_monitor=_always_can_launch(),
+            )
+            await pool.run([1])
+
+        # Verify browser_manager kwarg was passed
+        call_kwargs = mock_migrate.call_args.kwargs
+        assert "browser_manager" in call_kwargs
+        assert call_kwargs["browser_manager"] is pool._browser_manager

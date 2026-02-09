@@ -32,7 +32,8 @@ class AppController:
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         self.db_path = data_dir / "tgwebauth.db"
-        self.sessions_dir = data_dir / "sessions"
+        # Use "accounts/" for session storage — same as CLI (was data/sessions/)
+        self.sessions_dir = Path("accounts")
         self.db: Optional[Database] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -60,6 +61,7 @@ class AppController:
         healthy = sum(1 for a in accounts if a.status == "healthy")
         migrating = sum(1 for a in accounts if a.status == "migrating")
         errors = sum(1 for a in accounts if a.status == "error")
+        fragment_ok = sum(1 for a in accounts if a.fragment_status == "authorized")
         active_proxies = sum(1 for p in proxies if p.status == "active")
 
         return {
@@ -67,6 +69,7 @@ class AppController:
             "healthy": healthy,
             "migrating": migrating,
             "errors": errors,
+            "fragment_authorized": fragment_ok,
             "proxies_active": active_proxies,
             "proxies_total": len(proxies)
         }

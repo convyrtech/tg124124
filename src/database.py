@@ -27,6 +27,7 @@ class AccountRecord:
     last_check: Optional[datetime]
     error_message: Optional[str]
     created_at: datetime
+    fragment_status: Optional[str] = None  # None, "authorized"
 
 
 @dataclass
@@ -166,6 +167,8 @@ class Database:
         """Open async connection."""
         self._connection = await aiosqlite.connect(self.db_path)
         self._connection.row_factory = aiosqlite.Row
+        await self._connection.execute("PRAGMA journal_mode=WAL")
+        await self._connection.execute("PRAGMA busy_timeout=30000")
 
     async def close(self) -> None:
         """Close connection."""
@@ -210,7 +213,8 @@ class Database:
                     status=row["status"],
                     last_check=row["last_check"],
                     error_message=row["error_message"],
-                    created_at=row["created_at"]
+                    created_at=row["created_at"],
+                    fragment_status=row["fragment_status"],
                 )
             return None
 
@@ -247,7 +251,8 @@ class Database:
                     status=row["status"],
                     last_check=row["last_check"],
                     error_message=row["error_message"],
-                    created_at=row["created_at"]
+                    created_at=row["created_at"],
+                    fragment_status=row["fragment_status"],
                 )
                 for row in rows
             ]

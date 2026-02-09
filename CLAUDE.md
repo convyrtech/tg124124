@@ -6,7 +6,8 @@ It contains: project context, all available tools, work methodology, safety rule
 
 **Key documents:**
 - `.claude/MASTER_PROMPT.md` - Master operating guide (READ FIRST)
-- `docs/ACTION_PLAN_2026-02-08.md` - Current implementation plan
+- `docs/plans/2026-02-09-production-1000-design.md` - **CURRENT** production plan (Phase 1 done, Phase 2 next)
+- `docs/ACTION_PLAN_2026-02-08.md` - Legacy plan (partially superseded by production plan above)
 - `PROMPTS.md` - Prompt generator and plugin guide
 
 ## Project Goal
@@ -16,7 +17,7 @@ It contains: project context, all available tools, work methodology, safety rule
 
 Масштаб: **1000 аккаунтов**, переносимость между ПК.
 
-## Current Status (2026-02-08)
+## Current Status (2026-02-09)
 
 ### Что работает
 - Programmatic QR Login (без ручного сканирования)
@@ -25,23 +26,25 @@ It contains: project context, all available tools, work methodology, safety rule
 - SOCKS5 proxy с auth через pproxy relay
 - Batch миграция (sequential + parallel через ParallelMigrationController)
 - Fragment.com OAuth popup flow (переписан, требует тестирования на реальных аккаунтах)
-- SQLite metadata (accounts, proxies, migrations, batches, operation_log)
-- Worker pool (asyncio queue, retry, circuit breaker) - реализован, интегрирован в GUI
+- SQLite metadata (accounts, proxies, migrations, batches, operation_log) + WAL + busy_timeout=30s
+- Worker pool (asyncio queue, retry, circuit breaker, mode web/fragment) - интегрирован в GUI
+- Shared BrowserManager в worker pool (LRU eviction работает глобально)
 - Profile lifecycle (hot/cold tiering, LRU eviction, zip compression)
 - Proxy management (import, health check, auto-replace dead)
 - Auth TTL 365 days (SetAuthorizationTTLRequest после миграции)
 - Resource monitor (CPU/RAM, adaptive concurrency)
-- GUI (DearPyGui, 80% complete)
+- PID-based force-kill zombie browsers (psutil, не taskkill /IM)
+- QR decode: zxing-cpp + morphological preprocessing (100% rate на dot-style и thin-line QR)
+- GUI (DearPyGui, 90% complete): Migrate All, Retry Failed, Fragment All, STOP, progress throttle, fragment_status column
 - CLI: 9 команд (migrate, open, list, check, health, fragment, check-proxies, proxy-refresh, init)
-- 255 тестов проходят
+- 269 тестов проходят
 
 ### Что НЕ работает / НЕ доделано
-- **Resource leaks** - зомби-процессы pproxy/Camoufox при таймаутах/крашах
-- **Fragment auth** - переписан, но CSS-селекторы не проверены на реальном сайте, 11 багов из аудита
+- **Fragment auth** - CSS-селекторы не проверены на реальном fragment.com
 - **Worker pool не в CLI** - CLI использует ParallelMigrationController, а не worker_pool.py
-- **FIX-001..007** - QR decode grey zone, SQLite lock в parallel, зависания без таймаутов
-- **GUI polish** - запускается, но не все кнопки протестированы
-- **migration_state.py** - deprecated, но CLI всё ещё импортирует для --resume/--retry-failed
+- **FIX-005** - 2FA selector hardcoded
+- **GUI polish** - кнопки работают, нужно ручное тестирование на реальных аккаунтах
+- **migration_state.py** - deprecated, не используется (можно удалить)
 
 ## Architecture
 
@@ -93,7 +96,7 @@ Camoufox → fragment.com → Click "Log in"
 Browser ──HTTP──> pproxy (localhost:random) ──SOCKS5+auth──> Remote Proxy
 ```
 
-## File Structure (9366 строк src/, 255 тестов)
+## File Structure (9565 строк src/, 269 тестов)
 ```
 tg-web-auth/
 ├── accounts/                # Исходные session файлы (.gitignore)
@@ -104,13 +107,13 @@ tg-web-auth/
 ├── profiles/                # Browser profiles (.gitignore)
 ├── data/                    # SQLite database (.gitignore)
 │   └── tgwebauth.db
-├── src/                     # 9366 строк
-│   ├── telegram_auth.py     # QR auth + AcceptLoginToken (2036 строк)
-│   ├── fragment_auth.py     # Fragment.com OAuth popup (655 строк)
-│   ├── browser_manager.py   # Camoufox + ProfileLifecycleManager (718 строк)
-│   ├── worker_pool.py       # Asyncio queue pool (572 строк, GUI only)
+├── src/                     # 9565 строк
+│   ├── telegram_auth.py     # QR auth + AcceptLoginToken (2038 строк)
+│   ├── fragment_auth.py     # Fragment.com OAuth popup + fragment_account() (689 строк)
+│   ├── browser_manager.py   # Camoufox + ProfileLifecycleManager + PID kill (761 строк)
+│   ├── worker_pool.py       # Asyncio queue pool, mode web/fragment (622 строк)
 │   ├── cli.py               # CLI 9 команд (978 строк)
-│   ├── database.py          # SQLite: accounts, proxies, migrations (905 строк)
+│   ├── database.py          # SQLite: accounts, proxies, migrations, WAL (907 строк)
 │   ├── proxy_manager.py     # Import, health check, auto-replace (442 строк)
 │   ├── proxy_relay.py       # SOCKS5→HTTP relay via pproxy (280 строк)
 │   ├── proxy_health.py      # Batch TCP check (103 строк)
@@ -121,10 +124,10 @@ tg-web-auth/
 │   ├── logger.py            # Logging setup (83 строк)
 │   ├── pproxy_wrapper.py    # pproxy process (23 строк)
 │   └── gui/
-│       ├── app.py           # DearPyGui main window (1224 строк)
+│       ├── app.py           # DearPyGui main window (1292 строк)
 │       ├── controllers.py   # GUI business logic (278 строк)
 │       └── theme.py         # Hacker dark green theme (99 строк)
-├── tests/                   # 255 тестов
+├── tests/                   # 269 тестов
 │   ├── test_telegram_auth.py
 │   ├── test_fragment_auth.py
 │   ├── test_browser_manager.py
@@ -153,7 +156,7 @@ tg-web-auth/
 - **Camoufox** - Antidetect browser (Firefox-based)
 - **Playwright** - Browser automation
 - **pproxy** - SOCKS5 auth relay
-- **OpenCV/pyzbar/jsQR** - QR decoding (3 fallback decoders)
+- **zxing-cpp/OpenCV/pyzbar/jsQR** - QR decoding (zxing-cpp primary, 3 fallbacks)
 - **Click** - CLI
 - **aiosqlite** - Async SQLite
 - **DearPyGui** - GUI
@@ -210,7 +213,7 @@ python -m src.gui.app                                  # Запуск GUI
 
 ### Тесты
 ```bash
-pytest                    # Все 255 тестов
+pytest                    # Все 269 тестов
 pytest -v                 # Verbose
 pytest tests/test_proxy_manager.py -v  # Конкретный файл
 ```
@@ -267,7 +270,7 @@ operation_log (id, account_id, operation, success, error_message,
 ## Quality Gates
 
 ### Перед завершением любой задачи
-1. [ ] `pytest` проходит без ошибок (255 тестов)
+1. [ ] `pytest` проходит без ошибок (269 тестов)
 2. [ ] Self-review на типичные ошибки
 3. [ ] Нет секретов в логах
 4. [ ] Все ресурсы закрываются (async with, try/finally)
@@ -281,24 +284,40 @@ operation_log (id, account_id, operation, success, error_message,
 - Use dataclasses for structured data
 - Async context managers for resource management
 
+## Development Patterns
+
+### Resource Cleanup Pattern (ОБЯЗАТЕЛЬНО для любого нового кода)
+- proxy_relay: always cleanup in try/finally or outer except (see browser_manager.py FIX-A)
+- subprocess: always kill in except/finally (see proxy_relay.py FIX-B)
+- BrowserManager: close_all() in finally of any method that creates browsers
+- asyncio.Queue: task_done() MUST be in finally block, never after try/except
+- GUI batch ops: disable buttons + check _active_pool guard before starting
+
+### Windows Gotchas
+- NEVER use `taskkill /IM` — kills ALL instances including parallel workers
+- Use psutil for PID-based process killing (cross-platform)
+- `tail` command doesn't work natively in cmd — use Read tool instead
+- PowerShell commands (`Get-ChildItem`) don't work in bash tool — use `ls` / `find`
+- File paths with Cyrillic need quotes in bash commands
+
+### Code Review Checklist (after every fix)
+- Double-cleanup: if resource cleaned in inner except, set to None to prevent outer cleanup
+- All batch entry points need _active_pool guard (migrate_selected, migrate_all, fragment_all)
+- proxy_relay.stop() is idempotent but avoid calling twice for clarity
+
 ## Known Issues
 
 ### Direct Session Injection (НЕ РАБОТАЕТ)
 Telegram Web K валидирует сессии на сервере. Единственный рабочий путь - **Programmatic QR Login**.
 
-### Resource Leaks (КРИТИЧНО для 1000 аккаунтов)
-- proxy_relay не закрывается при TimeoutError browser launch
-- pproxy process leak при race condition
-- Нет shutdown handler для дочерних процессов
+### Resource Leaks (all P0 fixed as of 2026-02-09)
+All critical resource leaks fixed: PID-based kill (psutil), proxy_relay cleanup (FIX-A/B),
+worker pool cleanup (FIX-C/D), GUI guards (FIX-F/G), shutdown handler (atexit+signal+psutil).
 
 ### Fragment Auth (требует тестирования)
 - CSS-селекторы не проверены на реальном fragment.com
 - asyncio.Event race condition в GUI context
 - Regex ловит любые 5-6 цифр как код подтверждения
 
-### Unfixed Bugs (FIX-001..007)
-- QR decode grey zone (len check)
-- SQLite "database is locked" в parallel mode
-- Telethon connect() зависает 180s без timeout
-- Browser launch зависает без timeout
-- 2FA selector hardcoded
+### Unfixed Bugs
+- FIX-005: 2FA selector hardcoded

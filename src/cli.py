@@ -209,6 +209,9 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             nonlocal batch_db_id
             db = await _connect_db()
             try:
+                # Reset accounts stuck in "migrating" from previous crash
+                await db.reset_interrupted_migrations()
+
                 if resume:
                     active = await db.get_active_batch()
                     if not active:

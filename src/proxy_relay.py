@@ -138,25 +138,36 @@ class ProxyRelay:
 
         if self._process.returncode is not None:
             stderr = await self._process.stderr.read()
+            self._process = None
             raise RuntimeError(f"ProxyRelay failed to start: {stderr.decode()}")
 
         logger.debug("ProxyRelay process started (PID: %d)", self._process.pid)
 
         # FIX-011: Health check - проверяем что relay слушает на порту
-        for retry in range(10):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(1)
-                    sock.connect((self.local_host, self.local_port))
-                    logger.debug("Relay verified listening on port %d", self.local_port)
-                    break
-            except (socket.error, socket.timeout):
-                if retry < 9:
-                    await asyncio.sleep(0.3)
-                else:
-                    raise RuntimeError(
-                        f"Proxy relay not responding on {self.local_host}:{self.local_port}"
-                    )
+        # FIX-B: Kill subprocess if health check fails (prevents zombie pproxy)
+        try:
+            for retry in range(10):
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                        sock.settimeout(1)
+                        sock.connect((self.local_host, self.local_port))
+                        logger.debug("Relay verified listening on port %d", self.local_port)
+                        break
+                except (socket.error, socket.timeout):
+                    if retry < 9:
+                        await asyncio.sleep(0.3)
+                    else:
+                        raise RuntimeError(
+                            f"Proxy relay not responding on {self.local_host}:{self.local_port}"
+                        )
+        except Exception:
+            if self._process:
+                try:
+                    self._process.kill()
+                except ProcessLookupError:
+                    pass
+                self._process = None
+            raise
 
         self._started = True
         logger.info("Started on %s", self.local_url)

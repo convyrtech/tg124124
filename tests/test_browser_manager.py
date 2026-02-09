@@ -12,6 +12,7 @@ from src.browser_manager import (
     BrowserManager,
     BrowserContext,
     ProfileLifecycleManager,
+    _get_browser_pid,
     parse_proxy,
 )
 
@@ -383,3 +384,104 @@ class TestProfileLifecycleManager:
         assert "newer" in mgr._access_order
         # older should come before newer in LRU order
         assert mgr._access_order.index("older") < mgr._access_order.index("newer")
+
+
+class TestGetBrowserPid:
+    """Tests for _get_browser_pid() function."""
+
+    def test_returns_none_on_missing_connection(self):
+        """Should return None when camoufox has no _connection."""
+        fake = MagicMock(spec=[])  # no attributes
+        assert _get_browser_pid(fake) is None
+
+    def test_returns_none_on_attribute_error(self):
+        """Should return None when transport chain is broken."""
+        fake = MagicMock()
+        del fake._connection  # force AttributeError
+        assert _get_browser_pid(fake) is None
+
+    @patch("src.browser_manager.psutil.Process")
+    def test_returns_child_pid(self, mock_process_cls):
+        """Should return child PID matching camoufox/firefox name."""
+        # Setup fake camoufox with PID chain
+        fake = MagicMock()
+        fake._connection._transport._proc.pid = 1234
+
+        child = MagicMock()
+        child.name.return_value = "camoufox.exe"
+        child.pid = 5678
+
+        mock_parent = MagicMock()
+        mock_parent.children.return_value = [child]
+        mock_process_cls.return_value = mock_parent
+
+        assert _get_browser_pid(fake) == 5678
+
+    @patch("src.browser_manager.psutil.Process")
+    def test_returns_node_pid_as_fallback(self, mock_process_cls):
+        """Should return node_pid when no camoufox child found."""
+        fake = MagicMock()
+        fake._connection._transport._proc.pid = 1234
+
+        # No matching children
+        other_child = MagicMock()
+        other_child.name.return_value = "some_other.exe"
+
+        mock_parent = MagicMock()
+        mock_parent.children.return_value = [other_child]
+        mock_process_cls.return_value = mock_parent
+
+        assert _get_browser_pid(fake) == 1234
+
+    @patch("src.browser_manager.psutil.Process")
+    def test_handles_no_such_process(self, mock_process_cls):
+        """Should return None when process doesn't exist."""
+        import psutil
+        fake = MagicMock()
+        fake._connection._transport._proc.pid = 9999
+        mock_process_cls.side_effect = psutil.NoSuchProcess(9999)
+
+        assert _get_browser_pid(fake) is None
+
+
+class TestBrowserContextForceKill:
+    """Tests for BrowserContext._force_kill_by_pid()."""
+
+    def _make_ctx(self, browser_pid=None):
+        """Create a BrowserContext with mocked internals."""
+        profile = BrowserProfile(name="test", path=Path("/tmp/test"), proxy=None)
+        ctx = BrowserContext(
+            profile=profile,
+            browser=MagicMock(),
+            camoufox=MagicMock(),
+        )
+        ctx._browser_pid = browser_pid
+        return ctx
+
+    def test_noop_when_no_pid(self):
+        """Should do nothing when _browser_pid is None."""
+        ctx = self._make_ctx(browser_pid=None)
+        ctx._force_kill_by_pid()  # should not raise
+
+    @patch("src.browser_manager.psutil.Process")
+    def test_kills_process_and_children(self, mock_process_cls):
+        """Should kill children first, then main process."""
+        child = MagicMock()
+        proc = MagicMock()
+        proc.children.return_value = [child]
+        mock_process_cls.return_value = proc
+
+        ctx = self._make_ctx(browser_pid=42)
+        ctx._force_kill_by_pid()
+
+        child.kill.assert_called_once()
+        proc.kill.assert_called_once()
+
+    @patch("src.browser_manager.psutil.Process")
+    def test_handles_already_gone(self, mock_process_cls):
+        """Should handle NoSuchProcess gracefully."""
+        import psutil
+        mock_process_cls.side_effect = psutil.NoSuchProcess(42)
+
+        ctx = self._make_ctx(browser_pid=42)
+        ctx._force_kill_by_pid()  # should not raise

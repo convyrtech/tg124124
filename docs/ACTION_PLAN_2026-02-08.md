@@ -30,7 +30,7 @@
 | GUI: DearPyGui (accounts, proxies, logs, settings) | Feb 6 | gui/ |
 | Proxy pool management (import, health, replace dead) | Feb 8 | proxy_manager.py |
 | CLI: proxy-refresh (auto-replace dead proxies) | Feb 8 | cli.py |
-| 255 tests passing | Feb 8 | tests/ |
+| 269 tests passing | Feb 9 | tests/ |
 
 ---
 
@@ -44,28 +44,28 @@
 **Files:** `browser_manager.py`, `proxy_relay.py`, `telegram_auth.py`
 **Priority:** P0 | **Risk:** System crash at ~50 accounts
 
-- [ ] Timeout на browser launch (max 60s)
-- [ ] proxy_relay cleanup при TimeoutError / crash
-- [ ] pproxy process PID tracking + force kill
-- [ ] Shutdown handler (atexit / signal) для ВСЕХ child processes
-- [ ] Timeout на Telethon connect() (max 30s)
-- [ ] Timeout на page.goto() (max 30s)
-- [ ] Тесты: timeout, crash, cleanup scenarios
-- [ ] Run pytest - all pass
+- [x] Timeout на browser launch (max 60s) — уже было в worker_pool
+- [x] proxy_relay cleanup при TimeoutError / crash — FIX-A (outer try/except) + FIX-B (health check kill)
+- [x] pproxy process PID tracking + force kill — psutil PID-based kill в browser_manager.py
+- [x] Shutdown handler — FIX-C (pool finally closes BrowserManager) + FIX-D (task_done finally)
+- [x] Timeout на Telethon connect() (max 30s) — уже было в telegram_auth
+- [x] Timeout на page.goto() (max 30s) — уже было в telegram_auth
+- [x] Тесты: timeout, crash, cleanup scenarios — 14 новых тестов
+- [x] Run pytest - all pass — 269 тестов
 
 #### A.2: Fix Critical Bugs
 **Files:** `telegram_auth.py`, `browser_manager.py`
 **Priority:** P0
 
 - [ ] FIX-001: QR decode grey zone (len<500 check wrong)
-- [ ] FIX-002: SQLite "database is locked" in parallel (WAL + busy_timeout)
+- [x] FIX-002: SQLite "database is locked" in parallel (WAL + busy_timeout) — DONE: PRAGMA journal_mode=WAL + busy_timeout=30000 в database.py
 - [ ] FIX-005: 2FA selector hardcoded, visibility not checked
-- [ ] FIX-006: Telethon connect() hangs 180s (add timeout)
-- [ ] FIX-007: Browser launch hangs (add timeout)
-- [ ] Cooldown: change from 90s to 60-120s random jitter
-- [ ] Batch pauses: after 10 accounts, pause 5-10 min
-- [ ] Тесты
-- [ ] Run pytest - all pass
+- [x] FIX-006: Telethon connect() hangs 180s — уже есть timeout в telegram_auth
+- [x] FIX-007: Browser launch hangs — уже есть timeout в telegram_auth
+- [x] Cooldown: 60-120s random jitter — уже в worker_pool.py
+- [x] Batch pauses: after 10 accounts, pause 5-10 min — уже в worker_pool.py
+- [x] Тесты — 269 тестов проходят
+- [x] Run pytest - all pass
 
 **NOTE:** FIX-003 (lock files) и FIX-004 (JSON race) больше не актуальны - JSON state deprecated, используем SQLite WAL.
 
@@ -202,7 +202,7 @@ Phase D: GUI Polish           [~1-2 дня]  Параллельно
 
 ## Success Criteria
 
-- [ ] 255+ tests pass
+- [x] 269 tests pass
 - [ ] No zombie processes after 100 sequential migrations
 - [ ] Canary: 5-10 accounts stable 24+ hours
 - [ ] Production: 1000 accounts migrated

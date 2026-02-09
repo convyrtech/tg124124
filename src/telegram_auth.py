@@ -249,6 +249,101 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
     except Exception as e:
         logger.debug("jsQR error: %s", e)
 
+    # Try zxing-cpp with morphological preprocessing (handles Telegram dot-style QR)
+    try:
+        import zxingcpp
+
+        def _zxing_decode_morph(pil_img):
+            """Decode QR via zxing-cpp with scale + morph close for dot-style QR."""
+            # 1. Try raw image
+            results = zxingcpp.read_barcodes(pil_img)
+            for r in results:
+                if r.text and 'tg://login?token=' in r.text:
+                    return r.text
+
+            # 2. Scale up + binarize + morphological close
+            # Two presets: high-contrast (dots) and low-contrast (thin lines)
+            img_gray = np.array(pil_img.convert('L'))
+            h, w = img_gray.shape
+            scaled = cv2.resize(img_gray, (w * 4, h * 4), interpolation=cv2.INTER_NEAREST)
+
+            for threshold in (128, 80):
+                _, binary = cv2.threshold(scaled, threshold, 255, cv2.THRESH_BINARY)
+                for ksize in (9, 13, 17):
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+                    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+                    results = zxingcpp.read_barcodes(Image.fromarray(closed))
+                    for r in results:
+                        if r.text and 'tg://login?token=' in r.text:
+                            return r.text
+            return None
+
+        def _get_qr_crops(pil_img):
+            """Get candidate QR crop regions for full-page screenshots."""
+            w, h = pil_img.size
+            crops = []
+
+            # 1. Contour-based detection (multiple thresholds)
+            gray_np = np.array(pil_img.convert('L'))
+            for thr in (150, 120, 100):
+                _, thresh = cv2.threshold(gray_np, thr, 255, cv2.THRESH_BINARY)
+                contours, _ = cv2.findContours(
+                    thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+                )
+                squares = []
+                for c in contours:
+                    bx, by, bw, bh = cv2.boundingRect(c)
+                    area = cv2.contourArea(c)
+                    if 100 < area < 50000 and bw > 10 and 0.6 <= bh / bw <= 1.6:
+                        squares.append((bx, by, bw, bh))
+
+                if len(squares) >= 3:
+                    xs = [s[0] for s in squares]
+                    ys = [s[1] for s in squares]
+                    x_max = max(s[0] + s[2] for s in squares)
+                    y_max = max(s[1] + s[3] for s in squares)
+                    span = max(x_max - min(xs), y_max - min(ys))
+                    # Only use if region is roughly square (QR-shaped)
+                    if span > 0 and 0.5 <= (x_max - min(xs)) / (y_max - min(ys)) <= 2.0:
+                        pad = int(span * 0.15)
+                        region = (
+                            max(0, min(xs) - pad),
+                            max(0, min(ys) - pad),
+                            min(w, x_max + pad),
+                            min(h, y_max + pad),
+                        )
+                        crops.append(region)
+                        break  # Use first successful threshold
+
+            # 2. Telegram Web K typical QR positions (center-right)
+            crops.append((int(w * 0.5), 0, w, int(h * 0.55)))
+            crops.append((int(w * 0.52), int(h * 0.05), int(w * 0.88), int(h * 0.52)))
+
+            return crops
+
+        # Try direct decode on full image
+        data = _zxing_decode_morph(image)
+        if data:
+            token_bytes = extract_token(data)
+            if token_bytes:
+                logger.info("Decoded QR with zxing-cpp (morphological)")
+                return token_bytes
+
+        # For large images: try multiple crop strategies
+        if image.width > 500 or image.height > 500:
+            for region in _get_qr_crops(image):
+                qr_crop = image.crop(region)
+                data = _zxing_decode_morph(qr_crop)
+                if data:
+                    token_bytes = extract_token(data)
+                    if token_bytes:
+                        logger.info("Decoded QR with zxing-cpp (cropped + morphological)")
+                        return token_bytes
+    except ImportError:
+        logger.debug("zxing-cpp not available, skipping")
+    except Exception as e:
+        logger.debug("zxing-cpp error: %s", e)
+
     # Try QRCodeDetectorAruco (more robust than standard detector)
     try:
         aruco_detector = cv2.QRCodeDetectorAruco()
@@ -1060,8 +1155,8 @@ class TelegramAuth:
                 )
 
                 # Если слишком долго ждать - прерываем
-                if wait_time > 300:  # 5 минут максимум
-                    logger.error(f"Flood wait {wait_time}s too long, aborting")
+                if wait_time > 3600:  # 1 час максимум
+                    logger.error(f"Flood wait {wait_time}s too long (>1h), aborting")
                     return False
 
                 # Ждём указанное время + небольшой jitter
@@ -1545,7 +1640,8 @@ async def migrate_account(
     account_dir: Path,
     password_2fa: Optional[str] = None,
     headless: bool = False,
-    proxy_override: Optional[str] = None
+    proxy_override: Optional[str] = None,
+    browser_manager: Optional[BrowserManager] = None,
 ) -> AuthResult:
     """
     Мигрирует один аккаунт из session в browser profile.
@@ -1555,6 +1651,7 @@ async def migrate_account(
         password_2fa: Пароль 2FA
         headless: Headless режим
         proxy_override: Прокси строка из БД (перезаписывает ___config.json)
+        browser_manager: Shared BrowserManager instance (creates new if None).
 
     Returns:
         AuthResult
@@ -1562,7 +1659,7 @@ async def migrate_account(
     account = AccountConfig.load(account_dir)
     if proxy_override is not None:
         account.proxy = proxy_override
-    auth = TelegramAuth(account)
+    auth = TelegramAuth(account, browser_manager=browser_manager)
     return await auth.authorize(password_2fa=password_2fa, headless=headless)
 
 

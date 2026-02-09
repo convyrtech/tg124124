@@ -1,4 +1,5 @@
 """Main GUI application."""
+import sys
 import dearpygui.dearpygui as dpg
 from pathlib import Path
 from typing import Optional, List, Callable
@@ -79,6 +80,7 @@ class TGWebAuthApp:
         self._shutting_down: bool = False
         self._migration_cancel: bool = False
         self._active_pool = None
+        self._last_table_refresh: float = 0.0
 
     def _start_async_loop(self) -> None:
         """Start async event loop in background thread."""
@@ -117,6 +119,11 @@ class TGWebAuthApp:
         self._shutting_down = True
         logger.info("Shutting down application...")
 
+        # Stop active worker pool
+        if hasattr(self, '_active_pool') and self._active_pool:
+            self._active_pool.request_shutdown()
+            self._active_pool = None
+
         # Close all tracked browser contexts
         if self._loop and self._active_browsers:
             async def close_browsers():
@@ -151,6 +158,20 @@ class TGWebAuthApp:
             if self._async_thread and self._async_thread.is_alive():
                 self._async_thread.join(timeout=5)
 
+        # Last resort: kill any orphaned child processes (pproxy, camoufox)
+        try:
+            import psutil
+            current = psutil.Process()
+            children = current.children(recursive=True)
+            for child in children:
+                try:
+                    child.kill()
+                    logger.info("Killed orphan child process: PID=%d (%s)", child.pid, child.name())
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception as e:
+            logger.warning("Child process cleanup error: %s", e)
+
         logger.info("Shutdown complete")
 
     def run(self) -> None:
@@ -165,17 +186,30 @@ class TGWebAuthApp:
         dpg.create_context()
 
         # Load font with Cyrillic support
-        # Use AppData path to avoid Cyrillic path issues with DearPyGui
+        # Auto-download JetBrainsMono if not present
         try:
             font_loaded = False
             import os
+            import urllib.request
             appdata = os.environ.get('APPDATA', '')
-            font_path = Path(appdata) / "tgwebauth" / "JetBrainsMono-Regular.ttf"
+            font_dir = Path(appdata) / "tgwebauth"
+            font_path = font_dir / "JetBrainsMono-Regular.ttf"
+
+            if not font_path.exists():
+                logger.info("Font not found, downloading JetBrainsMono...")
+                font_dir.mkdir(parents=True, exist_ok=True)
+                font_url = (
+                    "https://github.com/JetBrains/JetBrainsMono/raw/master/"
+                    "fonts/ttf/JetBrainsMono-Regular.ttf"
+                )
+                try:
+                    urllib.request.urlretrieve(font_url, font_path)
+                    logger.info("Font downloaded to: %s", font_path)
+                except Exception as e:
+                    logger.warning("Font download failed: %s", e)
 
             if font_path.exists():
                 font_str = str(font_path)
-                logger.info("Loading font from: %s", font_str)
-
                 with dpg.font_registry():
                     with dpg.font(font_str, 16) as default_font:
                         dpg.add_font_range_hint(dpg.mvFontRangeHint_Cyrillic)
@@ -185,9 +219,8 @@ class TGWebAuthApp:
                 logger.info("Cyrillic font loaded successfully")
 
             if not font_loaded:
-                logger.warning("Font not found at %s - Cyrillic may not display", font_path)
+                logger.warning("Font not available - Cyrillic may not display correctly")
         except Exception as e:
-            # Font loading failed - continue without custom font
             logger.warning("Font loading failed: %s - using default font", e)
 
         # Apply theme
@@ -213,9 +246,14 @@ class TGWebAuthApp:
         # Show 2FA dialog on start
         self._show_2fa_dialog()
 
-        # Register atexit handler for safety
+        # Register atexit + signal handlers for safety
         import atexit
+        import signal
         atexit.register(self._shutdown)
+        signal.signal(signal.SIGINT, lambda *_: self._shutdown())
+        # SIGTERM is not delivered on Windows, but register for POSIX compatibility
+        if sys.platform != 'win32':
+            signal.signal(signal.SIGTERM, lambda *_: self._shutdown())
 
         # Custom render loop to process UI queue
         while dpg.is_dearpygui_running():
@@ -245,6 +283,10 @@ class TGWebAuthApp:
 
                 dpg.add_text("[X]", color=(255, 82, 82))
                 dpg.add_text("0", tag="stat_errors")
+                dpg.add_spacer(width=10)
+
+                dpg.add_text("[F]", color=(255, 215, 0))
+                dpg.add_text("0", tag="stat_fragment")
 
                 dpg.add_spacer(width=50)
                 dpg.add_text("Proxies:", color=(150, 150, 150))
@@ -282,11 +324,23 @@ class TGWebAuthApp:
             )
             dpg.add_button(
                 label="Migrate Selected",
+                tag="btn_migrate_selected",
                 callback=self._migrate_selected
             )
             dpg.add_button(
                 label="Migrate All",
+                tag="btn_migrate_all",
                 callback=self._migrate_all
+            )
+            dpg.add_button(
+                label="Retry Failed",
+                tag="btn_retry_failed",
+                callback=self._retry_failed
+            )
+            dpg.add_button(
+                label="Fragment All",
+                tag="btn_fragment_all",
+                callback=self._fragment_all
             )
             dpg.add_button(
                 label="STOP",
@@ -315,8 +369,9 @@ class TGWebAuthApp:
             dpg.add_table_column(label="", width_fixed=True, width=30)  # Checkbox
             dpg.add_table_column(label="Name", width=200)
             dpg.add_table_column(label="Username", width=150)
-            dpg.add_table_column(label="Status", width=100)
-            dpg.add_table_column(label="Proxy", width=180)
+            dpg.add_table_column(label="Status", width=80)
+            dpg.add_table_column(label="Fragment", width=80)
+            dpg.add_table_column(label="Proxy", width=160)
             dpg.add_table_column(label="Actions", width=150)
 
     def _create_proxies_tab(self) -> None:
@@ -368,19 +423,24 @@ class TGWebAuthApp:
         """Show 2FA password input dialog on startup."""
         with dpg.window(
             tag="2fa_dialog",
-            label="2FA Password",
+            label="2FA",
             modal=True,
             no_close=True,
-            width=400,
-            height=180,
-            pos=[400, 250]
+            width=450,
+            height=200,
+            pos=[375, 250]
         ):
-            dpg.add_text("Enter 2FA password for batch operations:")
-            dpg.add_text("(Leave empty to enter manually each time)", color=(150, 150, 150))
+            dpg.add_text("Пароль двухфакторной аутентификации (2FA)")
+            dpg.add_text(
+                "Если у ваших аккаунтов есть облачный пароль Telegram,\n"
+                "введите его здесь. Если нет — нажмите Пропустить.",
+                color=(150, 150, 150)
+            )
             dpg.add_spacer(height=10)
             dpg.add_input_text(
                 tag="2fa_input",
                 password=True,
+                hint="Облачный пароль Telegram...",
                 width=-1,
                 on_enter=True,
                 callback=self._on_2fa_submit
@@ -388,7 +448,7 @@ class TGWebAuthApp:
             dpg.add_spacer(height=10)
             with dpg.group(horizontal=True):
                 dpg.add_button(label="OK", width=100, callback=self._on_2fa_submit)
-                dpg.add_button(label="Skip", width=100, callback=self._on_2fa_skip)
+                dpg.add_button(label="Пропустить", width=120, callback=self._on_2fa_skip)
 
     def _on_2fa_submit(self, sender=None, app_data=None) -> None:
         """Handle 2FA password submission."""
@@ -498,6 +558,7 @@ class TGWebAuthApp:
             dpg.set_value("stat_healthy", str(stats["healthy"]))
             dpg.set_value("stat_migrating", str(stats["migrating"]))
             dpg.set_value("stat_errors", str(stats["errors"]))
+            dpg.set_value("stat_fragment", str(stats.get("fragment_authorized", 0)))
             dpg.set_value("stat_proxies", f"{stats['proxies_active']}/{stats['proxies_total']}")
         except Exception as e:
             logger.error("Update stats error: %s", e)
@@ -525,6 +586,12 @@ class TGWebAuthApp:
                     status_text = dpg.add_text(account.status)
                     if account.status in self._status_themes:
                         dpg.bind_item_theme(status_text, self._status_themes[account.status])
+
+                    # Fragment status
+                    frag = account.fragment_status or "-"
+                    frag_text = dpg.add_text(frag)
+                    if frag == "authorized":
+                        dpg.bind_item_theme(frag_text, self._status_themes.get("healthy"))
 
                     # Proxy
                     if account.proxy_id and proxies_map and account.proxy_id in proxies_map:
@@ -807,9 +874,14 @@ class TGWebAuthApp:
                     self._log(f"[Fragment] Account {account_id} not found")
                     return
 
-                session_dir = Path(account.session_path) if account.session_path else None
-                if not session_dir or not session_dir.exists():
+                session_path = Path(account.session_path) if account.session_path else None
+                if not session_path:
                     self._log(f"[Fragment] Session not found for {account.name}")
+                    return
+
+                session_dir = session_path.parent
+                if not session_dir.exists():
+                    self._log(f"[Fragment] Session dir not found: {session_dir}")
                     return
 
                 self._log(f"[Fragment] Starting {account.name}...")
@@ -824,6 +896,11 @@ class TGWebAuthApp:
                     self._log(f"[Fragment] Config load error: {e}")
                     return
 
+                # Apply proxy from DB
+                proxy_str = await self._build_proxy_string(account)
+                if proxy_str:
+                    config.proxy = proxy_str
+
                 browser_manager = BrowserManager()
                 auth = FragmentAuth(config, browser_manager)
                 result = await auth.connect(headless=False)
@@ -831,8 +908,13 @@ class TGWebAuthApp:
                 if result.success:
                     status = "already authorized" if result.already_authorized else "connected"
                     self._log(f"[Fragment] {account.name} - {status}")
+                    await self._controller.db.update_account(
+                        account_id, fragment_status="authorized"
+                    )
                 else:
                     self._log(f"[Fragment] {account.name} - FAILED: {result.error}")
+
+                self._schedule_ui(lambda: self._refresh_table_async())
 
             except Exception as e:
                 logger.error("Fragment error: %s\n%s", e, traceback.format_exc())
@@ -962,6 +1044,9 @@ class TGWebAuthApp:
 
     def _migrate_selected(self, sender=None, app_data=None) -> None:
         """Migrate all selected accounts."""
+        if self._active_pool:
+            self._log("[Migrate] Migration already in progress")
+            return
         try:
             # Get selected checkboxes
             selected_ids = []
@@ -978,15 +1063,24 @@ class TGWebAuthApp:
                 self._log("[Warning] No accounts selected")
                 return
 
+            # Disable buttons immediately on main thread
+            self._set_batch_buttons_enabled(False)
             self._log(f"[Migrate] Starting migration of {len(selected_ids)} selected accounts...")
             self._migration_cancel = False
             self._run_async(self._batch_migrate(selected_ids))
         except Exception as e:
             logger.error("Migrate selected error: %s", e)
             self._log(f"[Error] Migrate: {e}")
+            self._set_batch_buttons_enabled(True)
 
     def _migrate_all(self, sender=None, app_data=None) -> None:
         """Migrate all pending accounts."""
+        # FIX-F: Guard against double-click creating orphaned pool → OOM
+        if self._active_pool:
+            self._log("[Migrate] Migration already in progress")
+            return
+        # Disable buttons immediately on main thread to prevent race
+        self._set_batch_buttons_enabled(False)
         self._log("[Migrate] Starting batch migration of all pending...")
         self._migration_cancel = False
 
@@ -994,12 +1088,44 @@ class TGWebAuthApp:
             accounts = await self._controller.db.list_accounts(status="pending")
             if not accounts:
                 self._log("[Migrate] No pending accounts")
+                self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
                 return
             ids = [a.id for a in accounts]
             self._log(f"[Migrate] {len(ids)} accounts to migrate...")
             await self._batch_migrate(ids)
 
         self._run_async(get_pending_ids())
+
+    def _set_batch_buttons_enabled(self, enabled: bool) -> None:
+        """FIX-G: Enable/disable batch operation buttons to prevent double-click."""
+        for tag in ("btn_migrate_selected", "btn_migrate_all", "btn_retry_failed", "btn_fragment_all"):
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, enabled=enabled)
+
+    def _retry_failed(self, sender=None, app_data=None) -> None:
+        """Retry all accounts with status='error'."""
+        if self._active_pool:
+            self._log("[Retry] Migration already in progress")
+            return
+        # Disable buttons immediately on main thread
+        self._set_batch_buttons_enabled(False)
+        self._log("[Retry] Retrying failed accounts...")
+        self._migration_cancel = False
+
+        async def get_error_ids():
+            accounts = await self._controller.db.list_accounts(status="error")
+            if not accounts:
+                self._log("[Retry] Нет аккаунтов с ошибками")
+                self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+                return
+            # Reset status to pending for retry
+            for a in accounts:
+                await self._controller.db.update_account(a.id, status="pending", error_message=None)
+            ids = [a.id for a in accounts]
+            self._log(f"[Retry] {len(ids)} аккаунтов на повтор...")
+            await self._batch_migrate(ids)
+
+        self._run_async(get_error_ids())
 
     def _stop_migration(self, sender=None, app_data=None) -> None:
         """Stop ongoing migration."""
@@ -1008,8 +1134,16 @@ class TGWebAuthApp:
             self._active_pool.request_shutdown()
         self._log("[Migrate] STOP requested - finishing active accounts...")
 
+    def _throttled_refresh(self, completed: int, total: int) -> None:
+        """Refresh accounts table at most every 3s (last update always fires)."""
+        now = time.time()
+        if completed >= total or (now - self._last_table_refresh >= 3.0):
+            self._last_table_refresh = now
+            self._schedule_ui(lambda: self._refresh_table_async())
+
     async def _batch_migrate(self, account_ids: list) -> None:
         """Batch migrate accounts using parallel worker pool."""
+        self._schedule_ui(lambda: self._set_batch_buttons_enabled(False))
         try:
             from ..worker_pool import MigrationWorkerPool
 
@@ -1018,7 +1152,7 @@ class TGWebAuthApp:
                 num_workers=3,
                 password_2fa=self._2fa_password,
                 on_progress=lambda completed, total, result:
-                    self._schedule_ui(lambda: self._refresh_table_async()),
+                    self._throttled_refresh(completed, total),
                 on_log=lambda msg: self._log(msg),
             )
 
@@ -1037,6 +1171,67 @@ class TGWebAuthApp:
             logger.error("Batch migrate error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Batch migrate: {e}")
             self._active_pool = None
+        finally:
+            self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+
+    def _fragment_all(self, sender=None, app_data=None) -> None:
+        """Start fragment.com auth for all healthy (migrated) accounts."""
+        if self._active_pool:
+            self._log("[Fragment] Migration already in progress")
+            return
+
+        # Disable buttons immediately on main thread
+        self._set_batch_buttons_enabled(False)
+        self._log("[Fragment] Starting batch fragment auth for healthy accounts...")
+        self._migration_cancel = False
+
+        async def get_healthy_ids():
+            accounts = await self._controller.db.list_accounts(status="healthy")
+            # Skip already fragment-authorized accounts
+            accounts = [a for a in accounts if a.fragment_status != "authorized"]
+            if not accounts:
+                self._log("[Fragment] Нет аккаунтов для авторизации (все уже авторизованы или нет мигрированных)")
+                self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+                return
+            ids = [a.id for a in accounts]
+            self._log(f"[Fragment] {len(ids)} аккаунтов для авторизации на fragment.com...")
+            await self._batch_fragment(ids)
+
+        self._run_async(get_healthy_ids())
+
+    async def _batch_fragment(self, account_ids: list) -> None:
+        """Batch fragment auth using parallel worker pool."""
+        self._schedule_ui(lambda: self._set_batch_buttons_enabled(False))
+        try:
+            from ..worker_pool import MigrationWorkerPool
+
+            pool = MigrationWorkerPool(
+                db=self._controller.db,
+                num_workers=3,
+                password_2fa=self._2fa_password,
+                on_progress=lambda completed, total, result:
+                    self._throttled_refresh(completed, total),
+                on_log=lambda msg: self._log(msg),
+                mode="fragment",
+            )
+
+            self._active_pool = pool
+
+            result = await pool.run(account_ids)
+
+            self._log(
+                f"[Fragment] Done: {result.success_count} OK, "
+                f"{result.error_count} errors, {result.total} total"
+            )
+            self._active_pool = None
+            self._schedule_ui(lambda: self._refresh_table_async())
+
+        except Exception as e:
+            logger.error("Batch fragment error: %s\n%s", e, traceback.format_exc())
+            self._log(f"[Error] Batch fragment: {e}")
+            self._active_pool = None
+        finally:
+            self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
 
     def _auto_assign_proxies(self, sender=None, app_data=None) -> None:
         """Auto-assign free proxies to accounts without proxies."""

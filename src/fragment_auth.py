@@ -19,13 +19,14 @@ import random
 import re
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 
 from .browser_manager import BrowserManager, BrowserContext
-from .telegram_auth import AccountConfig, parse_telethon_proxy
+from .telegram_auth import AccountConfig, AuthResult, parse_telethon_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -653,3 +654,36 @@ class FragmentAuth:
                     await client.disconnect()
                 except Exception as e:
                     logger.debug("Error disconnecting Telethon: %s", e)
+
+
+async def fragment_account(
+    account_dir: Path,
+    password_2fa: Optional[str] = None,
+    headless: bool = True,
+    proxy_override: Optional[str] = None,
+    browser_manager: Optional[BrowserManager] = None,
+) -> AuthResult:
+    """Authorize one account on fragment.com. Pool-compatible wrapper.
+
+    Args:
+        account_dir: Directory with session, api.json, ___config.json.
+        password_2fa: Unused (kept for API compat with migrate_account).
+        headless: Run browser headless.
+        proxy_override: Proxy string from DB.
+        browser_manager: Shared BrowserManager instance.
+
+    Returns:
+        AuthResult for compatibility with MigrationWorkerPool.
+    """
+    account = AccountConfig.load(Path(account_dir))
+    if proxy_override is not None:
+        account.proxy = proxy_override
+    auth = FragmentAuth(account, browser_manager or BrowserManager())
+    result = await auth.connect(headless=headless)
+
+    return AuthResult(
+        success=result.success,
+        profile_name=account.name,
+        error=result.error,
+        user_info={"already_authorized": result.already_authorized} if result.success else None,
+    )

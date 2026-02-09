@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 
+import psutil
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -72,6 +74,33 @@ def _rmtree_force(path: Path) -> None:
         shutil.rmtree(path, onexc=_on_rmtree_error)
     else:
         shutil.rmtree(path, onerror=_on_rmtree_error)
+
+
+def _get_browser_pid(camoufox_instance) -> Optional[int]:
+    """Extract PID of camoufox.exe via psutil process tree.
+
+    Chain: camoufox._connection._transport._proc.pid -> node.exe PID
+    -> psutil.Process(pid).children() -> camoufox.exe PID
+
+    Args:
+        camoufox_instance: AsyncCamoufox context manager instance.
+
+    Returns:
+        PID of camoufox.exe (or node.exe as fallback), or None if not found.
+    """
+    try:
+        transport = camoufox_instance._connection._transport
+        node_pid = transport._proc.pid
+        parent = psutil.Process(node_pid)
+        for child in parent.children(recursive=True):
+            name = child.name().lower()
+            if 'camoufox' in name or 'firefox' in name:
+                return child.pid
+        # Fallback: return node_pid (kill node -> cascade kill children)
+        return node_pid
+    except Exception as e:
+        logger.debug("Could not extract browser PID: %s", e)
+        return None
 
 
 def _clean_session_restore(browser_data_path: Path) -> None:
@@ -382,73 +411,50 @@ class BrowserManager:
 
         When AsyncCamoufox.__aenter__() times out, the underlying
         camoufox.exe process may still be running. This method attempts
-        to close it gracefully, then forcefully kills camoufox.exe by PID.
+        to close it gracefully, then kills by PID (psutil), falling back
+        to taskkill /IM only as last resort.
 
-        IMPORTANT: Only kills the specific camoufox.exe process, NOT
-        regular firefox.exe (user's browser).
+        IMPORTANT: PID-based kill only affects THIS browser instance,
+        NOT other parallel workers' browsers.
         """
         import subprocess
 
+        # 1. Try graceful exit via Playwright context manager
         try:
-            # Try graceful exit via Playwright context manager
-            try:
-                await asyncio.wait_for(camoufox.__aexit__(None, None, None), timeout=10)
-                logger.debug("Zombie browser cleaned up gracefully")
-                return
-            except Exception:
-                pass
+            await asyncio.wait_for(camoufox.__aexit__(None, None, None), timeout=10)
+            logger.debug("Zombie browser cleaned up gracefully")
+            return
         except Exception as e:
             logger.debug("Graceful cleanup failed: %s", e)
 
-        # Fallback: kill camoufox.exe processes (NOT firefox.exe!)
-        try:
-            if sys.platform == 'win32':
-                subprocess.run(
-                    ['taskkill', '/F', '/IM', 'camoufox.exe'],
-                    capture_output=True, timeout=5
-                )
-            else:
-                subprocess.run(
-                    ['pkill', '-f', 'camoufox'],
-                    capture_output=True, timeout=5
-                )
-            logger.info("Killed zombie camoufox.exe processes")
-        except Exception as e:
-            logger.debug("Fallback kill camoufox failed: %s", e)
+        # 2. PID-based kill (safe for parallel workers)
+        pid = _get_browser_pid(camoufox)
+        if pid:
+            try:
+                proc = psutil.Process(pid)
+                children = proc.children(recursive=True)
+                for child in children:
+                    try:
+                        child.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                proc.kill()
+                logger.info("Killed zombie browser PID %d via psutil", pid)
+                await asyncio.sleep(1)
+                return
+            except psutil.NoSuchProcess:
+                logger.debug("Zombie browser PID %d already gone", pid)
+                return
+            except Exception as e:
+                logger.warning("PID-based kill failed for PID %d: %s", pid, e)
 
-        # Also kill zombie Playwright node.exe driver processes.
-        # Each failed launch leaves a node.exe (~40-60MB) that never exits.
-        # Identify by 'playwright' in command line to avoid killing other node processes.
-        try:
-            if sys.platform == 'win32':
-                # Use PowerShell Get-CimInstance (wmic is deprecated)
-                ps_cmd = (
-                    "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" "
-                    "| Where-Object { $_.CommandLine -like '*playwright*' } "
-                    "| ForEach-Object { $_.ProcessId }"
-                )
-                result = subprocess.run(
-                    ['powershell', '-NoProfile', '-Command', ps_cmd],
-                    capture_output=True, text=True, timeout=15
-                )
-                pids = [
-                    line.strip() for line in result.stdout.splitlines()
-                    if line.strip().isdigit()
-                ]
-                for pid in pids:
-                    subprocess.run(
-                        ['taskkill', '/F', '/PID', pid],
-                        capture_output=True, timeout=5
-                    )
-                if pids:
-                    logger.info("Killed %d zombie Playwright node.exe processes", len(pids))
-            else:
-                subprocess.run(
-                    ['pkill', '-f', 'node.*playwright'],
-                    capture_output=True, timeout=5
-                )
-        except Exception as e:
-            logger.debug("Fallback kill playwright node failed: %s", e)
+        # FIX-E: Do NOT use taskkill /IM — it kills ALL camoufox instances,
+        # including other parallel workers' browsers. Accept the zombie as
+        # lesser evil; it will be cleaned up on pool shutdown via close_all().
+        logger.warning(
+            "PID not found for zombie browser cleanup. "
+            "Process may remain until pool shutdown."
+        )
 
         # Wait for file locks to release
         await asyncio.sleep(1)
@@ -521,63 +527,79 @@ class BrowserManager:
         logger.info("Proxy: %s", proxy_info)
         logger.info("Headless: %s", headless)
 
+        # FIX-A: Wrap entire launch in try/except to ensure proxy_relay cleanup
+        # on ANY exception (not just TimeoutError). Without this, non-timeout
+        # errors (OSError, PermissionError, etc.) leave zombie pproxy processes.
         camoufox = AsyncCamoufox(**args)
 
         try:
-            browser = await asyncio.wait_for(
-                camoufox.__aenter__(),
-                timeout=self.BROWSER_LAUNCH_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            # Kill the zombie Firefox process left by the timed-out launch
-            await self._kill_zombie_browser(camoufox)
-
-            # Retry once with a fresh profile (delete corrupted browser_data)
-            logger.warning(
-                "Browser launch timeout for '%s' — retrying with fresh profile...",
-                profile.name
-            )
-            if browser_data_path.exists():
-                try:
-                    _rmtree_force(browser_data_path)
-                    logger.info("Deleted corrupted browser_data for '%s'", profile.name)
-                except OSError as e:
-                    logger.warning(
-                        "Could not fully delete browser_data for '%s': %s",
-                        profile.name, e
-                    )
-
-            # Rebuild args (profile dir will be recreated)
-            if profile.proxy and needs_relay(profile.proxy):
-                args = self._build_camoufox_args(relay_profile, headless, extra_args)
-            else:
-                args = self._build_camoufox_args(profile, headless, extra_args)
-
-            camoufox = AsyncCamoufox(**args)
             try:
                 browser = await asyncio.wait_for(
                     camoufox.__aenter__(),
                     timeout=self.BROWSER_LAUNCH_TIMEOUT
                 )
             except asyncio.TimeoutError:
+                # Kill the zombie Firefox process left by the timed-out launch
                 await self._kill_zombie_browser(camoufox)
-                if proxy_relay:
-                    await proxy_relay.stop()
-                raise RuntimeError(
-                    f"Browser launch timeout after {self.BROWSER_LAUNCH_TIMEOUT}s "
-                    f"(retried with fresh profile)"
+
+                # Retry once with a fresh profile (delete corrupted browser_data)
+                logger.warning(
+                    "Browser launch timeout for '%s' — retrying with fresh profile...",
+                    profile.name
                 )
+                if browser_data_path.exists():
+                    try:
+                        _rmtree_force(browser_data_path)
+                        logger.info("Deleted corrupted browser_data for '%s'", profile.name)
+                    except OSError as e:
+                        logger.warning(
+                            "Could not fully delete browser_data for '%s': %s",
+                            profile.name, e
+                        )
 
-        ctx = BrowserContext(
-            profile=profile,
-            browser=browser,
-            camoufox=camoufox,
-            proxy_relay=proxy_relay,
-            manager=self,  # Back-reference for cleanup
-        )
+                # Rebuild args (profile dir will be recreated)
+                if profile.proxy and needs_relay(profile.proxy):
+                    args = self._build_camoufox_args(relay_profile, headless, extra_args)
+                else:
+                    args = self._build_camoufox_args(profile, headless, extra_args)
 
-        self._active_browsers[profile.name] = ctx
-        return ctx
+                camoufox = AsyncCamoufox(**args)
+                try:
+                    browser = await asyncio.wait_for(
+                        camoufox.__aenter__(),
+                        timeout=self.BROWSER_LAUNCH_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    await self._kill_zombie_browser(camoufox)
+                    if proxy_relay:
+                        await proxy_relay.stop()
+                        proxy_relay = None  # Prevent double-stop in outer except
+                    raise RuntimeError(
+                        f"Browser launch timeout after {self.BROWSER_LAUNCH_TIMEOUT}s "
+                        f"(retried with fresh profile)"
+                    )
+
+            browser_pid = _get_browser_pid(camoufox)
+
+            ctx = BrowserContext(
+                profile=profile,
+                browser=browser,
+                camoufox=camoufox,
+                proxy_relay=proxy_relay,
+                manager=self,  # Back-reference for cleanup
+            )
+            ctx._browser_pid = browser_pid
+
+            self._active_browsers[profile.name] = ctx
+            return ctx
+        except Exception:
+            # Cleanup proxy_relay on ANY unhandled exception in launch flow
+            if proxy_relay:
+                try:
+                    await proxy_relay.stop()
+                except Exception as e:
+                    logger.warning("Relay cleanup error on launch failure: %s", e)
+            raise
 
     async def close_all(self):
         """Закрывает все активные браузеры"""
@@ -610,6 +632,7 @@ class BrowserContext:
         self._manager = manager
         self._page = None
         self._closed = False
+        self._browser_pid: Optional[int] = None
 
     async def new_page(self):
         """
@@ -658,6 +681,25 @@ class BrowserContext:
 
     CLOSE_TIMEOUT = 15  # секунд на закрытие браузера
 
+    def _force_kill_by_pid(self) -> None:
+        """Kill browser process tree by PID (psutil). Only kills THIS browser."""
+        if not self._browser_pid:
+            return
+        try:
+            proc = psutil.Process(self._browser_pid)
+            children = proc.children(recursive=True)
+            for child in children:
+                try:
+                    child.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            proc.kill()
+            logger.info("Force-killed browser PID %d for '%s'", self._browser_pid, self.profile.name)
+        except psutil.NoSuchProcess:
+            logger.debug("Browser PID %d already gone", self._browser_pid)
+        except Exception as e:
+            logger.warning("Failed to kill browser PID %d: %s", self._browser_pid, e)
+
     async def close(self):
         """Закрывает браузер и останавливает proxy relay с timeout"""
         if self._closed:
@@ -677,9 +719,14 @@ class BrowserContext:
                 timeout=self.CLOSE_TIMEOUT
             )
         except asyncio.TimeoutError:
-            logger.warning("Browser close timed out after %ds for '%s'", self.CLOSE_TIMEOUT, self.profile.name)
+            logger.warning(
+                "Browser close timed out for '%s' - force killing PID %s",
+                self.profile.name, self._browser_pid,
+            )
+            self._force_kill_by_pid()
         except Exception as e:
-            logger.warning("Error during browser exit: %s", e)
+            logger.warning("Error during browser exit: %s — force killing PID %s", e, self._browser_pid)
+            self._force_kill_by_pid()
 
         if self._proxy_relay:
             try:
