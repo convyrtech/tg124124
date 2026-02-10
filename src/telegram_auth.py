@@ -1338,6 +1338,12 @@ class TelegramAuth:
                 logger.info("Password form disappeared - likely successful")
                 break
 
+            # Check for INCORRECT PASSWORD on submit button
+            incorrect_btn = await page.query_selector('button:has-text("INCORRECT PASSWORD"), button:has-text("INCORRECT")')
+            if incorrect_btn:
+                logger.error("2FA error: INCORRECT PASSWORD")
+                return False
+
             # Проверяем loading state
             loading_btn = await page.query_selector('button:has-text("PLEASE WAIT"), button:has-text("Loading")')
             if not loading_btn:
@@ -1483,6 +1489,21 @@ class TelegramAuth:
                                 required_2fa=True,
                                 telethon_alive=await self._verify_telethon_session(client)
                             )
+                        # 2FA entered but auth didn't complete
+                        return AuthResult(
+                            success=False,
+                            profile_name=profile.name,
+                            required_2fa=True,
+                            error="2FA accepted but authorization did not complete",
+                        )
+                    else:
+                        # Wrong password or 2FA form error
+                        return AuthResult(
+                            success=False,
+                            profile_name=profile.name,
+                            required_2fa=True,
+                            error="2FA password incorrect or rejected",
+                        )
                 else:
                     logger.info("2FA password not provided, waiting for manual input...")
                     success, _ = await self._wait_for_auth_complete(page)
