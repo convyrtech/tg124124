@@ -37,7 +37,9 @@ It contains: project context, all available tools, work methodology, safety rule
 - QR decode: zxing-cpp + morphological preprocessing (100% rate на dot-style и thin-line QR)
 - GUI (DearPyGui, 90% complete): Migrate All, Retry Failed, Fragment All, STOP, progress throttle, fragment_status column
 - CLI: 9 команд (migrate, open, list, check, health, fragment, check-proxies, proxy-refresh, init)
-- 269 тестов проходят
+- CLI atexit: psutil orphan killer (pproxy via cmdline, camoufox/firefox via name)
+- Proxy relay recreation on browser launch retry (fresh port, no broken state)
+- 271 тестов проходят
 
 ### Что НЕ работает / НЕ доделано
 - **Fragment auth** - CSS-селекторы не проверены на реальном fragment.com
@@ -127,7 +129,7 @@ tg-web-auth/
 │       ├── app.py           # DearPyGui main window (1292 строк)
 │       ├── controllers.py   # GUI business logic (278 строк)
 │       └── theme.py         # Hacker dark green theme (99 строк)
-├── tests/                   # 269 тестов
+├── tests/                   # 271 тестов
 │   ├── test_telegram_auth.py
 │   ├── test_fragment_auth.py
 │   ├── test_browser_manager.py

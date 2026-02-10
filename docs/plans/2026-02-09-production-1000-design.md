@@ -339,6 +339,15 @@ CLAUDE.md **автоматически читается** при каждой с
 - [x] pytest — все 269 тестов зелёные
 - [x] Code review: fixed double proxy_relay.stop(), added missing guard in _migrate_selected()
 
+### Phase 1.7: Relay Recreation + CLI Shutdown (2026-02-10)
+
+- [x] browser_manager: proxy relay recreation on retry (stop old → new ProxyRelay → fresh port)
+- [x] cli.py: atexit orphan killer (psutil cmdline for pproxy, name for camoufox/firefox)
+- [x] cli.py: KeyboardInterrupt handler for fragment --all batch mode
+- [x] Audit: found & fixed pproxy cmdline detection bug (python.exe -m pproxy)
+- [x] 2 new tests for relay recreation (271 total)
+- [x] Removed unused `needs_relay` import from tests
+
 ### Phase 1.5: Quality & UX Fixes (team audit findings)
 
 - [x] requirements.txt: добавлены dearpygui, aiosqlite, screeninfo
