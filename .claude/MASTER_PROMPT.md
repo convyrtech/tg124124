@@ -12,7 +12,7 @@ for web.telegram.org (QR login) and fragment.com (Telegram Login Widget).
 
 **Hardware:** Ryzen 5600U (6C/12T), 16GB RAM, NVMe SSD, Windows.
 **Priority:** Stability > Anti-ban safety > Speed.
-**Codebase:** 9565 lines src/, 271 tests, Python 3.11+ async.
+**Codebase:** ~10K lines src/, 287 tests, Python 3.11+ async.
 
 ### How QR Login Works
 ```
@@ -52,7 +52,7 @@ src/logger.py            # Logging setup (83 lines)
 src/gui/app.py           # DearPyGui main window (1292 lines, 85% complete)
 src/gui/controllers.py   # GUI business logic (278 lines)
 src/gui/theme.py         # Hacker-style dark green theme (99 lines)
-tests/                   # 271 tests
+tests/                   # 287 tests
 accounts/                # Source session files (gitignored)
 profiles/                # Browser profiles (gitignored)
 data/                    # SQLite database (tgwebauth.db)
@@ -220,6 +220,14 @@ Completed in session 2026-02-10:
 - 2 new tests (269 → 271)
 - Audit: found & fixed pproxy cmdline detection bug (python.exe -m pproxy, not "pproxy")
 - Smoke test attempt: account 573189220650 has dead session (expected — needs live sessions)
+
+Production audit (5 parallel agents, 50+ findings → 18 fixes):
+- Block 1 Anti-ban (7): circuit breaker single-probe, global batch pause, dedup accounts,
+  QR stale token non-retryable, queue.join timeout, shared BrowserManager in CLI, cooldown after completion
+- Block 2 Resource leaks (6): fragment_single BrowserManager P0, per-row buttons disable,
+  log deque(500), incremental table update, async zip I/O, CLI fragment shared BrowserManager
+- Block 3 Security (5): proxy creds stripped from configs/logs/errors, assign_proxy check
+- 16 new tests (271 → 287), reviewer verdict: SHIP IT
 
 **STOPPED AT:** Phase 2 — Smoke Test. Need accounts with live Telethon sessions.
 Next: find/verify 10 accounts with live sessions → GUI "Migrate All" → monitor RAM/zombies.

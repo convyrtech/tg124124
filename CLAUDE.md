@@ -39,14 +39,23 @@ It contains: project context, all available tools, work methodology, safety rule
 - CLI: 9 команд (migrate, open, list, check, health, fragment, check-proxies, proxy-refresh, init)
 - CLI atexit: psutil orphan killer (pproxy via cmdline, camoufox/firefox via name)
 - Proxy relay recreation on browser launch retry (fresh port, no broken state)
-- 271 тестов проходят
+- Circuit breaker single-probe half-open (prevents worker flood after reset)
+- Global batch pause (asyncio.Event pauses ALL workers, not just one)
+- Account dedup in worker pool (prevents AUTH_KEY_DUPLICATED)
+- QR token: non-retryable errors (EXPIRED/INVALID) fail immediately
+- GUI: per-row buttons disabled during batch, log deque(500), incremental table update
+- Async zip I/O in ProfileLifecycleManager (run_in_executor)
+- Proxy credentials stripped from profile_config.json and error messages
+- assign_proxy() checks for already-assigned proxy
+- 287 тестов проходят
 
 ### Что НЕ работает / НЕ доделано
 - **Fragment auth** - CSS-селекторы не проверены на реальном fragment.com
-- **Worker pool не в CLI** - CLI использует ParallelMigrationController, а не worker_pool.py
+- **Fragment receive_updates=False** - может мешать получению кодов от 777000
 - **FIX-005** - 2FA selector hardcoded
-- **GUI polish** - кнопки работают, нужно ручное тестирование на реальных аккаунтах
 - **migration_state.py** - deprecated, не используется (можно удалить)
+- **psutil.cpu_percent** - блокирует event loop 100ms (P2)
+- **operation_log** - растёт без ротации (P2)
 
 ## Architecture
 
@@ -129,7 +138,7 @@ tg-web-auth/
 │       ├── app.py           # DearPyGui main window (1292 строк)
 │       ├── controllers.py   # GUI business logic (278 строк)
 │       └── theme.py         # Hacker dark green theme (99 строк)
-├── tests/                   # 271 тестов
+├── tests/                   # 287 тестов
 │   ├── test_telegram_auth.py
 │   ├── test_fragment_auth.py
 │   ├── test_browser_manager.py
