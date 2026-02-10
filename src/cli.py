@@ -159,10 +159,12 @@ def cli():
               help="JSON файл с паролями 2FA: {\"account_name\": \"password\"}")
 @click.option("--status", "show_status", is_flag=True,
               help="Показать статус текущего batch и выйти")
+@click.option("--no-proxy", is_flag=True,
+              help="Игнорировать все прокси (для тестирования без VPN/proxy)")
 def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             headless: bool, cooldown: int, parallel: int, auto_scale: bool,
             resume: bool, retry_failed: bool, fresh: bool,
-            password_file: Optional[str], show_status: bool):
+            password_file: Optional[str], show_status: bool, no_proxy: bool):
     """Мигрировать аккаунт(ы) из session в browser profile"""
     import json
     import shutil
@@ -245,15 +247,20 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
         password_2fa = password or passwords_map.get(account_dir.name) or get_2fa_password(account_dir.name, None)
 
         # Load proxy from DB for this account (overrides ___config.json)
-        async def _get_single_proxy():
-            db = await _connect_db()
-            try:
-                pmap = await db.get_proxy_map()
-                return pmap.get(account_dir.name)
-            finally:
-                await db.close()
+        single_proxy = None
+        if no_proxy:
+            single_proxy = "NONE"  # Special value: strip all proxies
+            click.echo("No-proxy mode: все прокси отключены")
+        else:
+            async def _get_single_proxy():
+                db = await _connect_db()
+                try:
+                    pmap = await db.get_proxy_map()
+                    return pmap.get(account_dir.name)
+                finally:
+                    await db.close()
 
-        single_proxy = asyncio.run(_get_single_proxy())
+            single_proxy = asyncio.run(_get_single_proxy())
 
         result = asyncio.run(migrate_account(
             account_dir=account_dir,
@@ -383,19 +390,24 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
         # Load proxy map from DB (overrides ___config.json proxies)
         proxy_map = None
 
-        async def _load_proxy_map():
-            db = await _connect_db()
-            try:
-                return await db.get_proxy_map()
-            finally:
-                await db.close()
+        if no_proxy:
+            # Special proxy_map: all accounts get "NONE" → strip all proxies
+            proxy_map = {d.name: "NONE" for d in accounts}
+            click.echo(f"No-proxy mode: все прокси отключены для {len(accounts)} аккаунтов")
+        else:
+            async def _load_proxy_map():
+                db = await _connect_db()
+                try:
+                    return await db.get_proxy_map()
+                finally:
+                    await db.close()
 
-        try:
-            proxy_map = asyncio.run(_load_proxy_map())
-            if proxy_map:
-                click.echo(f"DB прокси загружены для {len(proxy_map)} аккаунтов")
-        except Exception as e:
-            logger.warning(f"Could not load proxy map from DB: {e}")
+            try:
+                proxy_map = asyncio.run(_load_proxy_map())
+                if proxy_map:
+                    click.echo(f"DB прокси загружены для {len(proxy_map)} аккаунтов")
+            except Exception as e:
+                logger.warning(f"Could not load proxy map from DB: {e}")
 
         if parallel > 0 or auto_scale:
             # Параллельный режим

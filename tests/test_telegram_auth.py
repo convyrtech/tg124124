@@ -547,11 +547,19 @@ class TestRandomizedCooldown:
         assert avg_high > avg_low
 
     def test_cooldown_never_negative(self):
-        """Test that cooldown is never negative."""
+        """Test that cooldown is never negative and respects base_cooldown range."""
+        # Testing mode: base < MIN_COOLDOWN — allows shorter cooldowns
         for _ in range(100):
-            cooldown = get_randomized_cooldown(10)  # Low base
-            assert cooldown >= MIN_COOLDOWN
+            cooldown = get_randomized_cooldown(10)
+            assert cooldown >= 10 * 0.5  # Low bound = base * 0.5
+            assert cooldown <= 10 * 2    # High bound = base * 2
             assert cooldown > 0
+
+        # Production mode: base >= MIN_COOLDOWN
+        for _ in range(100):
+            cooldown = get_randomized_cooldown(90)
+            assert cooldown >= MIN_COOLDOWN
+            assert cooldown <= MAX_COOLDOWN
 
 
 class TestFloodWaitHandling:

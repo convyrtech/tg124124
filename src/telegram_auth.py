@@ -1805,7 +1805,8 @@ def get_randomized_cooldown(base_cooldown: float = DEFAULT_ACCOUNT_COOLDOWN) -> 
     Генерирует randomized cooldown для избежания детекции паттернов.
 
     Использует log-normal distribution с центром около base_cooldown.
-    Результат в диапазоне [MIN_COOLDOWN, MAX_COOLDOWN].
+    Результат clamped to [base_cooldown * 0.5, base_cooldown * 2].
+    For production (base >= MIN_COOLDOWN), also respects MIN/MAX_COOLDOWN.
 
     Args:
         base_cooldown: Базовое значение cooldown в секундах
@@ -1820,8 +1821,12 @@ def get_randomized_cooldown(base_cooldown: float = DEFAULT_ACCOUNT_COOLDOWN) -> 
 
     delay = random.lognormvariate(mu, sigma)
 
-    # Ограничиваем диапазон
-    return max(MIN_COOLDOWN, min(delay, MAX_COOLDOWN))
+    # Clamp to reasonable range around base_cooldown
+    # For testing (--cooldown 10): range [5, 20]
+    # For production (--cooldown 90): range [60, 180]
+    low = max(base_cooldown * 0.5, MIN_COOLDOWN) if base_cooldown >= MIN_COOLDOWN else base_cooldown * 0.5
+    high = min(base_cooldown * 2, MAX_COOLDOWN)
+    return max(low, min(delay, high))
 
 
 async def migrate_account(
@@ -1845,7 +1850,10 @@ async def migrate_account(
         AuthResult
     """
     account = AccountConfig.load(account_dir)
-    if proxy_override is not None:
+    if proxy_override == "NONE":
+        # --no-proxy mode: strip all proxies (DB + ___config.json)
+        account.proxy = None
+    elif proxy_override is not None:
         account.proxy = proxy_override
     auth = TelegramAuth(account, browser_manager=browser_manager)
     return await auth.authorize(password_2fa=password_2fa, headless=headless)
