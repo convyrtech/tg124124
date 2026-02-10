@@ -166,8 +166,8 @@ class TestFragmentAuth:
     async def test_check_fragment_state_fallback_logout_link(self, fragment_auth):
         """Test fallback: detect authorized via .logout-link presence."""
         page = AsyncMock()
-        # Aj not loaded, no login-link, but .logout-link exists
-        page.evaluate = AsyncMock(side_effect=[None, False, True])
+        # Aj not loaded, no login-link CSS, no login-link text fallback, .logout-link exists
+        page.evaluate = AsyncMock(side_effect=[None, False, False, True])
         state = await fragment_auth._check_fragment_state(page)
         assert state == "authorized"
 
@@ -175,8 +175,8 @@ class TestFragmentAuth:
     async def test_check_fragment_state_cookie_fallback(self, fragment_auth):
         """Test detecting authorized state via stel_ssid cookie."""
         page = AsyncMock()
-        # Aj not loaded, no login-link, no logout-link
-        page.evaluate = AsyncMock(side_effect=[None, False, False])
+        # Aj not loaded, no login-link CSS, no login-link text, no logout-link CSS, no logout-link text
+        page.evaluate = AsyncMock(side_effect=[None, False, False, False, False])
         # But stel_ssid cookie exists
         mock_context = MagicMock()
         mock_context.cookies = AsyncMock(return_value=[
@@ -190,8 +190,8 @@ class TestFragmentAuth:
     async def test_check_fragment_state_loading(self, fragment_auth):
         """Test loading state when nothing is detected (no cookies either)."""
         page = AsyncMock()
-        # Aj not loaded, no login-link, no logout-link, no cookies
-        page.evaluate = AsyncMock(side_effect=[None, False, False])
+        # Aj not loaded, no login-link CSS, no login-link text, no logout-link CSS, no logout-link text
+        page.evaluate = AsyncMock(side_effect=[None, False, False, False, False])
         mock_context = MagicMock()
         mock_context.cookies = AsyncMock(return_value=[])
         page.context = mock_context
@@ -224,7 +224,7 @@ class TestFragmentAuth:
 
         popup = await fragment_auth._open_oauth_popup(page)
         assert popup == mock_popup
-        page.wait_for_event.assert_called_once_with('popup', timeout=10000)
+        page.wait_for_event.assert_called_once_with('popup', timeout=20000)
         page.click.assert_awaited_once_with('button.login-link')
         mock_popup.wait_for_load_state.assert_awaited_once_with('domcontentloaded')
 

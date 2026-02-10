@@ -153,18 +153,40 @@ def cli():
               help="Продолжить прерванную миграцию (только pending аккаунты)")
 @click.option("--retry-failed", is_flag=True,
               help="Повторить только упавшие аккаунты")
+@click.option("--fresh", is_flag=True,
+              help="Удалить browser_data перед retry (сбросить кэш 2FA)")
+@click.option("--password-file", type=click.Path(exists=True),
+              help="JSON файл с паролями 2FA: {\"account_name\": \"password\"}")
 @click.option("--status", "show_status", is_flag=True,
               help="Показать статус текущего batch и выйти")
 def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             headless: bool, cooldown: int, parallel: int, auto_scale: bool,
-            resume: bool, retry_failed: bool, show_status: bool):
+            resume: bool, retry_failed: bool, fresh: bool,
+            password_file: Optional[str], show_status: bool):
     """Мигрировать аккаунт(ы) из session в browser profile"""
+    import json
+    import shutil
     import signal
     import sqlite3
     from .telegram_auth import migrate_account, migrate_accounts_batch, ParallelMigrationController
     from .database import Database
 
     DB_PATH = Path("data/tgwebauth.db")
+
+    # FIX-5.2: Load password file for 2FA
+    passwords_map: dict = {}
+    if password_file:
+        try:
+            with open(password_file, 'r', encoding='utf-8') as f:
+                passwords_map = json.load(f)
+            click.echo(f"Loaded {len(passwords_map)} passwords from {password_file}")
+        except Exception as e:
+            click.echo(f"Error loading password file: {e}")
+            sys.exit(1)
+
+    # FIX-2.4: --fresh flag is processed after _resolve_accounts() so we know which accounts failed
+    if fresh and not retry_failed:
+        click.echo("Warning: --fresh has no effect without --retry-failed")
 
     async def _connect_db() -> Database:
         """Initialize and connect database (async)."""
@@ -219,8 +241,8 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
 
         click.echo(f"Мигрирую: {account_dir.name}")
 
-        # FIX #8: Безопасное получение пароля
-        password_2fa = get_2fa_password(account_dir.name, password)
+        # FIX #8: Безопасное получение пароля (CLI arg > password-file > env)
+        password_2fa = password or passwords_map.get(account_dir.name) or get_2fa_password(account_dir.name, None)
 
         result = asyncio.run(migrate_account(
             account_dir=account_dir,
@@ -326,7 +348,24 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
 
         click.echo(f"Аккаунтов для миграции: {len(accounts)}")
 
-        # FIX #8: Безопасное получение пароля
+        # FIX-2.4: --fresh flag deletes browser_data ONLY for resolved (failed) accounts
+        if fresh and retry_failed and accounts:
+            profiles_dir = Path("profiles")
+            failed_names = {d.name for d in accounts}
+            deleted = 0
+            if profiles_dir.exists():
+                for profile_dir in profiles_dir.iterdir():
+                    if (profile_dir.is_dir()
+                            and profile_dir.name in failed_names
+                            and (profile_dir / "browser_data").exists()):
+                        try:
+                            shutil.rmtree(profile_dir / "browser_data")
+                            deleted += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to delete {profile_dir / 'browser_data'}: {e}")
+            click.echo(f"Fresh mode: deleted {deleted} browser_data directories (of {len(failed_names)} failed)")
+
+        # FIX #8: Безопасное получение пароля (CLI arg or env)
         password_2fa = get_2fa_password("all", password)
 
         if parallel > 0 or auto_scale:
@@ -359,72 +398,122 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             if hasattr(signal, 'SIGTERM'):
                 signal.signal(signal.SIGTERM, handle_signal)
 
-            # Progress callback — UI only (no asyncio.run inside running loop!)
-            def on_progress(completed, total, result):
+            # FIX-4.2 + FIX-C5: DB update per-account via progress callback (crash-safe)
+            # Use a shared DB connection for the batch, closed in finally
+            _parallel_db = None
+
+            async def _init_parallel_db():
+                nonlocal _parallel_db
+                _parallel_db = await _connect_db()
+
+            async def _close_parallel_db():
+                nonlocal _parallel_db
+                if _parallel_db:
+                    await _parallel_db.close()
+                    _parallel_db = None
+
+            async def _on_progress_async(completed, total, result):
+                """Update DB immediately for each completed account."""
                 status_str = click.style("OK", fg="green") if result and result.success else click.style("FAIL", fg="red")
                 name = result.profile_name if result else "?"
                 click.echo(f"  [{completed}/{total}] {status_str} {name}")
-
-            results = asyncio.run(controller.run(
-                account_dirs=accounts,
-                password_2fa=password_2fa,
-                headless=headless,
-                on_progress=on_progress
-            ))
-
-            # Update DB after parallel run completes
-            if batch_db_id:
-                async def _update_parallel():
-                    db = await _connect_db()
+                if batch_db_id and result and _parallel_db:
                     try:
-                        for r in results:
-                            if r.success:
-                                await db.mark_batch_account_completed(batch_db_id, r.profile_name)
-                            else:
-                                await db.mark_batch_account_failed(batch_db_id, r.profile_name, r.error or "Unknown error")
-                    finally:
-                        await db.close()
-                asyncio.run(_update_parallel())
+                        if result.success:
+                            await _parallel_db.mark_batch_account_completed(batch_db_id, result.profile_name)
+                        else:
+                            await _parallel_db.mark_batch_account_failed(batch_db_id, result.profile_name, result.error or "Unknown error")
+                    except Exception as e:
+                        logger.warning(f"DB update error: {e}")
+
+            async def _run_parallel():
+                await _init_parallel_db()
+                try:
+                    return await controller.run(
+                        account_dirs=accounts,
+                        password_2fa=password_2fa,
+                        headless=headless,
+                        on_progress=_on_progress_async,
+                        passwords_map=passwords_map if passwords_map else None,
+                    )
+                finally:
+                    await _close_parallel_db()
+
+            results = asyncio.run(_run_parallel())
         else:
             # Последовательный режим (существующий)
             click.echo(f"Режим: ПОСЛЕДОВАТЕЛЬНЫЙ")
             click.echo(f"Cooldown между аккаунтами: {cooldown}s")
 
-            # FIX #6: Используем batch функцию с cooldown
-            results = asyncio.run(migrate_accounts_batch(
-                account_dirs=accounts,
-                password_2fa=password_2fa,
-                headless=headless,
-                cooldown=cooldown
-            ))
+            # FIX-4.2: Per-account crash-safe DB update callback
+            # Use shared DB connection for entire batch (avoid 1000 open/close cycles)
+            _seq_db = None
 
-            # Update state in DB for sequential mode
-            if batch_db_id:
-                async def _update_sequential():
-                    db = await _connect_db()
-                    try:
-                        for result in results:
-                            if result.success:
-                                await db.mark_batch_account_completed(batch_db_id, result.profile_name)
-                            else:
-                                await db.mark_batch_account_failed(batch_db_id, result.profile_name, result.error or "Unknown error")
-                    finally:
-                        await db.close()
-                asyncio.run(_update_sequential())
+            async def _run_sequential():
+                nonlocal _seq_db
+                _seq_db = await _connect_db()
+                try:
+                    async def _on_result_sequential(result):
+                        status_str = click.style("OK", fg="green") if result.success else click.style("FAIL", fg="red")
+                        click.echo(f"  {status_str} {result.profile_name}")
+                        if batch_db_id and _seq_db:
+                            try:
+                                if result.success:
+                                    await _seq_db.mark_batch_account_completed(batch_db_id, result.profile_name)
+                                else:
+                                    await _seq_db.mark_batch_account_failed(batch_db_id, result.profile_name, result.error or "Unknown error")
+                            except Exception as e:
+                                logger.warning(f"DB update error: {e}")
+
+                    # FIX #6: Используем batch функцию с cooldown
+                    return await migrate_accounts_batch(
+                        account_dirs=accounts,
+                        password_2fa=password_2fa,
+                        headless=headless,
+                        cooldown=cooldown,
+                        on_result=_on_result_sequential,
+                        passwords_map=passwords_map if passwords_map else None,
+                    )
+                finally:
+                    if _seq_db:
+                        await _seq_db.close()
+
+            results = asyncio.run(_run_sequential())
 
         # Итог
         success = [r for r in results if r.success]
         failed = [r for r in results if not r.success]
 
         click.echo(f"\n{'='*50}")
-        click.echo("ИТОГ МИГРАЦИИ")
+        click.echo("BATCH COMPLETE")
         click.echo(f"{'='*50}")
-        click.echo(f"Всего: {len(results)}")
-        click.echo(f"Успешно: {len(success)}")
-        click.echo(f"Ошибки: {len(failed)}")
+        click.echo(f"Total:      {len(results)}")
+        click.echo(click.style(f"Success:    {len(success)} ({len(success)*100//max(len(results),1)}%)", fg="green"))
+        click.echo(click.style(f"Failed:     {len(failed)}", fg="red" if failed else "green"))
 
+        # FIX-4.3: Error breakdown by category (uses auto-classified error_category from AuthResult)
         if failed:
-            click.echo("\nНеуспешные аккаунты:")
+            error_categories: dict = {}
+            for result in failed:
+                category = result.error_category or "unknown"
+                error_categories.setdefault(category, []).append(result)
+
+            click.echo("\nError breakdown:")
+            category_hints = {
+                "dead_session": "Replace session files",
+                "bad_proxy": "Run: proxy-refresh",
+                "qr_decode_fail": "Auto-retry recommended (--retry-failed)",
+                "2fa_required": "Provide passwords via --password-file",
+                "rate_limited": "Wait and retry",
+                "timeout": "Check proxy speed",
+                "browser_crash": "Retry (--retry-failed)",
+                "unknown": "Manual investigation needed",
+            }
+            for cat, items in sorted(error_categories.items(), key=lambda x: -len(x[1])):
+                hint = category_hints.get(cat, "")
+                click.echo(f"  {cat:20s} {len(items):>4d}  — {hint}")
+
+            click.echo("\nFailed accounts:")
             for result in failed:
                 click.echo(f"  - {result.profile_name}: {result.error}")
             click.echo("\nИспользуйте --retry-failed для повтора упавших")
@@ -994,6 +1083,143 @@ def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str):
             await db.close()
 
     asyncio.run(_run())
+
+
+@cli.command()
+def preflight():
+    """FIX-5.1: Pre-flight validation before large batch migration."""
+    import shutil
+
+    from .database import Database
+
+    DB_PATH = Path("data/tgwebauth.db")
+
+    async def _run_preflight():
+        click.echo("=" * 50)
+        click.echo("PREFLIGHT REPORT")
+        click.echo("=" * 50)
+
+        # 1. Disk space
+        usage = shutil.disk_usage(Path(".").resolve())
+        free_gb = usage.free / (1024 ** 3)
+        disk_ok = free_gb > 50  # Need ~100MB/profile, 50GB minimum
+        status = click.style("OK", fg="green") if disk_ok else click.style("LOW", fg="red")
+        click.echo(f"\nDisk space:        {free_gb:.1f} GB free  {status}")
+
+        # 2. Session files
+        account_dirs = find_account_dirs()
+        total_accounts = len(account_dirs)
+        sessions_ok = 0
+        sessions_missing = 0
+        no_api = 0
+        for d in account_dirs:
+            session = d / "session.session"
+            api = d / "api.json"
+            if session.exists() and api.exists():
+                sessions_ok += 1
+            elif not session.exists():
+                sessions_missing += 1
+            elif not api.exists():
+                no_api += 1
+
+        click.echo(f"\nAccounts found:    {total_accounts}")
+        click.echo(f"  Session + API:   {sessions_ok}")
+        if sessions_missing:
+            click.echo(click.style(f"  No session:      {sessions_missing}", fg="red"))
+        if no_api:
+            click.echo(click.style(f"  No api.json:     {no_api}", fg="red"))
+
+        # 3. DB proxies check
+        db = Database(DB_PATH)
+        await db.initialize()
+        await db.connect()
+        try:
+            all_proxies = await db.list_proxies()
+            active_proxies = [p for p in all_proxies if p.status == "active"]
+            assigned_proxies = [p for p in all_proxies if p.assigned_account_id]
+
+            click.echo(f"\nProxies:")
+            click.echo(f"  Total:           {len(all_proxies)}")
+            click.echo(f"  Active:          {len(active_proxies)}")
+            click.echo(f"  Assigned:        {len(assigned_proxies)}")
+
+            # 4. Quick proxy TCP check via DB batch
+            if active_proxies:
+                from .proxy_health import check_proxy_connection
+                click.echo(f"\n  TCP check (sample up to 20)...")
+                sample = active_proxies[:20]
+                tasks = [check_proxy_connection(p.host, p.port, timeout=10) for p in sample]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                alive = sum(1 for r in results if r is True)
+                click.echo(f"  Alive:           {alive}/{len(sample)}")
+                if alive < len(sample):
+                    click.echo(click.style(
+                        f"  Dead:            {len(sample) - alive}", fg="red"))
+
+            # 5. Session alive check (sample up to 5)
+            click.echo(f"\nSession alive check (sample 5)...")
+            alive_count = 0
+            dead_count = 0
+            twofa_count = 0
+            sample_accounts = account_dirs[:5]
+            for acct_dir in sample_accounts:
+                try:
+                    from .telegram_auth import AccountConfig, parse_telethon_proxy
+                    account = AccountConfig.load(acct_dir)
+                    from telethon import TelegramClient
+                    proxy = parse_telethon_proxy(account.proxy)
+                    client = TelegramClient(
+                        str(account.session_path.with_suffix('')),
+                        account.api_id,
+                        account.api_hash,
+                        proxy=proxy,
+                    )
+                    try:
+                        await asyncio.wait_for(client.connect(), timeout=15)
+                        if await client.is_user_authorized():
+                            alive_count += 1
+                            # Check 2FA
+                            try:
+                                from telethon.tl.functions.account import GetPasswordRequest
+                                pwd = await client(GetPasswordRequest())
+                                if pwd.has_password:
+                                    twofa_count += 1
+                            except Exception:
+                                pass
+                        else:
+                            dead_count += 1
+                    finally:
+                        await client.disconnect()
+                except Exception as e:
+                    dead_count += 1
+                    logger.debug(f"Preflight session check failed for {acct_dir.name}: {e}")
+
+            click.echo(f"  Alive:           {alive_count}/{len(sample_accounts)}")
+            if dead_count:
+                click.echo(click.style(f"  Dead:            {dead_count}", fg="red"))
+            if twofa_count:
+                click.echo(click.style(f"  2FA:             {twofa_count}", fg="yellow"))
+
+            # 6. Resources
+            import psutil
+            ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+            ram_avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+            click.echo(f"\nResources:")
+            click.echo(f"  RAM total:       {ram_gb:.1f} GB")
+            click.echo(f"  RAM available:   {ram_avail_gb:.1f} GB")
+
+            # Estimate
+            recommended_parallel = min(10, max(1, int(ram_avail_gb / 0.5)))
+            est_time_hours = (total_accounts * 60) / (recommended_parallel * 3600)
+            click.echo(f"\nEstimate:")
+            click.echo(f"  Ready accounts:  {sessions_ok}")
+            click.echo(f"  Recommended -j:  {recommended_parallel}")
+            click.echo(f"  Est. time:       ~{est_time_hours:.1f} hours")
+
+        finally:
+            await db.close()
+
+    asyncio.run(_run_preflight())
 
 
 @cli.command()

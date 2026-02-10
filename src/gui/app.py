@@ -83,7 +83,8 @@ class TGWebAuthApp:
         self._active_pool = None
         self._last_table_refresh: float = 0.0
         # Fix #10: O(1) log append with bounded deque instead of O(n) string concat
-        self._log_lines: collections.deque = collections.deque(maxlen=500)
+        # FIX-7.4: 500→2000 for 1000-account batches (~3-4 messages per account)
+        self._log_lines: collections.deque = collections.deque(maxlen=2000)
         self._log_lines.append("[System] TG Web Auth started")
         # Fix #9: Track per-row action buttons for disabling during batch
         self._row_action_buttons: List[int] = []
@@ -508,13 +509,17 @@ class TGWebAuthApp:
     def _log(self, message: str) -> None:
         """Add message to log (thread-safe).
 
-        Uses a bounded deque (maxlen=500) to avoid O(n^2) string concat.
-        At 1000 accounts the old approach copied megabytes per append.
+        Uses a bounded deque (maxlen=2000) to avoid O(n^2) string concat.
+        FIX-7.1: Rebuild only every 10th message to reduce UI freeze at scale.
         """
         def do_log():
             if dpg.does_item_exist("log_output"):
                 self._log_lines.append(message)
-                dpg.set_value("log_output", "\n".join(self._log_lines))
+                # Rebuild full text every 10 messages to avoid O(n) join on every append.
+                # Skip intermediate updates — deque handles eviction, so the widget
+                # stays in sync on the next full rebuild.
+                if len(self._log_lines) % 10 == 0 or len(self._log_lines) < 50:
+                    dpg.set_value("log_output", "\n".join(self._log_lines))
 
         # If called from main thread, do directly; otherwise queue
         try:

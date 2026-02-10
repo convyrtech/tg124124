@@ -54,25 +54,11 @@ class AppController:
             await self.db.close()
 
     async def get_stats(self) -> dict:
-        """Get account/proxy statistics."""
-        accounts = await self.db.list_accounts()
-        proxies = await self.db.list_proxies()
+        """Get account/proxy statistics.
 
-        healthy = sum(1 for a in accounts if a.status == "healthy")
-        migrating = sum(1 for a in accounts if a.status == "migrating")
-        errors = sum(1 for a in accounts if a.status == "error")
-        fragment_ok = sum(1 for a in accounts if a.fragment_status == "authorized")
-        active_proxies = sum(1 for p in proxies if p.status == "active")
-
-        return {
-            "total": len(accounts),
-            "healthy": healthy,
-            "migrating": migrating,
-            "errors": errors,
-            "fragment_authorized": fragment_ok,
-            "proxies_active": active_proxies,
-            "proxies_total": len(proxies)
-        }
+        FIX-7.2: Uses SQL COUNT(*) aggregation instead of loading all records.
+        """
+        return await self.db.get_counts()
 
     async def search_accounts(self, query: str) -> List[AccountRecord]:
         """Search accounts by name/username/phone."""

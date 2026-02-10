@@ -180,15 +180,65 @@ class AccountConfig:
         )
 
 
+class ErrorCategory:
+    """FIX-4.1: Error categories for batch error breakdown."""
+    DEAD_SESSION = "dead_session"
+    BAD_PROXY = "bad_proxy"
+    QR_DECODE_FAIL = "qr_decode_fail"
+    TWO_FA_REQUIRED = "2fa_required"
+    RATE_LIMITED = "rate_limited"
+    TIMEOUT = "timeout"
+    BROWSER_CRASH = "browser_crash"
+    UNKNOWN = "unknown"
+
+
+def classify_error(error_message: str) -> str:
+    """FIX-4.1: Classify error message into an ErrorCategory.
+
+    Args:
+        error_message: Error string from AuthResult
+
+    Returns:
+        ErrorCategory string constant
+    """
+    if not error_message:
+        return ErrorCategory.UNKNOWN
+
+    msg = error_message.lower()
+
+    if any(s in msg for s in ("not authorized", "auth_key_unregistered", "session is not authorized", "dead session")):
+        return ErrorCategory.DEAD_SESSION
+    if any(s in msg for s in ("connectionerror", "proxy error", "proxy connection", "connection refused", "socks", "proxy failed")):
+        return ErrorCategory.BAD_PROXY
+    if any(s in msg for s in ("failed to extract qr", "qr not found", "qr_decode", "qr token")):
+        return ErrorCategory.QR_DECODE_FAIL
+    if any(s in msg for s in ("2fa", "password required", "two-factor", "incorrect password")):
+        return ErrorCategory.TWO_FA_REQUIRED
+    if any(s in msg for s in ("floodwaiterror", "flood wait", "too many attempts", "rate limit")):
+        return ErrorCategory.RATE_LIMITED
+    if any(s in msg for s in ("timeout", "timed out")):
+        return ErrorCategory.TIMEOUT
+    if any(s in msg for s in ("browser crash", "target closed", "connection closed", "browser target")):
+        return ErrorCategory.BROWSER_CRASH
+
+    return ErrorCategory.UNKNOWN
+
+
 @dataclass
 class AuthResult:
     """Результат авторизации"""
     success: bool
     profile_name: str
     error: Optional[str] = None
+    error_category: str = ""
     required_2fa: bool = False
     user_info: Optional[Dict[str, Any]] = None
     telethon_alive: bool = False  # FIX #2: Session safety check
+
+    def __post_init__(self):
+        """Auto-classify error if not set."""
+        if self.error and not self.error_category:
+            self.error_category = classify_error(self.error)
 
 
 def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
@@ -318,7 +368,10 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
                         crops.append(region)
                         break  # Use first successful threshold
 
-            # 2. Telegram Web K typical QR positions (center-right)
+            # 2. Telegram Web K typical QR positions
+            # FIX-1.3: Center crop first (auth QR appears centered on page)
+            crops.append((int(w * 0.25), int(h * 0.1), int(w * 0.75), int(h * 0.65)))
+            # Right-side crops as fallback
             crops.append((int(w * 0.5), 0, w, int(h * 0.55)))
             crops.append((int(w * 0.52), int(h * 0.05), int(w * 0.88), int(h * 0.52)))
 
@@ -525,7 +578,7 @@ class TelegramAuth:
     TELEGRAM_WEB_URL = "https://web.telegram.org/k/"
     QR_WAIT_TIMEOUT = 30  # секунд ждать появления QR
     AUTH_WAIT_TIMEOUT = 120  # секунд ждать завершения авторизации
-    QR_MAX_RETRIES = 5  # FIX-008: Увеличено с 3 до 5 для надёжности
+    QR_MAX_RETRIES = 8  # FIX-6.1: Increased from 5 to 8 for 1000-account reliability
     QR_RETRY_DELAY = 5  # секунд между retry
 
     def __init__(self, account: AccountConfig, browser_manager: Optional[BrowserManager] = None):
@@ -573,10 +626,15 @@ class TelegramAuth:
         )
 
         # FIX-006: Timeout на connect() чтобы не зависать навечно
+        # FIX-4.4: Catch TypeError from broken proxy libs + ConnectionError
         try:
             await asyncio.wait_for(client.connect(), timeout=30)
         except asyncio.TimeoutError:
             raise RuntimeError("Telethon connect timeout after 30s")
+        except TypeError as e:
+            raise RuntimeError(f"Telethon connection failed (proxy error): {e}")
+        except (ConnectionError, OSError) as e:
+            raise RuntimeError(f"Telethon connection failed: {e}")
 
         if not await client.is_user_authorized():
             await client.disconnect()
@@ -862,6 +920,16 @@ class TelegramAuth:
                 # Метод 0b: Инжектируем jsQR и декодируем canvas прямо в браузере
                 # Это работает лучше чем внешние декодеры для стилизованных QR Telegram
                 # Загружаем jsQR из локального файла (CDN блокируется CSP)
+                # FIX-1.4: Verify jsQR is actually available (SPA navigation loses injected scripts)
+                if hasattr(self, '_jsqr_injected') and self._jsqr_injected:
+                    try:
+                        jsqr_available = await page.evaluate("() => typeof window.jsQR === 'function'")
+                        if not jsqr_available:
+                            self._jsqr_injected = False
+                            logger.debug("jsQR lost after SPA navigation, will re-inject")
+                    except Exception:
+                        self._jsqr_injected = False
+
                 if not hasattr(self, '_jsqr_injected') or not self._jsqr_injected:
                     try:
                         import os
@@ -877,24 +945,44 @@ class TelegramAuth:
                     except Exception as e:
                         logger.debug(f"jsQR injection error: {e}")
 
+                # FIX-1.1b: For WebGL canvas, use OffscreenCanvas to get imageData
                 qr_from_browser = await page.evaluate("""
                     () => {
                         const canvas = document.querySelector('canvas');
                         if (!canvas) return null;
 
-                        const ctx = canvas.getContext('2d');
-                        if (!ctx) return null;
-
                         if (typeof jsQR !== 'function') {
                             return { error: 'jsQR not available' };
                         }
 
-                        // Получаем данные canvas
                         const width = canvas.width;
                         const height = canvas.height;
-                        const imageData = ctx.getImageData(0, 0, width, height);
 
-                        // Декодируем с jsQR (attemptBoth пробует и нормальную и инвертированную версию)
+                        // Guard: zero-dimension canvas (not yet rendered or hidden)
+                        if (width === 0 || height === 0) {
+                            return { error: 'Canvas has zero dimensions' };
+                        }
+
+                        // Try getContext('2d') first (fastest path)
+                        let ctx = canvas.getContext('2d');
+                        let imageData;
+                        if (ctx) {
+                            imageData = ctx.getImageData(0, 0, width, height);
+                        } else {
+                            // WebGL canvas: draw to offscreen 2d canvas
+                            try {
+                                const offscreen = document.createElement('canvas');
+                                offscreen.width = width;
+                                offscreen.height = height;
+                                const ctx2 = offscreen.getContext('2d');
+                                if (!ctx2) return { error: 'Cannot create 2d context' };
+                                ctx2.drawImage(canvas, 0, 0);
+                                imageData = ctx2.getImageData(0, 0, width, height);
+                            } catch(e) {
+                                return { error: 'WebGL canvas copy failed: ' + e.message };
+                            }
+                        }
+
                         const code = jsQR(imageData.data, width, height, {
                             inversionAttempts: 'attemptBoth'
                         });
@@ -919,19 +1007,20 @@ class TelegramAuth:
                         logger.debug(f"Browser jsQR: {qr_from_browser.get('error')}")
 
                 # Fallback: Получить canvas data для внешнего декодирования
+                # FIX-1.1: toDataURL() works on both 2d AND WebGL canvases
+                # without needing getContext('2d') — which returns null on WebGL
                 qr_from_canvas = await page.evaluate("""
                     () => {
                         const canvas = document.querySelector('canvas');
                         if (!canvas) return null;
 
-                        const ctx = canvas.getContext('2d');
-                        if (!ctx) return null;
-
-                        return {
-                            dataUrl: canvas.toDataURL('image/png'),
-                            width: canvas.width,
-                            height: canvas.height
-                        };
+                        try {
+                            return {
+                                dataUrl: canvas.toDataURL('image/png'),
+                                width: canvas.width,
+                                height: canvas.height
+                            };
+                        } catch(e) { return null; }
                     }
                 """)
 
@@ -1008,15 +1097,25 @@ class TelegramAuth:
                     if token_bytes:
                         return token_bytes
 
-                # Метод 2: Ищем QR canvas и делаем скриншот
+                # Метод 2: Ищем QR canvas и делаем скриншот элемента
                 qr_element = await page.query_selector('canvas')
 
                 if qr_element:
+                    # Check bounding box — skip if canvas is hidden or zero-sized
+                    bbox = await qr_element.bounding_box()
+                    if not bbox or bbox['width'] < 10 or bbox['height'] < 10:
+                        continue  # Canvas not visible yet, retry next iteration
+
                     # Ждём полной отрисовки QR
                     await asyncio.sleep(2)
 
-                    # Делаем скриншот всей страницы
-                    screenshot = await page.screenshot(full_page=False)
+                    # FIX-1.2: Screenshot of canvas element only, not full page
+                    # Full page = 1280x720, QR = ~200x200 = 3% pixels → decoders fail
+                    try:
+                        screenshot = await qr_element.screenshot()
+                    except Exception:
+                        # Element screenshot failed (hidden/detached) — skip this iteration
+                        continue
                     return screenshot
 
             except Exception as e:
@@ -1028,6 +1127,16 @@ class TelegramAuth:
 
             if attempt % 5 == 0 and attempt > 0:
                 logger.debug(f"Still waiting for QR... ({attempt}s)")
+
+            # FIX-2.1: Re-check page state every 10s to detect 2FA/authorized mid-wait
+            if attempt > 0 and attempt % 10 == 0:
+                try:
+                    state = await self._check_page_state(page)
+                    if state in ("2fa_required", "authorized"):
+                        logger.info(f"Page state changed to '{state}' during QR wait, aborting")
+                        return None
+                except Exception:
+                    pass
 
         return None
 
@@ -1091,7 +1200,23 @@ class TelegramAuth:
                     await page.reload(wait_until="domcontentloaded", timeout=30000)
                 except Exception as e:
                     logger.warning(f"Page reload warning: {e}")
-                await asyncio.sleep(self.QR_RETRY_DELAY)
+
+                # FIX-2.2: Check page state after reload (may show 2FA, error, already-authorized)
+                await asyncio.sleep(3)
+                try:
+                    post_reload_state = await self._check_page_state(page)
+                    if post_reload_state == "2fa_required":
+                        logger.warning("Page shows 2FA after reload, stopping QR extraction")
+                        return None
+                    if post_reload_state == "authorized":
+                        logger.info("Already authorized after reload")
+                        return None
+                except Exception:
+                    pass
+
+                # FIX-6.2: Exponential backoff between retries (capped at 25s to stay within QR token lifetime)
+                delay = min(self.QR_RETRY_DELAY * (1.5 ** retry), 25)
+                await asyncio.sleep(delay)
 
             result = await self._wait_for_qr(page)
 
@@ -1527,11 +1652,37 @@ class TelegramAuth:
                         telethon_alive=await self._verify_telethon_session(client)
                     )
 
+            # FIX-2.3: Guard against "unknown"/"loading" state fallthrough
+            if current_state in ("unknown", "loading"):
+                logger.warning(
+                    f"Page state is '{current_state}' after 10s checks — "
+                    "may be CloudFlare, blank page, or slow load. "
+                    "Proceeding with QR extraction but with reduced confidence."
+                )
+
             # 4. Ждём и декодируем QR (FIX #4: с retry)
             logger.info("[4/6] Extracting QR token...")
             token = await self._extract_qr_token_with_retry(page)
 
             if not token:
+                # FIX-C4: Re-check if browser became authorized during QR extraction
+                # (e.g., delayed AcceptLoginToken took effect, or profile was already logged in)
+                final_state = await self._check_page_state(page)
+                if final_state == "authorized":
+                    logger.info("Browser authorized during QR extraction cycle")
+                    await self._set_authorization_ttl(client)
+                    return AuthResult(
+                        success=True,
+                        profile_name=profile.name,
+                        telethon_alive=await self._verify_telethon_session(client)
+                    )
+                if final_state == "2fa_required":
+                    return AuthResult(
+                        success=False,
+                        profile_name=profile.name,
+                        required_2fa=True,
+                        error="2FA required but no password provided"
+                    )
                 return AuthResult(
                     success=False,
                     profile_name=profile.name,
@@ -1704,7 +1855,9 @@ async def migrate_accounts_batch(
     account_dirs: list[Path],
     password_2fa: Optional[str] = None,
     headless: bool = False,
-    cooldown: int = DEFAULT_ACCOUNT_COOLDOWN
+    cooldown: int = DEFAULT_ACCOUNT_COOLDOWN,
+    on_result: Optional[Callable[["AuthResult"], Any]] = None,
+    passwords_map: Optional[dict[str, str]] = None,
 ) -> list[AuthResult]:
     """
     FIX #6: Мигрирует несколько аккаунтов с cooldown между ними.
@@ -1714,6 +1867,8 @@ async def migrate_accounts_batch(
         password_2fa: Общий 2FA пароль (если одинаковый)
         headless: Headless режим
         cooldown: Секунды между аккаунтами (default 45)
+        on_result: FIX-4.2: Callback called after each account (for crash-safe DB updates)
+        passwords_map: FIX-H9: Per-account 2FA passwords {account_name: password}
 
     Returns:
         Список AuthResult
@@ -1725,12 +1880,26 @@ async def migrate_accounts_batch(
         logger.info(f"ACCOUNT {i + 1}/{len(account_dirs)}: {account_dir.name}")
         logger.info("=" * 60)
 
+        # FIX-H9: Per-account password from passwords_map overrides global password_2fa
+        account_password = password_2fa
+        if passwords_map and account_dir.name in passwords_map:
+            account_password = passwords_map[account_dir.name]
+
         result = await migrate_account(
             account_dir=account_dir,
-            password_2fa=password_2fa,
+            password_2fa=account_password,
             headless=headless
         )
         results.append(result)
+
+        # FIX-4.2: Call per-account callback for crash-safe DB updates
+        if on_result:
+            try:
+                cb_result = on_result(result)
+                if asyncio.iscoroutine(cb_result):
+                    await cb_result
+            except Exception as e:
+                logger.warning(f"on_result callback error: {e}")
 
         # FIX #6: Randomized cooldown между аккаунтами (кроме последнего)
         if i < len(account_dirs) - 1:
@@ -1936,7 +2105,8 @@ class ParallelMigrationController:
         account_dirs: list[Path],
         password_2fa: Optional[str] = None,
         headless: bool = False,
-        on_progress: Optional[ProgressCallback] = None
+        on_progress: Optional[ProgressCallback] = None,
+        passwords_map: Optional[dict[str, str]] = None,
     ) -> list[AuthResult]:
         """
         Run parallel migration with shutdown support.
@@ -2008,9 +2178,13 @@ class ParallelMigrationController:
                 try:
                     async with asyncio.timeout(TASK_TIMEOUT):
                         # FIX #13: Pass shared browser_manager
+                        # FIX-H9: Per-account password from passwords_map overrides global
+                        account_password = password_2fa
+                        if passwords_map and account_dir.name in passwords_map:
+                            account_password = passwords_map[account_dir.name]
                         result = await migrate_account(
                             account_dir=account_dir,
-                            password_2fa=password_2fa,
+                            password_2fa=account_password,
                             headless=headless,
                             browser_manager=browser_manager,
                         )
@@ -2039,7 +2213,9 @@ class ParallelMigrationController:
                     self._completed += 1
                     if on_progress:
                         try:
-                            on_progress(self._completed, self._total, result)
+                            cb_result = on_progress(self._completed, self._total, result)
+                            if asyncio.iscoroutine(cb_result):
+                                await cb_result
                         except Exception as e:
                             logger.warning(f"Progress callback error: {e}")
 

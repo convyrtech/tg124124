@@ -257,6 +257,50 @@ class Database:
                 for row in rows
             ]
 
+    async def get_counts(self) -> dict:
+        """FIX-7.2: Get account/proxy counts with SQL aggregation (no full row load).
+
+        Returns:
+            Dict with account status counts and proxy counts.
+        """
+        result = {
+            "total": 0, "healthy": 0, "migrating": 0, "errors": 0,
+            "fragment_authorized": 0, "proxies_active": 0, "proxies_total": 0,
+        }
+        # Account status counts
+        async with self._connection.execute(
+            "SELECT status, COUNT(*) as cnt FROM accounts GROUP BY status"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                result["total"] += row["cnt"]
+                if row["status"] == "healthy":
+                    result["healthy"] = row["cnt"]
+                elif row["status"] == "migrating":
+                    result["migrating"] = row["cnt"]
+                elif row["status"] == "error":
+                    result["errors"] = row["cnt"]
+
+        # Fragment status
+        async with self._connection.execute(
+            "SELECT COUNT(*) as cnt FROM accounts WHERE fragment_status = 'authorized'"
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                result["fragment_authorized"] = row["cnt"]
+
+        # Proxy counts
+        async with self._connection.execute(
+            "SELECT status, COUNT(*) as cnt FROM proxies GROUP BY status"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                result["proxies_total"] += row["cnt"]
+                if row["status"] == "active":
+                    result["proxies_active"] = row["cnt"]
+
+        return result
+
     async def update_account(self, account_id: int, **kwargs) -> None:
         """Update account fields with SQL injection protection."""
         if not kwargs:

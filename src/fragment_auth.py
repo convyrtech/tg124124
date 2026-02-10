@@ -113,7 +113,8 @@ class FragmentAuth:
             system_lang_code=device.system_lang_code,
             auto_reconnect=False,
             connection_retries=0,
-            receive_updates=False,
+            # FIX-3.1: MUST be True — event handler for 777000 codes needs update dispatch
+            receive_updates=True,
         )
 
         try:
@@ -148,7 +149,9 @@ class FragmentAuth:
             r'Код входа:\s*(\d{5,6})',
             r'login code[:\s]+(\d{5,6})',
             r'code[:\s]+(\d{5,6})',
-            r'\b(\d{5,6})\b',
+            r'code\s+is\s+(\d{5,6})',
+            # Fallback: standalone code on its own line (not embedded in unrelated numbers)
+            r'^\s*(\d{5,6})\s*$',
         ]
 
         for pattern in patterns:
@@ -175,7 +178,7 @@ class FragmentAuth:
             "authorized", "not_authorized", "loading", or "unknown"
         """
         try:
-            # Primary: check Aj.state.unAuth JS variable
+            # Primary: check Aj.state.unAuth JS variable (minified, may break on update)
             is_unauth = await page.evaluate(
                 "() => (typeof Aj !== 'undefined' && Aj.state) ? Aj.state.unAuth : null"
             )
@@ -184,10 +187,16 @@ class FragmentAuth:
             if is_unauth is True:
                 return "not_authorized"
 
-            # Fallback: check for Connect Telegram button
+            # FIX-3.2: Fallback selectors — by CSS class first, then by text content
             has_login_btn = await page.evaluate(
                 "() => !!document.querySelector('button.login-link')"
             )
+            # Text-based fallback for login button (robust against CSS class changes)
+            if not has_login_btn:
+                has_login_btn = await page.evaluate("""
+                    () => !!Array.from(document.querySelectorAll('button'))
+                        .find(b => /log\\s*in|connect\\s*telegram/i.test(b.textContent))
+                """)
             if has_login_btn:
                 return "not_authorized"
 
@@ -195,6 +204,12 @@ class FragmentAuth:
             has_logout = await page.evaluate(
                 "() => !!document.querySelector('.logout-link')"
             )
+            # Text-based fallback for logout indicator
+            if not has_logout:
+                has_logout = await page.evaluate("""
+                    () => !!Array.from(document.querySelectorAll('a, button'))
+                        .find(el => /log\\s*out|disconnect/i.test(el.textContent))
+                """)
             if has_logout:
                 return "authorized"
 
@@ -224,8 +239,24 @@ class FragmentAuth:
         Raises:
             RuntimeError: If popup doesn't appear or button not found
         """
-        popup_promise = page.wait_for_event('popup', timeout=10000)
-        await page.click('button.login-link')
+        # Wait for page JS to fully initialize before clicking
+        await asyncio.sleep(2)
+        popup_promise = page.wait_for_event('popup', timeout=20000)
+        # FIX-3.2: Try CSS class first, then text-based fallback
+        try:
+            await page.click('button.login-link')
+        except Exception:
+            # Fallback: click by text content
+            login_btn = await page.evaluate("""
+                () => {
+                    const btn = Array.from(document.querySelectorAll('button'))
+                        .find(b => /log\\s*in|connect\\s*telegram/i.test(b.textContent));
+                    if (btn) { btn.click(); return true; }
+                    return false;
+                }
+            """)
+            if not login_btn:
+                raise RuntimeError("Login button not found on fragment.com")
         popup = await popup_promise
         await popup.wait_for_load_state('domcontentloaded')
         logger.info("OAuth popup opened: %s", popup.url)
@@ -356,8 +387,18 @@ class FragmentAuth:
             if (phoneEl) phoneEl.value = phone;
         }""", formatted)
 
-        # Click submit
-        await popup.click('form#send-form button[type="submit"]')
+        # FIX-3.2: Click submit with fallback
+        try:
+            await popup.click('form#send-form button[type="submit"]')
+        except Exception:
+            await popup.evaluate("""
+                () => {
+                    const btn = document.querySelector('button[type="submit"]')
+                        || Array.from(document.querySelectorAll('button'))
+                            .find(b => /next|submit|send/i.test(b.textContent));
+                    if (btn) btn.click();
+                }
+            """)
 
         # Wait for confirmation form to appear (#login-form loses .hide class)
         try:
@@ -425,9 +466,9 @@ class FragmentAuth:
                 confirmed.set()
                 return
 
-            # Variant C: unknown message format
-            logger.warning("Unknown message from 777000: %s", event.raw_text[:100])
-            confirmed.set()
+            # Variant C: unknown message format — do NOT auto-confirm,
+            # it may be an unrelated stale message from 777000
+            logger.warning("Unknown message from 777000 (not confirming): %s", event.raw_text[:100])
 
         try:
             await asyncio.wait_for(confirmed.wait(), timeout=timeout)
