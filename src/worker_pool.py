@@ -288,11 +288,14 @@ class MigrationWorkerPool:
                     else:
                         result.error_count += 1
 
-                # Update completed count and fire progress callback
-                self._completed_count += 1
+                    # Update completed count only for final results (not retries).
+                    # Counting retries inflates progress and triggers batch pause
+                    # too frequently (every 3-4 accounts instead of every 10).
+                    self._completed_count += 1
+
                 completed = self._completed_count
 
-                if self._on_progress:
+                if self._on_progress and not is_retry:
                     try:
                         self._on_progress(completed, total, account_result)
                     except Exception as exc:
@@ -564,9 +567,11 @@ class MigrationWorkerPool:
                 f"#{retries_used + 1}/{self._max_retries}"
             )
             try:
-                self._queue.put_nowait(account_id)
-            except asyncio.QueueFull:
-                self._log(f"[Pool] {name} - queue full, retry dropped")
+                await asyncio.wait_for(
+                    self._queue.put(account_id), timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                self._log(f"[Pool] {name} - queue full after 30s, retry dropped")
                 return AccountResult(
                     account_id=account_id,
                     account_name=name,

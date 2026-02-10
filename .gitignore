@@ -20,13 +20,16 @@ build/
 
 # Project specific - SENSITIVE DATA
 accounts/
+accounts*.zip
 profiles/
 *.session
 api.json
 ___config.json
+прокси.txt
 
 # Debug files
 debug_*.png
+popup_debug_*.html
 *.png
 
 # Storage analysis (contains auth_key!)

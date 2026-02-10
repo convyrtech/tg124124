@@ -731,15 +731,24 @@ class TGWebAuthApp:
         async def do_open():
             try:
                 from ..browser_manager import BrowserManager
+                from ..telegram_auth import AccountConfig
 
                 account = await self._controller.db.get_account(account_id)
                 if not account:
                     self._log(f"[Error] Account {account_id} not found")
                     return
 
-                # Profile name is the FULL account name (directory name)
-                # e.g. "12709623038 (Софт 312)"
-                profile_name = account.name
+                # Resolve profile name via AccountConfig (same logic as migration).
+                # DB stores composite name "573189007843 (Kamila)" but profile
+                # directory is created using AccountConfig.name ("Kamila").
+                session_path = Path(account.session_path)
+                account_dir = session_path.parent
+                try:
+                    acfg = AccountConfig.load(account_dir)
+                    profile_name = acfg.name
+                except Exception:
+                    # Fallback to DB name if config is missing
+                    profile_name = account.name
                 self._log(f"[Open] Launching browser for {profile_name}...")
 
                 # Use BrowserManager directly (not CLI!)
