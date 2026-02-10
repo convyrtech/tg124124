@@ -20,6 +20,7 @@ import random
 import math
 import sqlite3
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -65,6 +66,83 @@ from .browser_manager import BrowserManager, BrowserProfile, BrowserContext
 
 if TYPE_CHECKING:
     from .resource_monitor import ResourceMonitor
+
+
+# Watchdog timeout for browser operations (seconds).
+# Kills browser process tree via threading.Timer if authorize() hangs.
+# Independent of asyncio event loop — works even when Playwright pipe I/O
+# blocks the Windows ProactorEventLoop (observed with Camoufox headless).
+BROWSER_WATCHDOG_TIMEOUT = 240  # 4 minutes
+
+
+class BrowserWatchdog:
+    """Thread-based watchdog that kills browser process tree on timeout.
+
+    When page.goto() hangs in Camoufox headless on Windows, the Playwright
+    pipe I/O can block the asyncio event loop, preventing asyncio.timeout()
+    from firing. This watchdog uses threading.Timer (OS-level, independent
+    of asyncio) to kill the browser after BROWSER_WATCHDOG_TIMEOUT seconds.
+
+    Usage:
+        watchdog = BrowserWatchdog(driver_pid, browser_pid, "account_name")
+        watchdog.start()
+        try:
+            await page.goto(...)
+        finally:
+            watchdog.cancel()
+    """
+
+    def __init__(self, driver_pid: Optional[int], browser_pid: Optional[int],
+                 profile_name: str, timeout: float = BROWSER_WATCHDOG_TIMEOUT):
+        self._driver_pid = driver_pid
+        self._browser_pid = browser_pid
+        self._profile_name = profile_name
+        self._timeout = timeout
+        self._timer = threading.Timer(timeout, self._kill)
+        self._timer.daemon = True
+
+    def start(self) -> None:
+        """Start the watchdog timer."""
+        self._timer.start()
+
+    def cancel(self) -> None:
+        """Cancel the watchdog (call in finally block)."""
+        self._timer.cancel()
+
+    def _kill(self) -> None:
+        """Kill entire browser process tree. Runs in timer thread."""
+        import psutil
+
+        logger.warning(
+            "Watchdog timeout (%ds) for '%s' — killing browser process tree "
+            "(driver PID %s, browser PID %s)",
+            self._timeout, self._profile_name,
+            self._driver_pid, self._browser_pid,
+        )
+
+        # Kill browser first, then driver (driver holds the pipe to Python)
+        for pid in [self._browser_pid, self._driver_pid]:
+            if not pid:
+                continue
+            try:
+                proc = psutil.Process(pid)
+                children = proc.children(recursive=True)
+                for child in children:
+                    try:
+                        child.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                proc.kill()
+                logger.info(
+                    "Watchdog killed PID %d for '%s'",
+                    pid, self._profile_name,
+                )
+            except psutil.NoSuchProcess:
+                pass
+            except Exception as e:
+                logger.warning(
+                    "Watchdog kill failed for PID %d: %s", pid, e,
+                )
 
 
 @dataclass
@@ -1543,6 +1621,7 @@ class TelegramAuth:
 
         client = None
         browser_ctx = None
+        watchdog = None
 
         try:
             # 1. Подключаем Telethon client
@@ -1562,6 +1641,17 @@ class TelegramAuth:
                 extra_args=browser_extra_args
             )
             page = await browser_ctx.new_page()
+
+            # Start thread-based watchdog to kill browser if authorize() hangs.
+            # Needed because Playwright pipe I/O can block asyncio event loop
+            # on Windows, preventing asyncio.timeout() from firing.
+            if browser_ctx._browser_pid or browser_ctx._driver_pid:
+                watchdog = BrowserWatchdog(
+                    driver_pid=browser_ctx._driver_pid,
+                    browser_pid=browser_ctx._browser_pid,
+                    profile_name=profile.name,
+                )
+                watchdog.start()
 
             # Устанавливаем viewport для корректного отображения QR
             await page.set_viewport_size({"width": 1280, "height": 800})
@@ -1761,6 +1851,10 @@ class TelegramAuth:
             )
 
         finally:
+            # Cancel watchdog first (before cleanup attempts that might also hang)
+            if watchdog:
+                watchdog.cancel()
+
             # FIX #5: ERROR RECOVERY - гарантированный cleanup
             if client:
                 try:

@@ -14,6 +14,7 @@ from src.browser_manager import (
     BrowserContext,
     ProfileLifecycleManager,
     _get_browser_pid,
+    _get_driver_pid,
     parse_proxy,
 )
 
@@ -457,6 +458,52 @@ class TestGetBrowserPid:
         assert _get_browser_pid(fake) is None
 
 
+class TestGetDriverPid:
+    """Tests for _get_driver_pid() function."""
+
+    def test_returns_driver_pid(self):
+        """Should return the transport process PID (Playwright driver)."""
+        fake = MagicMock()
+        fake._connection._transport._proc.pid = 1234
+        assert _get_driver_pid(fake) == 1234
+
+    def test_returns_none_on_missing_connection(self):
+        """Should return None when camoufox has no _connection."""
+        fake = MagicMock(spec=[])
+        assert _get_driver_pid(fake) is None
+
+    def test_returns_none_on_attribute_error(self):
+        """Should return None when transport chain is broken."""
+        fake = MagicMock()
+        del fake._connection
+        assert _get_driver_pid(fake) is None
+
+
+class TestBrowserContextDriverPid:
+    """Tests for _driver_pid field on BrowserContext."""
+
+    def test_driver_pid_initialized_none(self):
+        """BrowserContext._driver_pid defaults to None."""
+        profile = BrowserProfile(name="test", path=Path("/tmp/test"), proxy=None)
+        ctx = BrowserContext(
+            profile=profile,
+            browser=MagicMock(),
+            camoufox=MagicMock(),
+        )
+        assert ctx._driver_pid is None
+
+    def test_driver_pid_can_be_set(self):
+        """BrowserContext._driver_pid can be assigned after init."""
+        profile = BrowserProfile(name="test", path=Path("/tmp/test"), proxy=None)
+        ctx = BrowserContext(
+            profile=profile,
+            browser=MagicMock(),
+            camoufox=MagicMock(),
+        )
+        ctx._driver_pid = 5678
+        assert ctx._driver_pid == 5678
+
+
 class TestBrowserContextForceKill:
     """Tests for BrowserContext._force_kill_by_pid()."""
 
@@ -546,6 +593,7 @@ class TestLaunchRelayRecreation:
         with patch("src.browser_manager.ProxyRelay", FakeRelay), \
              patch("src.browser_manager.AsyncCamoufox") as MockCamoufox, \
              patch("src.browser_manager._get_browser_pid", return_value=123), \
+             patch("src.browser_manager._get_driver_pid", return_value=100), \
              patch.object(manager, "_kill_zombie_browser", new_callable=AsyncMock):
 
             mock_instance = MagicMock()
@@ -607,6 +655,7 @@ class TestLaunchRelayRecreation:
         with patch("src.browser_manager.ProxyRelay", FakeRelay), \
              patch("src.browser_manager.AsyncCamoufox") as MockCamoufox, \
              patch("src.browser_manager._get_browser_pid", return_value=456), \
+             patch("src.browser_manager._get_driver_pid", return_value=400), \
              patch.object(manager, "_kill_zombie_browser", new_callable=AsyncMock):
 
             mock_instance = MagicMock()

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from src.telegram_auth import (
     AccountConfig,
     AuthResult,
+    BrowserWatchdog,
     decode_qr_from_screenshot,
     parse_telethon_proxy,
     get_randomized_cooldown,
@@ -944,3 +945,65 @@ class TestParallelMigrationControllerCooldownAfterCompletion:
 
         # Both should complete
         assert len(timestamps) == 2
+
+
+class TestBrowserWatchdog:
+    """Tests for BrowserWatchdog thread-based timeout mechanism."""
+
+    def test_watchdog_cancel_prevents_kill(self):
+        """Cancelled watchdog does not call kill."""
+        import time
+        watchdog = BrowserWatchdog(
+            driver_pid=99999, browser_pid=99998,
+            profile_name="test", timeout=0.2,
+        )
+        watchdog.start()
+        watchdog.cancel()
+        time.sleep(0.5)
+        # If kill was called, it would try psutil.Process(99999) and fail,
+        # but cancel should prevent it entirely.
+
+    def test_watchdog_fires_and_kills_process(self):
+        """Watchdog kills process after timeout."""
+        import time
+        import subprocess
+        import sys
+
+        # Start a dummy long-running process to kill
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        pid = proc.pid
+
+        watchdog = BrowserWatchdog(
+            driver_pid=None, browser_pid=pid,
+            profile_name="test_kill", timeout=0.3,
+        )
+        watchdog.start()
+        time.sleep(1)  # Wait for watchdog to fire
+
+        # Process should be dead
+        assert proc.poll() is not None, "Watchdog did not kill the process"
+        watchdog.cancel()  # Cleanup (no-op after fire)
+
+    def test_watchdog_handles_nonexistent_pid(self):
+        """Watchdog gracefully handles PIDs that don't exist."""
+        import time
+        watchdog = BrowserWatchdog(
+            driver_pid=999999, browser_pid=999998,
+            profile_name="ghost", timeout=0.1,
+        )
+        watchdog.start()
+        time.sleep(0.5)
+        # Should not raise — NoSuchProcess is caught internally
+        watchdog.cancel()
+
+    def test_watchdog_timer_is_daemon(self):
+        """Watchdog thread is daemon (won't prevent process exit)."""
+        watchdog = BrowserWatchdog(
+            driver_pid=1, browser_pid=2,
+            profile_name="test", timeout=999,
+        )
+        assert watchdog._timer.daemon is True
+        watchdog.cancel()

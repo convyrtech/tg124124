@@ -76,6 +76,26 @@ def _rmtree_force(path: Path) -> None:
         shutil.rmtree(path, onerror=_on_rmtree_error)
 
 
+def _get_driver_pid(camoufox_instance) -> Optional[int]:
+    """Extract Playwright driver process PID (root of browser process tree).
+
+    This is the node.exe/driver process that communicates with Python via pipe.
+    Killing this process cascades to all child processes (firefox/camoufox).
+
+    Args:
+        camoufox_instance: AsyncCamoufox context manager instance.
+
+    Returns:
+        PID of the driver process, or None if not found.
+    """
+    try:
+        transport = camoufox_instance._connection._transport
+        return transport._proc.pid
+    except Exception as e:
+        logger.debug("Could not extract driver PID: %s", e)
+        return None
+
+
 def _get_browser_pid(camoufox_instance) -> Optional[int]:
     """Extract PID of camoufox.exe via psutil process tree.
 
@@ -628,6 +648,7 @@ class BrowserManager:
                     )
 
             browser_pid = _get_browser_pid(camoufox)
+            driver_pid = _get_driver_pid(camoufox)
 
             ctx = BrowserContext(
                 profile=profile,
@@ -637,6 +658,7 @@ class BrowserManager:
                 manager=self,  # Back-reference for cleanup
             )
             ctx._browser_pid = browser_pid
+            ctx._driver_pid = driver_pid
 
             self._active_browsers[profile.name] = ctx
             return ctx
@@ -681,6 +703,7 @@ class BrowserContext:
         self._page = None
         self._closed = False
         self._browser_pid: Optional[int] = None
+        self._driver_pid: Optional[int] = None
 
     async def new_page(self):
         """
