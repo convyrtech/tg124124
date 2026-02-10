@@ -28,6 +28,9 @@ from typing import Optional, Tuple, Dict, Any, Callable, Set, TYPE_CHECKING
 # Logger for this module
 logger = logging.getLogger(__name__)
 
+# Suppress noisy Telethon internal logs
+logging.getLogger('telethon').setLevel(logging.ERROR)
+
 # QR decoding - use OpenCV (works on Windows without extra DLLs)
 try:
     import cv2
@@ -564,6 +567,9 @@ class TelegramAuth:
             app_version=device.app_version,
             lang_code=device.lang_code,
             system_lang_code=device.system_lang_code,
+            auto_reconnect=False,
+            connection_retries=0,
+            receive_updates=False,
         )
 
         # FIX-006: Timeout на connect() чтобы не зависать навечно

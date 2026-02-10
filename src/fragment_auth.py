@@ -111,6 +111,9 @@ class FragmentAuth:
             app_version=device.app_version,
             lang_code=device.lang_code,
             system_lang_code=device.system_lang_code,
+            auto_reconnect=False,
+            connection_retries=0,
+            receive_updates=False,
         )
 
         try:
