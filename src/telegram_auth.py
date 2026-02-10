@@ -1858,6 +1858,7 @@ async def migrate_accounts_batch(
     cooldown: int = DEFAULT_ACCOUNT_COOLDOWN,
     on_result: Optional[Callable[["AuthResult"], Any]] = None,
     passwords_map: Optional[dict[str, str]] = None,
+    proxy_map: Optional[dict[str, str]] = None,
 ) -> list[AuthResult]:
     """
     FIX #6: Мигрирует несколько аккаунтов с cooldown между ними.
@@ -1869,6 +1870,7 @@ async def migrate_accounts_batch(
         cooldown: Секунды между аккаунтами (default 45)
         on_result: FIX-4.2: Callback called after each account (for crash-safe DB updates)
         passwords_map: FIX-H9: Per-account 2FA passwords {account_name: password}
+        proxy_map: DB proxy overrides {account_name: "socks5:host:port:user:pass"}
 
     Returns:
         Список AuthResult
@@ -1885,10 +1887,14 @@ async def migrate_accounts_batch(
         if passwords_map and account_dir.name in passwords_map:
             account_password = passwords_map[account_dir.name]
 
+        # DB proxy override (takes priority over ___config.json)
+        account_proxy = proxy_map.get(account_dir.name) if proxy_map else None
+
         result = await migrate_account(
             account_dir=account_dir,
             password_2fa=account_password,
-            headless=headless
+            headless=headless,
+            proxy_override=account_proxy,
         )
         results.append(result)
 
@@ -2107,6 +2113,7 @@ class ParallelMigrationController:
         headless: bool = False,
         on_progress: Optional[ProgressCallback] = None,
         passwords_map: Optional[dict[str, str]] = None,
+        proxy_map: Optional[dict[str, str]] = None,
     ) -> list[AuthResult]:
         """
         Run parallel migration with shutdown support.
@@ -2182,11 +2189,14 @@ class ParallelMigrationController:
                         account_password = password_2fa
                         if passwords_map and account_dir.name in passwords_map:
                             account_password = passwords_map[account_dir.name]
+                        # DB proxy override (takes priority over ___config.json)
+                        account_proxy = proxy_map.get(account_dir.name) if proxy_map else None
                         result = await migrate_account(
                             account_dir=account_dir,
                             password_2fa=account_password,
                             headless=headless,
                             browser_manager=browser_manager,
+                            proxy_override=account_proxy,
                         )
                 except asyncio.TimeoutError:
                     logger.warning(f"Task timeout after {TASK_TIMEOUT}s for {account_dir.name}")

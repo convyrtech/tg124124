@@ -244,10 +244,22 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
         # FIX #8: Безопасное получение пароля (CLI arg > password-file > env)
         password_2fa = password or passwords_map.get(account_dir.name) or get_2fa_password(account_dir.name, None)
 
+        # Load proxy from DB for this account (overrides ___config.json)
+        async def _get_single_proxy():
+            db = await _connect_db()
+            try:
+                pmap = await db.get_proxy_map()
+                return pmap.get(account_dir.name)
+            finally:
+                await db.close()
+
+        single_proxy = asyncio.run(_get_single_proxy())
+
         result = asyncio.run(migrate_account(
             account_dir=account_dir,
             password_2fa=password_2fa,
-            headless=headless
+            headless=headless,
+            proxy_override=single_proxy,
         ))
 
         if result.success:
@@ -368,6 +380,23 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
         # FIX #8: Безопасное получение пароля (CLI arg or env)
         password_2fa = get_2fa_password("all", password)
 
+        # Load proxy map from DB (overrides ___config.json proxies)
+        proxy_map = None
+
+        async def _load_proxy_map():
+            db = await _connect_db()
+            try:
+                return await db.get_proxy_map()
+            finally:
+                await db.close()
+
+        try:
+            proxy_map = asyncio.run(_load_proxy_map())
+            if proxy_map:
+                click.echo(f"DB прокси загружены для {len(proxy_map)} аккаунтов")
+        except Exception as e:
+            logger.warning(f"Could not load proxy map from DB: {e}")
+
         if parallel > 0 or auto_scale:
             # Параллельный режим
             from .resource_monitor import ResourceMonitor
@@ -435,6 +464,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                         headless=headless,
                         on_progress=_on_progress_async,
                         passwords_map=passwords_map if passwords_map else None,
+                        proxy_map=proxy_map,
                     )
                 finally:
                     await _close_parallel_db()
@@ -473,6 +503,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                         cooldown=cooldown,
                         on_result=_on_result_sequential,
                         passwords_map=passwords_map if passwords_map else None,
+                        proxy_map=proxy_map,
                     )
                 finally:
                     if _seq_db:

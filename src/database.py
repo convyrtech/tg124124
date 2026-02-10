@@ -487,6 +487,28 @@ class Database:
                 for row in rows
             ]
 
+    async def get_proxy_map(self) -> dict[str, str]:
+        """Get proxy map {account_name: "socks5:host:port:user:pass"} for all accounts with assigned proxy.
+
+        Returns proxy strings from DB that can be used as proxy_override in TelegramAuth.
+        """
+        query = """
+            SELECT a.name, p.protocol, p.host, p.port, p.username, p.password
+            FROM accounts a
+            JOIN proxies p ON a.proxy_id = p.id
+            WHERE a.proxy_id IS NOT NULL AND p.status = 'active'
+        """
+        async with self._connection.execute(query) as cursor:
+            rows = await cursor.fetchall()
+            result = {}
+            for row in rows:
+                proto = row["protocol"] or "socks5"
+                parts = [proto, row["host"], str(row["port"])]
+                if row["username"] and row["password"]:
+                    parts.extend([row["username"], row["password"]])
+                result[row["name"]] = ":".join(parts)
+            return result
+
     # ==================== Migration Tracking ====================
 
     async def start_migration(self, account_id: int) -> int:
