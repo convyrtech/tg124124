@@ -43,7 +43,7 @@ class ProxyConfig:
         elif len(parts) == 3:
             proto, host, port = parts
             return cls(proto, host, int(port))
-        raise ValueError(f"Invalid proxy format: {proxy_str}")
+        raise ValueError("Invalid proxy format (expected protocol:host:port[:user:pass])")
 
     @property
     def has_auth(self) -> bool:

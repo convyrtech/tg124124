@@ -156,6 +156,11 @@ class MigrationWorkerPool:
         # Retry tracking: account_id -> attempts_used
         self._retry_counts: dict[int, int] = {}
 
+        # FIX #5: Shared event for batch pause — all workers wait on this.
+        # Set = running, cleared = paused.
+        self._batch_pause_event = asyncio.Event()
+        self._batch_pause_event.set()  # Start in running state
+
     def request_shutdown(self) -> None:
         """Request graceful shutdown. Workers finish current task and exit."""
         self._shutdown_event.set()
@@ -174,11 +179,18 @@ class MigrationWorkerPool:
         if not account_ids:
             return PoolResult()
 
+        # FIX #6: Deduplicate to prevent two workers opening same .session
+        # (AUTH_KEY_DUPLICATED = session death). Preserves order.
+        account_ids = list(dict.fromkeys(account_ids))
+
         self._shutdown_event.clear()
         self._completed_count = 0
         self._retry_counts.clear()
         # Recreate queue to ensure clean state
         self._queue = asyncio.Queue(maxsize=self._num_workers * 2)
+        # FIX #5: Reset batch pause event to running state
+        self._batch_pause_event = asyncio.Event()
+        self._batch_pause_event.set()
 
         total = len(account_ids)
         result = PoolResult(total=total)
@@ -201,8 +213,16 @@ class MigrationWorkerPool:
             # Wait for producer to finish feeding the queue
             await producer
 
-            # Wait until all items (including retries) are processed via queue.join()
-            await self._queue.join()
+            # FIX #12: queue.join() with timeout to prevent hanging if a worker crashes.
+            # Timeout = (task_timeout * num_workers) + 60s buffer.
+            join_timeout = self._task_timeout * self._num_workers + 60
+            try:
+                await asyncio.wait_for(self._queue.join(), timeout=join_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Queue join timed out after %.0fs — sending stop sentinels anyway",
+                    join_timeout,
+                )
 
             # Send stop sentinels for each worker
             for _ in range(self._num_workers):
@@ -245,6 +265,10 @@ class MigrationWorkerPool:
             result: Shared PoolResult to record outcomes.
         """
         while True:
+            # FIX #5: Wait for batch pause to clear before taking next item.
+            # All workers block here when batch pause is active.
+            await self._batch_pause_event.wait()
+
             account_id = await self._queue.get()
 
             if account_id == _STOP_SENTINEL:
@@ -354,6 +378,26 @@ class MigrationWorkerPool:
                     error="SKIP: Shutdown during circuit breaker wait",
                 )
 
+        # FIX #4: In half-open state, only one worker probes.
+        # acquire_half_open_probe() returns False if another worker is already probing.
+        if self._circuit_breaker.is_open:
+            if not await self._circuit_breaker.acquire_half_open_probe():
+                # Another worker is probing — wait for probe result
+                wait_time = self._circuit_breaker.time_until_reset() or 5.0
+                self._log(
+                    f"[W{worker_id}] Circuit breaker half-open, "
+                    f"another worker is probing — waiting {wait_time:.0f}s..."
+                )
+                await self._interruptible_sleep(wait_time)
+                # Re-check after wait — the probe worker may have closed the circuit
+                if not self._circuit_breaker.can_proceed():
+                    return AccountResult(
+                        account_id=account_id,
+                        account_name=name,
+                        success=False,
+                        error="RETRY: Circuit breaker still open after probe",
+                    )
+
         # Check resource availability
         if not self._resource_monitor.can_launch_more():
             self._log(
@@ -439,6 +483,7 @@ class MigrationWorkerPool:
                     account_id, name, "error", error_msg
                 )
             self._circuit_breaker.record_failure()
+            self._circuit_breaker.release_half_open_probe()  # FIX #4
             return await self._maybe_retry(
                 account_id, name, error_msg, retries
             )
@@ -454,6 +499,7 @@ class MigrationWorkerPool:
                     account_id, name, "error", error_msg
                 )
             self._circuit_breaker.record_failure()
+            self._circuit_breaker.release_half_open_probe()  # FIX #4
             return await self._maybe_retry(
                 account_id, name, error_msg, retries
             )
@@ -484,6 +530,7 @@ class MigrationWorkerPool:
                     except Exception as exc:
                         logger.warning("DB update username for %s: %s", name, exc)
             self._circuit_breaker.record_success()
+            self._circuit_breaker.release_half_open_probe()  # FIX #4
             self._log(f"[W{worker_id}] {name} - OK")
             return AccountResult(
                 account_id=account_id,
@@ -502,6 +549,7 @@ class MigrationWorkerPool:
                     account_id, name, "error", error_msg
                 )
             self._circuit_breaker.record_failure()
+            self._circuit_breaker.release_half_open_probe()  # FIX #4
             self._log(f"[W{worker_id}] {name} - FAILED: {humanize_error(error_msg)}")
             return await self._maybe_retry(
                 account_id, name, error_msg, retries
@@ -617,11 +665,15 @@ class MigrationWorkerPool:
         """
         Apply per-worker cooldown and global batch pause.
 
+        FIX #5: Batch pause uses shared asyncio.Event to pause ALL workers,
+        not just the one whose modulo count happens to hit the threshold.
+
         Args:
             completed_total: Total completed across all workers.
             is_flood_wait: If True, triple the cooldown.
         """
-        # Batch pause check (global, every N completed)
+        # FIX #5: Batch pause check — CLEAR event to block ALL workers,
+        # then SET after pause to release them.
         if (
             self._batch_pause_every > 0
             and completed_total > 0
@@ -632,7 +684,11 @@ class MigrationWorkerPool:
                 f"[Pool] Batch pause {pause / 60:.1f} min "
                 f"(every {self._batch_pause_every} accounts)..."
             )
+            # Clear event — all workers will block at top of their loop
+            self._batch_pause_event.clear()
             await self._interruptible_sleep(pause)
+            # Set event — release all workers
+            self._batch_pause_event.set()
             return  # Batch pause replaces regular cooldown
 
         # Regular per-worker cooldown

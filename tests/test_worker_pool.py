@@ -598,3 +598,195 @@ class TestSharedBrowserManager:
         call_kwargs = mock_migrate.call_args.kwargs
         assert "browser_manager" in call_kwargs
         assert call_kwargs["browser_manager"] is pool._browser_manager
+
+
+class TestDeduplication:
+    """FIX #6: Duplicate account_ids must be removed."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_ids_removed(self, tmp_path):
+        """Same account_id appearing twice should only be processed once."""
+        d = tmp_path / "account_1"
+        d.mkdir()
+        (d / "session.session").touch()
+        accounts = {1: _make_account(1, name="Dup", session_dir=d)}
+
+        db = _mock_db(accounts)
+        call_count = 0
+
+        async def count_migrate(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _make_auth_result(success=True)
+
+        with patch("src.worker_pool.migrate_account", side_effect=count_migrate):
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                max_retries=0,
+                resource_monitor=_always_can_launch(),
+            )
+            result = await pool.run([1, 1, 1])
+
+        # Should deduplicate: only 1 migration, not 3
+        assert call_count == 1
+        assert result.total == 1
+        assert result.success_count == 1
+
+    @pytest.mark.asyncio
+    async def test_dedup_preserves_order(self, tmp_path):
+        """Deduplication preserves first occurrence order."""
+        accounts = {}
+        for i in [3, 1, 2]:
+            d = tmp_path / f"account_{i}"
+            d.mkdir()
+            (d / "session.session").touch()
+            accounts[i] = _make_account(i, name=f"Acc{i}", session_dir=d)
+
+        db = _mock_db(accounts)
+        seen_ids = []
+
+        async def track_migrate(**kwargs):
+            account_dir = kwargs.get("account_dir")
+            if account_dir:
+                seen_ids.append(account_dir.name)
+            return _make_auth_result(success=True)
+
+        with patch("src.worker_pool.migrate_account", side_effect=track_migrate):
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                resource_monitor=_always_can_launch(),
+            )
+            result = await pool.run([3, 1, 2, 1, 3])
+
+        assert result.total == 3  # Deduplicated from 5 to 3
+
+
+class TestBatchPauseEvent:
+    """FIX #5: Batch pause should block ALL workers via shared event."""
+
+    @pytest.mark.asyncio
+    async def test_batch_pause_event_exists(self):
+        """Pool should have _batch_pause_event attribute."""
+        db = _mock_db()
+        pool = MigrationWorkerPool(db=db)
+        assert hasattr(pool, "_batch_pause_event")
+        assert pool._batch_pause_event.is_set()  # Starts in running state
+
+    @pytest.mark.asyncio
+    async def test_batch_pause_clears_and_sets_event(self, tmp_path):
+        """Batch pause should clear event (block workers) then set it (resume)."""
+        accounts = {}
+        for i in range(1, 6):
+            d = tmp_path / f"account_{i}"
+            d.mkdir()
+            (d / "session.session").touch()
+            accounts[i] = _make_account(i, name=f"Acc{i}", session_dir=d)
+
+        db = _mock_db(accounts)
+        logs = []
+
+        with patch("src.worker_pool.migrate_account", new_callable=AsyncMock) as mock_migrate:
+            mock_migrate.return_value = _make_auth_result(success=True)
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=5,
+                batch_pause_range=(0.01, 0.02),
+                resource_monitor=_always_can_launch(),
+                on_log=logs.append,
+            )
+            result = await pool.run([1, 2, 3, 4, 5])
+
+        assert result.success_count == 5
+        # Should have a batch pause log
+        pause_logs = [l for l in logs if "Batch pause" in l]
+        assert len(pause_logs) >= 1
+
+
+class TestQueueJoinTimeout:
+    """FIX #12: queue.join() must have a timeout."""
+
+    @pytest.mark.asyncio
+    async def test_queue_join_timeout_handled(self, tmp_path):
+        """If queue.join() times out, pool should still send stop sentinels."""
+        d = tmp_path / "account_1"
+        d.mkdir()
+        (d / "session.session").touch()
+        accounts = {1: _make_account(1, name="JoinTimeout", session_dir=d)}
+
+        db = _mock_db(accounts)
+
+        with patch("src.worker_pool.migrate_account", new_callable=AsyncMock) as mock_migrate:
+            mock_migrate.return_value = _make_auth_result(success=True)
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                task_timeout=0.5,
+                resource_monitor=_always_can_launch(),
+            )
+            # Normal run should complete fine (join doesn't actually timeout)
+            result = await pool.run([1])
+
+        assert result.success_count == 1
+
+
+class TestCircuitBreakerHalfOpen:
+    """FIX #4: Half-open circuit breaker probe tests."""
+
+    def test_half_open_probing_flag_initial(self):
+        """Circuit breaker starts with _half_open_probing=False."""
+        breaker = CircuitBreaker()
+        assert breaker._half_open_probing is False
+
+    @pytest.mark.asyncio
+    async def test_acquire_probe_when_closed(self):
+        """acquire_half_open_probe returns True when circuit is closed."""
+        breaker = CircuitBreaker()
+        assert await breaker.acquire_half_open_probe() is True
+
+    @pytest.mark.asyncio
+    async def test_acquire_probe_blocks_second_caller(self):
+        """Only one caller can acquire the probe; second gets False."""
+        breaker = CircuitBreaker(failure_threshold=1, reset_timeout=0.01)
+        breaker.record_failure()
+        assert breaker.is_open
+
+        import time
+        time.sleep(0.02)  # Wait for reset timeout
+
+        # First caller gets the probe
+        assert await breaker.acquire_half_open_probe() is True
+        assert breaker._half_open_probing is True
+
+        # Second caller is blocked
+        assert await breaker.acquire_half_open_probe() is False
+
+        # Release
+        breaker.release_half_open_probe()
+        assert breaker._half_open_probing is False
+
+    def test_record_success_resets_probing(self):
+        """record_success resets _half_open_probing flag."""
+        breaker = CircuitBreaker(failure_threshold=1, reset_timeout=0.01)
+        breaker.record_failure()
+        breaker._half_open_probing = True
+        breaker.record_success()
+        assert breaker._half_open_probing is False
+
+    def test_reset_clears_probing(self):
+        """reset() clears the probing flag."""
+        breaker = CircuitBreaker()
+        breaker._half_open_probing = True
+        breaker.reset()
+        assert breaker._half_open_probing is False

@@ -343,7 +343,21 @@ class Database:
             return None
 
     async def assign_proxy(self, account_id: int, proxy_id: int) -> None:
-        """Assign proxy to account (1:1 binding)."""
+        """Assign proxy to account (1:1 binding).
+
+        Raises:
+            ValueError: If proxy is already assigned to a different account.
+        """
+        # Check if proxy is already assigned to a different account
+        async with self._connection.execute(
+            "SELECT assigned_account_id FROM proxies WHERE id = ?", (proxy_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] is not None and row[0] != account_id:
+                raise ValueError(
+                    f"Proxy {proxy_id} already assigned to account {row[0]}"
+                )
+
         await self._connection.execute(
             "UPDATE accounts SET proxy_id = ? WHERE id = ?",
             (proxy_id, account_id)

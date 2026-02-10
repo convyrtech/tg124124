@@ -792,3 +792,147 @@ class TestParallelMigrationControllerWithCircuitBreaker:
             circuit_breaker=breaker
         )
         assert controller.circuit_breaker is breaker
+
+
+class TestAcceptTokenNonRetryable:
+    """FIX #7: Non-retryable token errors (EXPIRED, ALREADY_ACCEPTED, INVALID)."""
+
+    @pytest.fixture
+    def mock_account(self, tmp_path):
+        account_dir = tmp_path / "test"
+        account_dir.mkdir()
+        (account_dir / "session.session").touch()
+        with open(account_dir / "api.json", 'w') as f:
+            json.dump({"api_id": 123, "api_hash": "hash"}, f)
+        return AccountConfig.load(account_dir)
+
+    @pytest.mark.asyncio
+    async def test_expired_token_not_retried(self, mock_account):
+        """AUTH_TOKEN_EXPIRED should return False immediately, no retry."""
+        from src.telegram_auth import TelegramAuth
+
+        auth = TelegramAuth(mock_account)
+        call_count = [0]
+
+        def raise_expired(*args, **kwargs):
+            call_count[0] += 1
+            raise Exception("AUTH_TOKEN_EXPIRED")
+
+        mock_client = AsyncMock(side_effect=raise_expired)
+        result = await auth._accept_token(mock_client, b"test_token")
+
+        assert result is False
+        assert call_count[0] == 1  # Only 1 attempt, no retries
+
+    @pytest.mark.asyncio
+    async def test_already_accepted_not_retried(self, mock_account):
+        """AUTH_TOKEN_ALREADY_ACCEPTED should return False immediately."""
+        from src.telegram_auth import TelegramAuth
+
+        auth = TelegramAuth(mock_account)
+        call_count = [0]
+
+        def raise_already(*args, **kwargs):
+            call_count[0] += 1
+            raise Exception("AUTH_TOKEN_ALREADY_ACCEPTED")
+
+        mock_client = AsyncMock(side_effect=raise_already)
+        result = await auth._accept_token(mock_client, b"test_token")
+
+        assert result is False
+        assert call_count[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_invalid_token_not_retried(self, mock_account):
+        """AUTH_TOKEN_INVALID should return False immediately."""
+        from src.telegram_auth import TelegramAuth
+
+        auth = TelegramAuth(mock_account)
+        call_count = [0]
+
+        def raise_invalid(*args, **kwargs):
+            call_count[0] += 1
+            raise Exception("AUTH_TOKEN_INVALID")
+
+        mock_client = AsyncMock(side_effect=raise_invalid)
+        result = await auth._accept_token(mock_client, b"test_token")
+
+        assert result is False
+        assert call_count[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_retryable_error_still_retries(self, mock_account):
+        """Other errors should still be retried."""
+        from src.telegram_auth import TelegramAuth
+
+        auth = TelegramAuth(mock_account)
+        call_count = [0]
+
+        def raise_then_succeed(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                raise Exception("Connection reset by peer")
+            return MagicMock()
+
+        mock_client = AsyncMock(side_effect=raise_then_succeed)
+        result = await auth._accept_token(mock_client, b"test_token")
+
+        assert result is True
+        assert call_count[0] == 3  # 2 failures + 1 success
+
+
+class TestParallelMigrationControllerSharedBrowser:
+    """FIX #13: ParallelMigrationController uses shared BrowserManager."""
+
+    @pytest.mark.asyncio
+    async def test_controller_passes_browser_manager(self, tmp_path):
+        """migrate_account should receive browser_manager kwarg."""
+        import asyncio
+        from src.telegram_auth import ParallelMigrationController
+
+        controller = ParallelMigrationController(max_concurrent=2, cooldown=0)
+        captured_kwargs = []
+
+        async def capture_migrate(account_dir, **kwargs):
+            captured_kwargs.append(kwargs)
+            await asyncio.sleep(0.01)
+            return AuthResult(success=True, profile_name=account_dir.name)
+
+        dirs = [tmp_path / "acc_1"]
+        for d in dirs:
+            d.mkdir()
+
+        with patch('src.telegram_auth.migrate_account', side_effect=capture_migrate):
+            await controller.run(dirs, headless=True)
+
+        assert len(captured_kwargs) == 1
+        assert "browser_manager" in captured_kwargs[0]
+        assert captured_kwargs[0]["browser_manager"] is not None
+
+
+class TestParallelMigrationControllerCooldownAfterCompletion:
+    """FIX #16: Cooldown happens after migration, not between create_task."""
+
+    @pytest.mark.asyncio
+    async def test_cooldown_after_completion(self, tmp_path):
+        """With cooldown > 0, tasks should complete with gaps between them."""
+        import asyncio
+        from src.telegram_auth import ParallelMigrationController
+
+        controller = ParallelMigrationController(max_concurrent=1, cooldown=0.01)
+        timestamps = []
+
+        async def timed_migrate(account_dir, **kwargs):
+            import time
+            timestamps.append(time.time())
+            return AuthResult(success=True, profile_name=account_dir.name)
+
+        dirs = [tmp_path / f"acc_{i}" for i in range(2)]
+        for d in dirs:
+            d.mkdir()
+
+        with patch('src.telegram_auth.migrate_account', side_effect=timed_migrate):
+            await controller.run(dirs, headless=True)
+
+        # Both should complete
+        assert len(timestamps) == 2

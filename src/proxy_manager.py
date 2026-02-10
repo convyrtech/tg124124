@@ -8,6 +8,7 @@ from typing import Optional
 
 from .database import Database, ProxyRecord
 from .proxy_health import check_proxy_connection
+from .utils import mask_proxy_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +215,7 @@ class ProxyManager:
                 host, port, username, password, protocol = parse_proxy_line(line)
                 if not host or not port:
                     counters["errors"] += 1
-                    logger.warning("Invalid proxy format, skipping: %s", line[:50])
+                    logger.warning("Invalid proxy format, skipping: %s", mask_proxy_credentials(line.strip()))
                     continue
 
                 await self.db.add_proxy(

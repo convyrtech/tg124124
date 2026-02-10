@@ -2,8 +2,9 @@
 import sys
 import dearpygui.dearpygui as dpg
 from pathlib import Path
-from typing import Optional, List, Callable
+from typing import Optional, List, Callable, Dict
 import asyncio
+import collections
 import threading
 import queue
 import time
@@ -81,6 +82,14 @@ class TGWebAuthApp:
         self._migration_cancel: bool = False
         self._active_pool = None
         self._last_table_refresh: float = 0.0
+        # Fix #10: O(1) log append with bounded deque instead of O(n) string concat
+        self._log_lines: collections.deque = collections.deque(maxlen=500)
+        self._log_lines.append("[System] TG Web Auth started")
+        # Fix #9: Track per-row action buttons for disabling during batch
+        self._row_action_buttons: List[int] = []
+        # Fix #11: Track status/fragment cells for incremental updates
+        self._status_cells: Dict[int, int] = {}
+        self._fragment_cells: Dict[int, int] = {}
 
     def _start_async_loop(self) -> None:
         """Start async event loop in background thread."""
@@ -497,11 +506,15 @@ class TGWebAuthApp:
         self._run_async(do_load())
 
     def _log(self, message: str) -> None:
-        """Add message to log (thread-safe)."""
+        """Add message to log (thread-safe).
+
+        Uses a bounded deque (maxlen=500) to avoid O(n^2) string concat.
+        At 1000 accounts the old approach copied megabytes per append.
+        """
         def do_log():
             if dpg.does_item_exist("log_output"):
-                current = dpg.get_value("log_output")
-                dpg.set_value("log_output", current + message + "\n")
+                self._log_lines.append(message)
+                dpg.set_value("log_output", "\n".join(self._log_lines))
 
         # If called from main thread, do directly; otherwise queue
         try:
@@ -564,11 +577,19 @@ class TGWebAuthApp:
             logger.error("Update stats error: %s", e)
 
     def _update_accounts_table_sync(self, accounts: List[AccountRecord], proxies_map: dict = None) -> None:
-        """Update table on main thread."""
+        """Update table on main thread (full rebuild)."""
         try:
             # Clear existing rows
             for child in dpg.get_item_children("accounts_table", 1) or []:
                 dpg.delete_item(child)
+
+            # Reset tracked widgets
+            self._row_action_buttons.clear()
+            self._status_cells.clear()
+            self._fragment_cells.clear()
+
+            # Determine if batch buttons should be disabled (batch is running)
+            batch_running = self._active_pool is not None
 
             # Add rows
             for account in accounts:
@@ -582,14 +603,16 @@ class TGWebAuthApp:
                     # Username
                     dpg.add_text(account.username or "-")
 
-                    # Status with color
+                    # Status with color (Fix #11: track cell tag for incremental updates)
                     status_text = dpg.add_text(account.status)
+                    self._status_cells[account.id] = status_text
                     if account.status in self._status_themes:
                         dpg.bind_item_theme(status_text, self._status_themes[account.status])
 
-                    # Fragment status
+                    # Fragment status (Fix #11: track cell tag)
                     frag = account.fragment_status or "-"
                     frag_text = dpg.add_text(frag)
+                    self._fragment_cells[account.id] = frag_text
                     if frag == "authorized":
                         dpg.bind_item_theme(frag_text, self._status_themes.get("healthy"))
 
@@ -603,32 +626,43 @@ class TGWebAuthApp:
                         proxy_text = "-"
                     dpg.add_text(proxy_text)
 
-                    # Actions
+                    # Actions (Fix #9: track buttons for batch disable)
                     with dpg.group(horizontal=True):
-                        dpg.add_button(
+                        btn_open = dpg.add_button(
                             label="Open",
                             callback=self._open_profile,
                             user_data=account.id,
                             width=50
                         )
-                        dpg.add_button(
+                        self._row_action_buttons.append(btn_open)
+                        btn_migrate = dpg.add_button(
                             label="Migrate",
                             callback=self._migrate_single,
                             user_data=account.id,
                             width=55
                         )
-                        dpg.add_button(
+                        self._row_action_buttons.append(btn_migrate)
+                        btn_proxy = dpg.add_button(
                             label="Proxy",
                             callback=self._show_assign_proxy_dialog,
                             user_data=account.id,
                             width=45
                         )
-                        dpg.add_button(
+                        self._row_action_buttons.append(btn_proxy)
+                        btn_frag = dpg.add_button(
                             label="Frag",
                             callback=self._fragment_single,
                             user_data=account.id,
                             width=40
                         )
+                        self._row_action_buttons.append(btn_frag)
+
+            # If a batch is running, keep per-row buttons disabled
+            if batch_running:
+                for btn_tag in self._row_action_buttons:
+                    if dpg.does_item_exist(btn_tag):
+                        dpg.configure_item(btn_tag, enabled=False)
+
         except Exception as e:
             logger.error("Update accounts table error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Table update: {e}")
@@ -791,6 +825,10 @@ class TGWebAuthApp:
 
     def _migrate_single(self, sender, app_data, user_data) -> None:
         """Migrate single account."""
+        # Fix #9: Guard against concurrent session use during batch ops
+        if self._active_pool:
+            self._log("[Migrate] Batch in progress, please wait")
+            return
         account_id = user_data
         self._log(f"[Migrate] Button clicked for account {account_id}")
 
@@ -873,6 +911,10 @@ class TGWebAuthApp:
 
     def _fragment_single(self, sender, app_data, user_data) -> None:
         """Authorize single account on fragment.com."""
+        # Fix #9: Guard against concurrent session use during batch ops
+        if self._active_pool:
+            self._log("[Fragment] Batch in progress, please wait")
+            return
         account_id = user_data
         self._log(f"[Fragment] Button clicked for account {account_id}")
 
@@ -910,18 +952,22 @@ class TGWebAuthApp:
                 if proxy_str:
                     config.proxy = proxy_str
 
+                # Fix #3: BrowserManager must be cleaned up in finally
                 browser_manager = BrowserManager()
-                auth = FragmentAuth(config, browser_manager)
-                result = await auth.connect(headless=False)
+                try:
+                    auth = FragmentAuth(config, browser_manager)
+                    result = await auth.connect(headless=False)
 
-                if result.success:
-                    status = "already authorized" if result.already_authorized else "connected"
-                    self._log(f"[Fragment] {account.name} - {status}")
-                    await self._controller.db.update_account(
-                        account_id, fragment_status="authorized"
-                    )
-                else:
-                    self._log(f"[Fragment] {account.name} - FAILED: {result.error}")
+                    if result.success:
+                        status = "already authorized" if result.already_authorized else "connected"
+                        self._log(f"[Fragment] {account.name} - {status}")
+                        await self._controller.db.update_account(
+                            account_id, fragment_status="authorized"
+                        )
+                    else:
+                        self._log(f"[Fragment] {account.name} - FAILED: {result.error}")
+                finally:
+                    await browser_manager.close_all()
 
                 self._schedule_ui(lambda: self._refresh_table_async())
 
@@ -943,15 +989,49 @@ class TGWebAuthApp:
             return f"{proxy.protocol}:{proxy.host}:{proxy.port}:{proxy.username}:{proxy.password}"
         return f"{proxy.protocol}:{proxy.host}:{proxy.port}"
 
+    def _update_status_cells(self, accounts: List[AccountRecord]) -> None:
+        """Incrementally update only status and fragment cells (Fix #11).
+
+        During batch ops this avoids destroying/recreating all 1000 rows
+        (14K DPG widget ops) every 3 seconds. Only changed cells are touched.
+        """
+        try:
+            for account in accounts:
+                # Update status cell
+                cell_tag = self._status_cells.get(account.id)
+                if cell_tag and dpg.does_item_exist(cell_tag):
+                    dpg.set_value(cell_tag, account.status)
+                    if account.status in self._status_themes:
+                        dpg.bind_item_theme(cell_tag, self._status_themes[account.status])
+
+                # Update fragment cell
+                frag_tag = self._fragment_cells.get(account.id)
+                if frag_tag and dpg.does_item_exist(frag_tag):
+                    frag = account.fragment_status or "-"
+                    dpg.set_value(frag_tag, frag)
+                    if frag == "authorized":
+                        dpg.bind_item_theme(frag_tag, self._status_themes.get("healthy"))
+        except Exception as e:
+            logger.error("Update status cells error: %s", e)
+
     def _refresh_table_async(self) -> None:
-        """Trigger async table refresh from UI thread."""
+        """Trigger async table refresh from UI thread.
+
+        Fix #11: During batch ops (self._active_pool set), only update
+        status/fragment cells incrementally instead of full rebuild.
+        """
         async def do_refresh():
             accounts = await self._controller.search_accounts("")
             stats = await self._controller.get_stats()
-            proxies = await self._controller.db.list_proxies()
-            proxies_map = {p.id: p for p in proxies}
             self._schedule_ui(lambda: self._update_stats_sync(stats))
-            self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
+            if self._active_pool and self._status_cells:
+                # Incremental update during batch — no full rebuild
+                self._schedule_ui(lambda: self._update_status_cells(accounts))
+            else:
+                # Full rebuild when no batch is running
+                proxies = await self._controller.db.list_proxies()
+                proxies_map = {p.id: p for p in proxies}
+                self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
         self._run_async(do_refresh())
 
     def _show_assign_proxy_dialog(self, sender, app_data, user_data) -> None:
@@ -1106,10 +1186,18 @@ class TGWebAuthApp:
         self._run_async(get_pending_ids())
 
     def _set_batch_buttons_enabled(self, enabled: bool) -> None:
-        """FIX-G: Enable/disable batch operation buttons to prevent double-click."""
+        """Enable/disable batch AND per-row action buttons to prevent double-click.
+
+        Fix #9: Also toggles per-row Migrate/Frag/Open/Proxy buttons so users
+        cannot trigger concurrent session use during batch operations.
+        """
         for tag in ("btn_migrate_selected", "btn_migrate_all", "btn_retry_failed", "btn_fragment_all"):
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, enabled=enabled)
+        # Fix #9: Toggle per-row action buttons
+        for btn_tag in self._row_action_buttons:
+            if dpg.does_item_exist(btn_tag):
+                dpg.configure_item(btn_tag, enabled=enabled)
 
     def _retry_failed(self, sender=None, app_data=None) -> None:
         """Retry all accounts with status='error'."""

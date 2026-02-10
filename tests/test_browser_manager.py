@@ -147,7 +147,7 @@ class TestBrowserManager:
         assert profiles[0].proxy is None  # Should be None due to parse error
 
     def test_save_profile_config(self, tmp_path):
-        """Test saving profile config."""
+        """Test saving profile config strips credentials from proxy."""
         manager = BrowserManager(profiles_dir=tmp_path)
         profile = manager.get_profile("test", proxy="socks5:h:p:u:p")
 
@@ -160,7 +160,9 @@ class TestBrowserManager:
             config = json.load(f)
 
         assert config["name"] == "test"
-        assert config["proxy"] == "socks5:h:p:u:p"
+        # Credentials must be stripped — only protocol:host:port stored
+        assert config["proxy"] == "socks5:h:p"
+        assert "u" not in config["proxy"]
 
 
 class TestBrowserContext:
@@ -245,21 +247,23 @@ def _make_hot_profile(profiles_dir: Path, name: str, files: dict[str, bytes] | N
 class TestProfileLifecycleManager:
     """Tests for ProfileLifecycleManager hot/cold tiering."""
 
-    def test_ensure_active_new_profile(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_ensure_active_new_profile(self, tmp_path):
         """ensure_active on non-existent profile returns path without crash."""
         mgr = ProfileLifecycleManager(tmp_path, max_hot=5)
-        result = mgr.ensure_active("brand_new")
+        result = await mgr.ensure_active("brand_new")
 
         assert result == tmp_path / "brand_new"
         assert "brand_new" in mgr._access_order
 
-    def test_hibernate_creates_zip_removes_dir(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_hibernate_creates_zip_removes_dir(self, tmp_path):
         """hibernate compresses profile to zip and removes directory."""
         _make_hot_profile(tmp_path, "acct1", {"browser_data/data.txt": b"hello"})
         mgr = ProfileLifecycleManager(tmp_path, max_hot=5)
 
         assert mgr.is_hot("acct1")
-        zip_path = mgr.hibernate("acct1")
+        zip_path = await mgr.hibernate("acct1")
 
         assert zip_path == tmp_path / "acct1.zip"
         assert zip_path.exists()
@@ -267,21 +271,23 @@ class TestProfileLifecycleManager:
         assert "acct1" not in mgr._access_order
         assert mgr.is_cold("acct1")
 
-    def test_ensure_active_decompresses_cold(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_ensure_active_decompresses_cold(self, tmp_path):
         """ensure_active on cold profile decompresses and deletes zip."""
         _make_hot_profile(tmp_path, "acct2", {"browser_data/test.db": b"data"})
         mgr = ProfileLifecycleManager(tmp_path, max_hot=5)
-        mgr.hibernate("acct2")
+        await mgr.hibernate("acct2")
 
         assert mgr.is_cold("acct2")
-        result = mgr.ensure_active("acct2")
+        result = await mgr.ensure_active("acct2")
 
         assert result == tmp_path / "acct2"
         assert mgr.is_hot("acct2")
         assert not (tmp_path / "acct2.zip").exists()
         assert "acct2" in mgr._access_order
 
-    def test_roundtrip_preserves_files(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_roundtrip_preserves_files(self, tmp_path):
         """hibernate then ensure_active preserves all file contents."""
         files = {
             "browser_data/test.txt": b"hello world",
@@ -291,14 +297,15 @@ class TestProfileLifecycleManager:
         _make_hot_profile(tmp_path, "roundtrip", files)
         mgr = ProfileLifecycleManager(tmp_path, max_hot=5)
 
-        mgr.hibernate("roundtrip")
-        mgr.ensure_active("roundtrip")
+        await mgr.hibernate("roundtrip")
+        await mgr.ensure_active("roundtrip")
 
         for rel_path, expected in files.items():
             actual = (tmp_path / "roundtrip" / rel_path).read_bytes()
             assert actual == expected, f"File {rel_path} content mismatch"
 
-    def test_lru_eviction(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_lru_eviction(self, tmp_path):
         """When max_hot is reached, oldest LRU profile is evicted."""
         _make_hot_profile(tmp_path, "a")
         _make_hot_profile(tmp_path, "b")
@@ -306,38 +313,41 @@ class TestProfileLifecycleManager:
 
         # Touch order: a (oldest), b (newest)
         # ensure_active on "c" (new, not yet on disk) should evict "a"
-        mgr.ensure_active("c")
+        await mgr.ensure_active("c")
 
         assert mgr.is_cold("a"), "Oldest profile 'a' should have been evicted"
         assert mgr.is_hot("b")
         assert "c" in mgr._access_order
 
-    def test_eviction_skips_protected(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_eviction_skips_protected(self, tmp_path):
         """Eviction skips profiles in the protected set."""
         _make_hot_profile(tmp_path, "p1")
         _make_hot_profile(tmp_path, "p2")
         mgr = ProfileLifecycleManager(tmp_path, max_hot=2)
 
         # Protect p1 (oldest), so p2 should be evicted instead
-        mgr.ensure_active("p3", protected={"p1"})
+        await mgr.ensure_active("p3", protected={"p1"})
 
         assert mgr.is_hot("p1"), "Protected profile 'p1' should NOT be evicted"
         assert mgr.is_cold("p2"), "Unprotected 'p2' should be evicted"
         assert "p3" in mgr._access_order
 
-    def test_hibernate_nonexistent_returns_none(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_hibernate_nonexistent_returns_none(self, tmp_path):
         """hibernate on non-existent profile returns None without crash."""
         mgr = ProfileLifecycleManager(tmp_path, max_hot=5)
-        result = mgr.hibernate("nope")
+        result = await mgr.hibernate("nope")
         assert result is None
 
-    def test_get_stats(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_get_stats(self, tmp_path):
         """get_stats returns correct hot/cold/total counts."""
         _make_hot_profile(tmp_path, "hot1")
         _make_hot_profile(tmp_path, "hot2")
         _make_hot_profile(tmp_path, "to_cold", {"browser_data/x.txt": b"x"})
         mgr = ProfileLifecycleManager(tmp_path, max_hot=10)
-        mgr.hibernate("to_cold")
+        await mgr.hibernate("to_cold")
 
         stats = mgr.get_stats()
         assert stats["hot"] == 2
@@ -345,17 +355,19 @@ class TestProfileLifecycleManager:
         assert stats["total"] == 3
         assert stats["max_hot"] == 10
 
-    def test_double_ensure_noop(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_double_ensure_noop(self, tmp_path):
         """Calling ensure_active twice on hot profile doesn't duplicate in LRU."""
         _make_hot_profile(tmp_path, "dup")
         mgr = ProfileLifecycleManager(tmp_path, max_hot=5)
 
-        mgr.ensure_active("dup")
-        mgr.ensure_active("dup")
+        await mgr.ensure_active("dup")
+        await mgr.ensure_active("dup")
 
         assert mgr._access_order.count("dup") == 1
 
-    def test_rmtree_readonly_files(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_rmtree_readonly_files(self, tmp_path):
         """hibernate succeeds even with read-only files (Windows PermissionError)."""
         profile_path = _make_hot_profile(tmp_path, "readonly_test", {
             "browser_data/locked.db": b"locked data",
@@ -365,7 +377,7 @@ class TestProfileLifecycleManager:
         locked_file.chmod(0o444)
 
         mgr = ProfileLifecycleManager(tmp_path, max_hot=5)
-        zip_path = mgr.hibernate("readonly_test")
+        zip_path = await mgr.hibernate("readonly_test")
 
         assert zip_path is not None
         assert zip_path.exists()

@@ -172,8 +172,11 @@ class ProfileLifecycleManager:
         """Check if profile is compressed as a zip file."""
         return (self.profiles_dir / f"{name}.zip").exists() and not self.is_hot(name)
 
-    def ensure_active(self, name: str, protected: Optional[set[str]] = None) -> Path:
+    async def ensure_active(self, name: str, protected: Optional[set[str]] = None) -> Path:
         """Ensure profile is hot (decompressed). Decompress from zip if needed.
+
+        Blocking zip I/O is offloaded to a thread executor so the asyncio
+        event loop is not stalled when multiple workers decompress in parallel.
 
         Args:
             name: Profile name.
@@ -190,10 +193,10 @@ class ProfileLifecycleManager:
             return profile_path
 
         if zip_path.exists():
-            self._evict_if_needed(protected)
+            await self._evict_if_needed(protected)
             try:
-                with zipfile.ZipFile(zip_path, 'r') as zf:
-                    zf.extractall(profile_path)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._extract_zip, zip_path, profile_path)
                 logger.info("Decompressed cold profile '%s'", name)
             except zipfile.BadZipFile:
                 logger.error("Corrupt zip for profile '%s', creating fresh profile", name)
@@ -206,12 +209,21 @@ class ProfileLifecycleManager:
             return profile_path
 
         # New profile — dir will be created later by _build_camoufox_args
-        self._evict_if_needed(protected)
+        await self._evict_if_needed(protected)
         self._touch(name)
         return profile_path
 
-    def hibernate(self, name: str) -> Optional[Path]:
+    @staticmethod
+    def _extract_zip(zip_path: Path, dest_path: Path) -> None:
+        """Extract zip archive (runs in executor thread)."""
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(dest_path)
+
+    async def hibernate(self, name: str) -> Optional[Path]:
         """Compress a hot profile to zip and remove the directory.
+
+        Blocking zip I/O is offloaded to a thread executor so the asyncio
+        event loop is not stalled when multiple workers compress in parallel.
 
         Args:
             name: Profile name.
@@ -225,19 +237,24 @@ class ProfileLifecycleManager:
         if not self.is_hot(name):
             return None
 
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for file_path in profile_path.rglob('*'):
-                if file_path.is_file():
-                    arcname = file_path.relative_to(profile_path)
-                    zf.write(file_path, arcname)
-
-        _rmtree_force(profile_path)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._compress_zip, profile_path, zip_path)
+        await loop.run_in_executor(None, _rmtree_force, profile_path)
 
         if name in self._access_order:
             self._access_order.remove(name)
 
         logger.info("Hibernated profile '%s' -> %s", name, zip_path.name)
         return zip_path
+
+    @staticmethod
+    def _compress_zip(profile_path: Path, zip_path: Path) -> None:
+        """Compress profile directory to zip (runs in executor thread)."""
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for file_path in profile_path.rglob('*'):
+                if file_path.is_file():
+                    arcname = file_path.relative_to(profile_path)
+                    zf.write(file_path, arcname)
 
     def _touch(self, name: str) -> None:
         """Move profile to end of LRU (most recently used)."""
@@ -255,7 +272,7 @@ class ProfileLifecycleManager:
                 count += 1
         return count
 
-    def _evict_if_needed(self, protected: Optional[set[str]] = None) -> None:
+    async def _evict_if_needed(self, protected: Optional[set[str]] = None) -> None:
         """Evict LRU profiles until under max_hot capacity."""
         protected = protected or set()
         while self._hot_count() >= self.max_hot:
@@ -264,7 +281,7 @@ class ProfileLifecycleManager:
                 if name not in protected and self.is_hot(name):
                     logger.info("Evicting LRU profile '%s' (capacity %d/%d)",
                                 name, self._hot_count(), self.max_hot)
-                    self.hibernate(name)
+                    await self.hibernate(name)
                     evicted = True
                     break
             if not evicted:
@@ -392,11 +409,25 @@ class BrowserManager:
 
         return args
 
+    @staticmethod
+    def _mask_proxy_for_config(proxy: Optional[str]) -> Optional[str]:
+        """Strip credentials from proxy string for safe storage in profile config.
+
+        Only protocol:host:port is stored. Actual credentials come from
+        the database at runtime, not from the profile config file.
+        """
+        if not proxy:
+            return None
+        parts = proxy.split(":")
+        if len(parts) >= 3:
+            return ":".join(parts[:3])  # protocol:host:port only
+        return proxy
+
     def _save_profile_config(self, profile: BrowserProfile):
         """Сохраняет конфигурацию профиля"""
         config = {
             "name": profile.name,
-            "proxy": profile.proxy,
+            "proxy": self._mask_proxy_for_config(profile.proxy),
         }
         profile.path.mkdir(parents=True, exist_ok=True)
         with open(profile.config_path, 'w', encoding='utf-8') as f:
@@ -481,7 +512,7 @@ class BrowserManager:
         # Hot/cold lifecycle: decompress if needed, evict LRU if at capacity
         # Protected set includes active browsers AND the current profile being launched
         protected = set(self._active_browsers.keys()) | {profile.name}
-        self.lifecycle.ensure_active(profile.name, protected=protected)
+        await self.lifecycle.ensure_active(profile.name, protected=protected)
 
         proxy_relay = None
 

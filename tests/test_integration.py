@@ -112,7 +112,8 @@ class TestBrowserManagerIntegration:
 
         assert len(profiles) == 1
         assert profiles[0].name == "persistent"
-        assert profiles[0].proxy == "socks5:host:1080:user:secret"
+        # Credentials are stripped from profile_config.json (security fix)
+        assert profiles[0].proxy == "socks5:host:1080"
 
 
 class TestTelegramAuthIntegration:

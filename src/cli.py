@@ -736,7 +736,7 @@ def fragment(account: Optional[str], fragment_all: bool, headed: bool, cooldown:
         click.echo("Укажите --account или --all")
         return
 
-    async def _run_single(account_dir: Path) -> Optional["FragmentResult"]:
+    async def _run_single(account_dir: Path, browser_manager: "BrowserManager") -> Optional["FragmentResult"]:
         """Запускает fragment auth для одного аккаунта. Returns result or None on config error."""
         try:
             config = AccountConfig.load(account_dir)
@@ -744,7 +744,6 @@ def fragment(account: Optional[str], fragment_all: bool, headed: bool, cooldown:
             click.echo(click.style(f"  SKIP {account_dir.name}: {e}", fg="yellow"))
             return None
 
-        browser_manager = BrowserManager()
         auth = FragmentAuth(config, browser_manager)
         result = await auth.connect(headless=headless)
 
@@ -756,81 +755,86 @@ def fragment(account: Optional[str], fragment_all: bool, headed: bool, cooldown:
         return result
 
     async def _run():
-        if account:
-            account_dir = get_account_dir(account)
-            if not account_dir:
-                click.echo(f"Аккаунт '{account}' не найден в {ACCOUNTS_DIR}/")
-                return
-            await _run_single(account_dir)
-        elif fragment_all:
-            account_dirs = find_account_dirs()
-            if not account_dirs:
-                click.echo(f"Нет аккаунтов в {ACCOUNTS_DIR}/")
-                return
+        # Fix #21: Shared BrowserManager with global LRU eviction
+        browser_manager = BrowserManager()
+        try:
+            if account:
+                account_dir = get_account_dir(account)
+                if not account_dir:
+                    click.echo(f"Аккаунт '{account}' не найден в {ACCOUNTS_DIR}/")
+                    return
+                await _run_single(account_dir, browser_manager)
+            elif fragment_all:
+                account_dirs = find_account_dirs()
+                if not account_dirs:
+                    click.echo(f"Нет аккаунтов в {ACCOUNTS_DIR}/")
+                    return
 
-            click.echo(f"Fragment auth для {len(account_dirs)} аккаунтов (headless={headless})")
-            results = []
+                click.echo(f"Fragment auth для {len(account_dirs)} аккаунтов (headless={headless})")
+                results = []
 
-            for i, account_dir in enumerate(account_dirs):
-                click.echo(f"\n[{i+1}/{len(account_dirs)}] {account_dir.name}")
-                result = await _run_single(account_dir)
-                results.append((account_dir.name, result))
+                for i, account_dir in enumerate(account_dirs):
+                    click.echo(f"\n[{i+1}/{len(account_dirs)}] {account_dir.name}")
+                    result = await _run_single(account_dir, browser_manager)
+                    results.append((account_dir.name, result))
 
-                # Cooldown between accounts (skip after last)
-                if i < len(account_dirs) - 1:
-                    actual_cooldown = cooldown + random.randint(-10, 10)
-                    actual_cooldown = max(10, actual_cooldown)
-                    await asyncio.sleep(actual_cooldown)
+                    # Cooldown between accounts (skip after last)
+                    if i < len(account_dirs) - 1:
+                        actual_cooldown = cooldown + random.randint(-10, 10)
+                        actual_cooldown = max(10, actual_cooldown)
+                        await asyncio.sleep(actual_cooldown)
 
-            # Categorized summary
-            ok_new = []
-            ok_existing = []
-            fail_session = []
-            fail_ip = []
-            fail_timeout = []
-            fail_other = []
-            skipped = []
+                # Categorized summary
+                ok_new = []
+                ok_existing = []
+                fail_session = []
+                fail_ip = []
+                fail_timeout = []
+                fail_other = []
+                skipped = []
 
-            for name, r in results:
-                if r is None:
-                    skipped.append(name)
-                elif r.success and r.already_authorized:
-                    ok_existing.append(name)
-                elif r.success:
-                    ok_new.append(name)
-                elif r.error and "not authorized" in r.error.lower():
-                    fail_session.append(name)
-                elif r.error and "AuthKeyDuplicated" in (r.error or ""):
-                    fail_ip.append(name)
-                elif r.error and ("timeout" in r.error.lower() or "Timeout" in (r.error or "")):
-                    fail_timeout.append(name)
-                else:
-                    fail_other.append((name, r.error))
+                for name, r in results:
+                    if r is None:
+                        skipped.append(name)
+                    elif r.success and r.already_authorized:
+                        ok_existing.append(name)
+                    elif r.success:
+                        ok_new.append(name)
+                    elif r.error and "not authorized" in r.error.lower():
+                        fail_session.append(name)
+                    elif r.error and "AuthKeyDuplicated" in (r.error or ""):
+                        fail_ip.append(name)
+                    elif r.error and ("timeout" in r.error.lower() or "Timeout" in (r.error or "")):
+                        fail_timeout.append(name)
+                    else:
+                        fail_other.append((name, r.error))
 
-            total_ok = len(ok_new) + len(ok_existing)
-            total_fail = len(fail_session) + len(fail_ip) + len(fail_timeout) + len(fail_other)
+                total_ok = len(ok_new) + len(ok_existing)
+                total_fail = len(fail_session) + len(fail_ip) + len(fail_timeout) + len(fail_other)
 
-            click.echo(f"\n{'=' * 50}")
-            click.echo("ИТОГ FRAGMENT AUTH")
-            click.echo(f"{'=' * 50}")
-            click.echo(click.style(f"  OK: {total_ok}/{len(results)}", fg="green"))
-            if ok_new:
-                click.echo(f"    Новых: {len(ok_new)}")
-            if ok_existing:
-                click.echo(f"    Уже авторизованы: {len(ok_existing)}")
-            if total_fail > 0:
-                click.echo(click.style(f"  FAIL: {total_fail}", fg="red"))
-                if fail_session:
-                    click.echo(f"    Мёртвые сессии ({len(fail_session)}): {', '.join(fail_session)}")
-                if fail_ip:
-                    click.echo(f"    Конфликт IP ({len(fail_ip)}): {', '.join(fail_ip)}")
-                if fail_timeout:
-                    click.echo(f"    Таймауты ({len(fail_timeout)}): {', '.join(fail_timeout)}")
-                if fail_other:
-                    for name, err in fail_other:
-                        click.echo(f"    {name}: {err}")
-            if skipped:
-                click.echo(click.style(f"  SKIP: {len(skipped)}", fg="yellow"))
+                click.echo(f"\n{'=' * 50}")
+                click.echo("ИТОГ FRAGMENT AUTH")
+                click.echo(f"{'=' * 50}")
+                click.echo(click.style(f"  OK: {total_ok}/{len(results)}", fg="green"))
+                if ok_new:
+                    click.echo(f"    Новых: {len(ok_new)}")
+                if ok_existing:
+                    click.echo(f"    Уже авторизованы: {len(ok_existing)}")
+                if total_fail > 0:
+                    click.echo(click.style(f"  FAIL: {total_fail}", fg="red"))
+                    if fail_session:
+                        click.echo(f"    Мёртвые сессии ({len(fail_session)}): {', '.join(fail_session)}")
+                    if fail_ip:
+                        click.echo(f"    Конфликт IP ({len(fail_ip)}): {', '.join(fail_ip)}")
+                    if fail_timeout:
+                        click.echo(f"    Таймауты ({len(fail_timeout)}): {', '.join(fail_timeout)}")
+                    if fail_other:
+                        for name, err in fail_other:
+                            click.echo(f"    {name}: {err}")
+                if skipped:
+                    click.echo(click.style(f"  SKIP: {len(skipped)}", fg="yellow"))
+        finally:
+            await browser_manager.close_all()
 
     try:
         asyncio.run(_run())

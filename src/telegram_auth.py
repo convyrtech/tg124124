@@ -1171,6 +1171,16 @@ class TelegramAuth:
                 await asyncio.sleep(wait_time + jitter)
 
             except Exception as e:
+                error_str = str(e).upper()
+                # FIX #7: Don't retry stale/invalid tokens — let outer loop
+                # re-fetch a fresh QR instead of wasting time + FloodWait risk
+                non_retryable = ('EXPIRED', 'ALREADY_ACCEPTED', 'INVALID')
+                if any(keyword in error_str for keyword in non_retryable):
+                    logger.warning(
+                        "Token error (non-retryable): %s — need fresh QR", e
+                    )
+                    return False
+
                 # Exponential backoff для других ошибок
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 3)
                 logger.warning(
@@ -1771,6 +1781,8 @@ class CircuitBreaker:
         self._consecutive_failures = 0
         self._last_failure_time: float = 0.0
         self._is_open = False
+        # FIX #4: Only one worker probes during HALF-OPEN state
+        self._half_open_probing = False
 
     @property
     def is_open(self) -> bool:
@@ -1802,6 +1814,8 @@ class CircuitBreaker:
             logger.info("Circuit breaker: success recorded, resetting state")
         self._consecutive_failures = 0
         self._is_open = False
+        # FIX #4: Probe completed successfully, release flag
+        self._half_open_probing = False
 
     def can_proceed(self) -> bool:
         """
@@ -1810,6 +1824,9 @@ class CircuitBreaker:
         Returns True if:
         - Circuit is closed (normal operation)
         - Circuit is open but reset_timeout has elapsed (half-open)
+
+        FIX #4: In half-open state, only one caller proceeds (via lock).
+        Others get False and must wait.
         """
         if not self._is_open:
             return True
@@ -1818,14 +1835,37 @@ class CircuitBreaker:
         elapsed = time.time() - self._last_failure_time
 
         if elapsed >= self._reset_timeout:
+            # FIX #4: Only allow one probe during half-open.
+            if self._half_open_probing:
+                # Another worker is already probing
+                return False
             logger.info(
                 f"Circuit breaker: reset timeout elapsed "
-                f"({elapsed:.1f}s >= {self._reset_timeout}s), allowing retry"
+                f"({elapsed:.1f}s >= {self._reset_timeout}s), allowing probe"
             )
-            # Move to half-open state - allow one request
             return True
 
         return False
+
+    async def acquire_half_open_probe(self) -> bool:
+        """
+        FIX #4: Acquire the half-open probe flag (non-blocking).
+
+        Call this from the worker BEFORE doing the actual migration
+        when can_proceed() returned True and circuit is open.
+        Returns True if this worker is the probe, False if another worker beat us.
+        Safe in asyncio single-threaded event loop (no yield between check and set).
+        """
+        if not self._is_open:
+            return True  # Circuit closed, no probe needed
+        if self._half_open_probing:
+            return False
+        self._half_open_probing = True
+        return True
+
+    def release_half_open_probe(self) -> None:
+        """FIX #4: Release the half-open probe flag after probe completes."""
+        self._half_open_probing = False
 
     def time_until_reset(self) -> float:
         """Seconds until circuit breaker resets (0 if closed)"""
@@ -1842,6 +1882,8 @@ class CircuitBreaker:
         self._consecutive_failures = 0
         self._is_open = False
         self._last_failure_time = 0.0
+        # FIX #4: Reset probe flag
+        self._half_open_probing = False
 
 
 class ParallelMigrationController:
@@ -1899,6 +1941,10 @@ class ParallelMigrationController:
         """
         Run parallel migration with shutdown support.
 
+        FIX #13: Uses shared BrowserManager with cleanup in finally.
+        FIX #16: Cooldown after migration completes (inside semaphore),
+                 not between create_task() calls.
+
         Returns results for completed accounts (may be partial on shutdown).
         """
         semaphore = asyncio.Semaphore(self.max_concurrent)
@@ -1907,6 +1953,9 @@ class ParallelMigrationController:
         self._total = len(account_dirs)
         self._completed = 0
         self._shutdown_requested = False
+
+        # FIX #13: Shared BrowserManager for all workers
+        browser_manager = BrowserManager()
 
         async def migrate_one(index: int, account_dir: Path):
             # Check shutdown before acquiring semaphore
@@ -1958,10 +2007,12 @@ class ParallelMigrationController:
 
                 try:
                     async with asyncio.timeout(TASK_TIMEOUT):
+                        # FIX #13: Pass shared browser_manager
                         result = await migrate_account(
                             account_dir=account_dir,
                             password_2fa=password_2fa,
-                            headless=headless
+                            headless=headless,
+                            browser_manager=browser_manager,
                         )
                 except asyncio.TimeoutError:
                     logger.warning(f"Task timeout after {TASK_TIMEOUT}s for {account_dir.name}")
@@ -1992,43 +2043,52 @@ class ParallelMigrationController:
                         except Exception as e:
                             logger.warning(f"Progress callback error: {e}")
 
+                # FIX #16: Cooldown AFTER migration completes (inside semaphore),
+                # ensuring actual gaps between account operations, not just
+                # between task creation.
+                if not self._shutdown_requested and self.cooldown > 0:
+                    jittered = get_randomized_cooldown(self.cooldown)
+                    await asyncio.sleep(jittered)
+
                 return result
 
-        # Create and track tasks
-        tasks = []
-        for i, account_dir in enumerate(account_dirs):
-            if self._shutdown_requested:
-                break
+        try:
+            # Create and track tasks (no cooldown between create_task calls)
+            tasks = []
+            for i, account_dir in enumerate(account_dirs):
+                if self._shutdown_requested:
+                    break
 
-            task = asyncio.create_task(migrate_one(i, account_dir))
-            self._active_tasks.add(task)
-            task.add_done_callback(self._active_tasks.discard)
-            tasks.append(task)
+                task = asyncio.create_task(migrate_one(i, account_dir))
+                self._active_tasks.add(task)
+                task.add_done_callback(self._active_tasks.discard)
+                tasks.append(task)
 
-            # Rate limiting with jitter to avoid pattern detection
-            if i < len(account_dirs) - 1 and self.cooldown > 0:
-                jittered = get_randomized_cooldown(self.cooldown)
-                await asyncio.sleep(jittered)
+            # Wait for all started tasks with batch timeout
+            BATCH_TIMEOUT = 3600  # 1 hour for entire batch
 
-        # Wait for all started tasks with batch timeout
-        BATCH_TIMEOUT = 3600  # 1 hour for entire batch
+            if tasks:
+                done, pending = await asyncio.wait(
+                    tasks,
+                    timeout=BATCH_TIMEOUT,
+                    return_when=asyncio.ALL_COMPLETED
+                )
 
-        if tasks:
-            done, pending = await asyncio.wait(
-                tasks,
-                timeout=BATCH_TIMEOUT,
-                return_when=asyncio.ALL_COMPLETED
-            )
-
-            # Cancel any stuck tasks that exceeded batch timeout
-            if pending:
-                logger.warning(f"Batch timeout: cancelling {len(pending)} stuck tasks")
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+                # Cancel any stuck tasks that exceeded batch timeout
+                if pending:
+                    logger.warning(f"Batch timeout: cancelling {len(pending)} stuck tasks")
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+        finally:
+            # FIX #13: Always clean up shared BrowserManager
+            try:
+                await browser_manager.close_all()
+            except Exception as e:
+                logger.warning("BrowserManager cleanup error in ParallelMigrationController: %s", e)
 
         # Return results in order (only completed ones)
         ordered_results = []
