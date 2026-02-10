@@ -9,6 +9,7 @@ TG Web Auth CLI
     check    - Проверить безопасность (fingerprint, proxy leaks)
 """
 import asyncio
+import atexit
 import logging
 import random
 import sys
@@ -16,9 +17,43 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import psutil
+
 from .logger import setup_logging, get_logger
 
 logger = get_logger(__name__)
+
+
+def _kill_orphan_children() -> None:
+    """Kill any orphaned child processes (pproxy, camoufox) on CLI exit.
+
+    pproxy runs as `python.exe -m pproxy`, so we check cmdline, not just name.
+    Camoufox/Firefox are matched by process name.
+    """
+    try:
+        current = psutil.Process()
+        children = current.children(recursive=True)
+        targets = []
+        for c in children:
+            try:
+                name = c.name().lower()
+                if any(n in name for n in ('camoufox', 'firefox')):
+                    targets.append(c)
+                elif 'pproxy' in ' '.join(c.cmdline()).lower():
+                    targets.append(c)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        for child in targets:
+            try:
+                child.kill()
+                logger.debug("Killed orphan process: PID=%d (%s)", child.pid, child.name())
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        pass  # Best-effort cleanup on exit
+
+
+atexit.register(_kill_orphan_children)
 
 # Suppress verbose logging from third-party libraries
 logging.getLogger("telethon").setLevel(logging.WARNING)
@@ -797,7 +832,10 @@ def fragment(account: Optional[str], fragment_all: bool, headed: bool, cooldown:
             if skipped:
                 click.echo(click.style(f"  SKIP: {len(skipped)}", fg="yellow"))
 
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        click.echo("\nПрервано пользователем")
 
 
 @cli.command("check-proxies")

@@ -557,10 +557,27 @@ class BrowserManager:
                             profile.name, e
                         )
 
-                # Rebuild args (profile dir will be recreated)
-                if profile.proxy and needs_relay(profile.proxy):
+                # Retry: recreate proxy relay (old one may be in broken state)
+                if proxy_relay:
+                    try:
+                        await proxy_relay.stop()
+                    except Exception as e:
+                        logger.debug("Relay stop on retry: %s", e)
+
+                    proxy_relay = ProxyRelay(profile.proxy)
+                    await proxy_relay.start()
+
+                    relay_profile = BrowserProfile(
+                        name=profile.name,
+                        path=profile.path,
+                        proxy=None,
+                    )
+                    if extra_args is None:
+                        extra_args = {}
+                    extra_args["proxy"] = proxy_relay.browser_proxy_config
                     args = self._build_camoufox_args(relay_profile, headless, extra_args)
                 else:
+                    # No relay — rebuild args (profile dir will be recreated)
                     args = self._build_camoufox_args(profile, headless, extra_args)
 
                 camoufox = AsyncCamoufox(**args)

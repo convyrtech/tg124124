@@ -1,6 +1,7 @@
 """
 Tests for browser_manager module.
 """
+import asyncio
 import pytest
 import json
 import tempfile
@@ -485,3 +486,124 @@ class TestBrowserContextForceKill:
 
         ctx = self._make_ctx(browser_pid=42)
         ctx._force_kill_by_pid()  # should not raise
+
+
+class TestLaunchRelayRecreation:
+    """Tests that proxy relay is recreated on retry after timeout."""
+
+    @pytest.mark.asyncio
+    async def test_relay_recreated_on_retry(self, tmp_path):
+        """On TimeoutError retry, old relay should be stopped and new one created."""
+        manager = BrowserManager(profiles_dir=tmp_path)
+        profile = BrowserProfile(
+            name="test_relay",
+            path=tmp_path / "test_relay",
+            proxy="socks5:host:1080:user:pass",
+        )
+
+        # Track ProxyRelay instances
+        relay_instances = []
+
+        class FakeRelay:
+            def __init__(self, proxy_str):
+                self.proxy_str = proxy_str
+                self.started = False
+                self.stopped = False
+                self.local_host = "127.0.0.1"
+                self.local_port = 9999 + len(relay_instances)
+                self.local_url = f"http://127.0.0.1:{self.local_port}"
+                self.browser_proxy_config = {"server": self.local_url}
+                relay_instances.append(self)
+
+            async def start(self):
+                self.started = True
+
+            async def stop(self):
+                self.stopped = True
+
+        mock_browser = MagicMock()
+        call_count = 0
+
+        async def fake_aenter(self_cm):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise asyncio.TimeoutError()
+            return mock_browser
+
+        with patch("src.browser_manager.ProxyRelay", FakeRelay), \
+             patch("src.browser_manager.AsyncCamoufox") as MockCamoufox, \
+             patch("src.browser_manager._get_browser_pid", return_value=123), \
+             patch.object(manager, "_kill_zombie_browser", new_callable=AsyncMock):
+
+            mock_instance = MagicMock()
+            mock_instance.__aenter__ = fake_aenter
+            MockCamoufox.return_value = mock_instance
+
+            ctx = await manager.launch(profile, headless=True)
+
+            # Two relay instances: original + recreated on retry
+            assert len(relay_instances) == 2
+            # First relay was stopped
+            assert relay_instances[0].stopped is True
+            # Second relay was started
+            assert relay_instances[1].started is True
+            # Context uses the new relay
+            assert ctx._proxy_relay is relay_instances[1]
+
+    @pytest.mark.asyncio
+    async def test_relay_stop_error_on_retry_is_handled(self, tmp_path):
+        """If old relay.stop() raises, new relay is still created."""
+        manager = BrowserManager(profiles_dir=tmp_path)
+        profile = BrowserProfile(
+            name="test_relay_err",
+            path=tmp_path / "test_relay_err",
+            proxy="socks5:host:1080:user:pass",
+        )
+
+        relay_instances = []
+
+        class FakeRelay:
+            def __init__(self, proxy_str):
+                self.started = False
+                self.stopped = False
+                self.local_host = "127.0.0.1"
+                self.local_port = 8888 + len(relay_instances)
+                self.local_url = f"http://127.0.0.1:{self.local_port}"
+                self.browser_proxy_config = {"server": self.local_url}
+                relay_instances.append(self)
+
+            async def start(self):
+                self.started = True
+
+            async def stop(self):
+                if not self.stopped:
+                    self.stopped = True
+                    if len(relay_instances) == 1:
+                        raise OSError("relay stop failed")
+
+        mock_browser = MagicMock()
+        call_count = 0
+
+        async def fake_aenter(self_cm):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise asyncio.TimeoutError()
+            return mock_browser
+
+        with patch("src.browser_manager.ProxyRelay", FakeRelay), \
+             patch("src.browser_manager.AsyncCamoufox") as MockCamoufox, \
+             patch("src.browser_manager._get_browser_pid", return_value=456), \
+             patch.object(manager, "_kill_zombie_browser", new_callable=AsyncMock):
+
+            mock_instance = MagicMock()
+            mock_instance.__aenter__ = fake_aenter
+            MockCamoufox.return_value = mock_instance
+
+            ctx = await manager.launch(profile, headless=True)
+
+            # Despite stop() error, new relay was created
+            assert len(relay_instances) == 2
+            assert relay_instances[1].started is True
+            assert ctx._proxy_relay is relay_instances[1]
