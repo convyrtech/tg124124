@@ -60,8 +60,8 @@ def copy_camoufox() -> None:
     """Copy Camoufox browser binary into dist."""
     print("[2/4] Copying Camoufox browser...")
     try:
-        from camoufox.pkgman import camoufox_path
-        src = Path(camoufox_path())
+        from camoufox.pkgman import launch_path
+        src = Path(launch_path()).parent
     except Exception as e:
         print(f"  WARNING: Could not find Camoufox: {e}")
         print("  Install with: python -m camoufox fetch")

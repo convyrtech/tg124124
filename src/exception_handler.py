@@ -57,3 +57,15 @@ def install_exception_handlers() -> None:
     """Install global exception handlers. Call once at app startup."""
     sys.excepthook = _excepthook
     logger.debug("Global exception handler installed")
+
+
+def install_asyncio_handler(loop) -> None:
+    """Install exception handler on asyncio event loop.
+
+    Call after event loop creation (e.g. in GUI background thread).
+
+    Args:
+        loop: asyncio event loop instance
+    """
+    loop.set_exception_handler(_asyncio_exception_handler)
+    logger.debug("Asyncio exception handler installed on loop")

@@ -12,6 +12,7 @@ Usage:
 """
 
 import logging
+import os
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -34,7 +35,14 @@ def setup_logging(
         log_file: Optional file path to write logs (overrides default)
         format_string: Custom format string (uses default if None)
         enable_file_logging: If True, always write to LOGS_DIR/app.log with rotation
+
+    Environment:
+        TGWA_DEBUG: Set to '1' or 'true' to force DEBUG level logging
     """
+    # Override level if TGWA_DEBUG env var is set
+    if os.environ.get('TGWA_DEBUG', '').lower() in ('1', 'true'):
+        level = logging.DEBUG
+
     if format_string is None:
         format_string = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
 

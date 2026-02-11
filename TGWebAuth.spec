@@ -33,7 +33,7 @@ hiddenimports += [
     'cv2',
     'pyzbar',
     'pyzbar.pyzbar',
-    'zxing',
+    'zxingcpp',
     'PIL',
     'PIL.Image',
     'numpy',

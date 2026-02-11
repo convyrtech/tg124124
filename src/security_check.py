@@ -297,43 +297,51 @@ async def run_security_check(
 
 
 def print_summary(result: SecurityCheckResult):
-    """Выводит итоговый отчёт"""
-    print("\n" + "="*60)
-    print("SECURITY CHECK SUMMARY")
-    print("="*60)
-
-    status = "✓ SAFE" if result.is_safe else "✗ UNSAFE"
-    print(f"\nStatus: {status}")
-
-    print(f"\n{'Check':<25} {'Result':<15} {'Details'}")
-    print("-"*60)
+    """Выводит итоговый отчёт."""
+    lines = [
+        "",
+        "=" * 60,
+        "SECURITY CHECK SUMMARY",
+        "=" * 60,
+        "",
+        f"Status: {'✓ SAFE' if result.is_safe else '✗ UNSAFE'}",
+        "",
+        f"{'Check':<25} {'Result':<15} {'Details'}",
+        "-" * 60,
+    ]
 
     # IP check
     ip_ok = result.proxy_ip in result.detected_ip or result.detected_ip != "unknown"
-    print(f"{'IP Match':<25} {'✓ OK' if ip_ok else '✗ FAIL':<15} {result.detected_ip}")
+    lines.append(f"{'IP Match':<25} {'✓ OK' if ip_ok else '✗ FAIL':<15} {result.detected_ip}")
 
     # WebRTC check
     webrtc_ok = not result.webrtc_leak
-    print(f"{'WebRTC Leak':<25} {'✓ Blocked' if webrtc_ok else '✗ LEAK!':<15} {result.webrtc_local_ip or 'None'}")
+    lines.append(f"{'WebRTC Leak':<25} {'✓ Blocked' if webrtc_ok else '✗ LEAK!':<15} {result.webrtc_local_ip or 'None'}")
 
     # Timezone check
     tz_ok = result.timezone_match
-    print(f"{'Timezone Match':<25} {'✓ OK' if tz_ok else '✗ MISMATCH':<15} {result.detected_timezone}")
+    lines.append(f"{'Timezone Match':<25} {'✓ OK' if tz_ok else '✗ MISMATCH':<15} {result.detected_timezone}")
 
     # Fingerprint info
-    print(f"\n{'Canvas Hash':<25} {result.canvas_hash}")
-    print(f"{'Screen':<25} {result.screen_resolution}")
-    print(f"{'Platform':<25} {result.platform}")
-
-    print("="*60)
+    lines.extend([
+        "",
+        f"{'Canvas Hash':<25} {result.canvas_hash}",
+        f"{'Screen':<25} {result.screen_resolution}",
+        f"{'Platform':<25} {result.platform}",
+        "=" * 60,
+    ])
 
     if not result.is_safe:
-        print("\n⚠️  WARNING: Security issues detected!")
-        print("   Do NOT proceed with account login until fixed.")
+        lines.append("")
+        lines.append("WARNING: Security issues detected!")
+        lines.append("   Do NOT proceed with account login until fixed.")
         if result.webrtc_leak:
-            print("   → WebRTC is leaking your real IP")
+            lines.append("   -> WebRTC is leaking your real IP")
         if not result.timezone_match:
-            print("   → Timezone doesn't match proxy location")
+            lines.append("   -> Timezone doesn't match proxy location")
+
+    summary = "\n".join(lines)
+    logger.info("Security check result:\n%s", summary)
 
 
 async def main():
