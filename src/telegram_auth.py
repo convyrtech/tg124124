@@ -760,6 +760,38 @@ class TelegramAuth:
             logger.warning("Failed to set authorization TTL: %s", e)
             return False
 
+    def _is_profile_already_authorized(self, profile) -> bool:
+        """Check if profile's storage_state.json already has user_auth.
+
+        This allows skipping browser launch for already-migrated accounts
+        during retry-failed runs (where authorize() was killed by watchdog
+        after storage_state was saved but before returning success).
+        """
+        storage_state_path = profile.path / "storage_state.json"
+        if not storage_state_path.exists():
+            return False
+        try:
+            with open(storage_state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            for origin in state.get("origins", []):
+                if origin.get("origin") != "https://web.telegram.org":
+                    continue
+                for item in origin.get("localStorage", []):
+                    if item.get("name") == "user_auth":
+                        user_auth = json.loads(item["value"])
+                        if user_auth.get("id"):
+                            logger.info(
+                                "Pre-check: storage_state.json has user_auth "
+                                "(userId=%s, date=%s)",
+                                user_auth.get("id"),
+                                user_auth.get("date"),
+                            )
+                            return True
+            return False
+        except Exception as e:
+            logger.debug("Pre-check storage_state.json failed: %s", e)
+            return False
+
     async def _check_page_state(self, page) -> str:
         """
         Определяет текущее состояние страницы Telegram Web.
@@ -1618,6 +1650,34 @@ class TelegramAuth:
         logger.info(f"Profile: {profile.name}")
         logger.debug(f"Device: {self.account.device.device_model} / {self.account.device.system_version}")
         logger.info("=" * 60)
+
+        # Pre-check: if profile already has valid auth in storage_state.json,
+        # skip browser launch entirely. This prevents re-migration timeouts
+        # when retry-failed picks up accounts that were partially completed
+        # (storage_state saved but authorize() killed by watchdog).
+        if self._is_profile_already_authorized(profile):
+            logger.info("Profile already has web auth — verifying session and skipping browser")
+            client = None
+            try:
+                client = await self._create_telethon_client()
+                self._client = client
+                await self._set_authorization_ttl(client)
+                telethon_alive = await self._verify_telethon_session(client)
+            except Exception as e:
+                logger.warning("Telethon check failed for pre-authorized profile: %s", e)
+                telethon_alive = False
+            finally:
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+            return AuthResult(
+                success=True,
+                profile_name=profile.name,
+                required_2fa=False,
+                telethon_alive=telethon_alive,
+            )
 
         client = None
         browser_ctx = None

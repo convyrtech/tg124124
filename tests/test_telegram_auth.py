@@ -947,6 +947,87 @@ class TestParallelMigrationControllerCooldownAfterCompletion:
         assert len(timestamps) == 2
 
 
+class TestIsProfileAlreadyAuthorized:
+    """Tests for pre-check that skips browser launch for already-migrated profiles."""
+
+    @pytest.fixture
+    def auth_instance(self, tmp_path):
+        """Create a TelegramAuth instance with mocked dependencies."""
+        from src.telegram_auth import TelegramAuth, AccountConfig
+        account_dir = tmp_path / "test_account"
+        account_dir.mkdir()
+        (account_dir / "session.session").write_bytes(b"fake")
+        (account_dir / "api.json").write_text('{"api_id": 123, "api_hash": "abc"}')
+        account = AccountConfig.load(account_dir)
+        auth = TelegramAuth(account, browser_manager=MagicMock())
+        return auth
+
+    def test_returns_true_when_user_auth_present(self, auth_instance, tmp_path):
+        """Profile with user_auth in storage_state.json is detected as authorized."""
+        profile = MagicMock()
+        profile.path = tmp_path / "profile"
+        profile.path.mkdir()
+        state = {
+            "origins": [{
+                "origin": "https://web.telegram.org",
+                "localStorage": [
+                    {"name": "user_auth", "value": '{"date":1770762062,"id":7954844955,"dcID":1}'},
+                    {"name": "number_of_accounts", "value": "1"},
+                ]
+            }]
+        }
+        (profile.path / "storage_state.json").write_text(json.dumps(state))
+        assert auth_instance._is_profile_already_authorized(profile) is True
+
+    def test_returns_false_when_no_user_auth(self, auth_instance, tmp_path):
+        """Profile without user_auth is not detected as authorized."""
+        profile = MagicMock()
+        profile.path = tmp_path / "profile"
+        profile.path.mkdir()
+        state = {
+            "origins": [{
+                "origin": "https://web.telegram.org",
+                "localStorage": [
+                    {"name": "number_of_accounts", "value": "0"},
+                    {"name": "dc", "value": "1"},
+                ]
+            }]
+        }
+        (profile.path / "storage_state.json").write_text(json.dumps(state))
+        assert auth_instance._is_profile_already_authorized(profile) is False
+
+    def test_returns_false_when_no_storage_state(self, auth_instance, tmp_path):
+        """Missing storage_state.json returns False."""
+        profile = MagicMock()
+        profile.path = tmp_path / "profile"
+        profile.path.mkdir()
+        assert auth_instance._is_profile_already_authorized(profile) is False
+
+    def test_returns_false_on_corrupted_json(self, auth_instance, tmp_path):
+        """Corrupted storage_state.json returns False gracefully."""
+        profile = MagicMock()
+        profile.path = tmp_path / "profile"
+        profile.path.mkdir()
+        (profile.path / "storage_state.json").write_text("{invalid json")
+        assert auth_instance._is_profile_already_authorized(profile) is False
+
+    def test_returns_false_when_user_auth_has_no_id(self, auth_instance, tmp_path):
+        """user_auth without 'id' field is not considered authorized."""
+        profile = MagicMock()
+        profile.path = tmp_path / "profile"
+        profile.path.mkdir()
+        state = {
+            "origins": [{
+                "origin": "https://web.telegram.org",
+                "localStorage": [
+                    {"name": "user_auth", "value": '{"date":1770762062}'},
+                ]
+            }]
+        }
+        (profile.path / "storage_state.json").write_text(json.dumps(state))
+        assert auth_instance._is_profile_already_authorized(profile) is False
+
+
 class TestBrowserWatchdog:
     """Tests for BrowserWatchdog thread-based timeout mechanism."""
 
