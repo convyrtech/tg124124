@@ -32,6 +32,7 @@ except ImportError as e:
     raise ImportError("camoufox not installed. Run: pip install camoufox && camoufox fetch") from e
 
 from .proxy_relay import ProxyRelay, needs_relay
+from .paths import PROFILES_DIR as _PROFILES_DIR
 
 
 @dataclass
@@ -340,7 +341,7 @@ class BrowserManager:
     - WebRTC blocking
     """
 
-    PROFILES_DIR = Path("profiles")
+    PROFILES_DIR = _PROFILES_DIR
 
     # Hardened Camoufox настройки
     DEFAULT_CONFIG = {
@@ -400,6 +401,13 @@ class BrowserManager:
         """Собирает аргументы для Camoufox"""
         args = {**self.DEFAULT_CONFIG}
         args["headless"] = headless
+
+        # In frozen mode: use bundled camoufox binary
+        if getattr(sys, 'frozen', False):
+            from .paths import APP_ROOT
+            bundled_exe = APP_ROOT / "camoufox" / ("camoufox.exe" if sys.platform == 'win32' else "camoufox")
+            if bundled_exe.exists():
+                args["executable_path"] = str(bundled_exe)
 
         if profile.proxy:
             args["proxy"] = parse_proxy(profile.proxy)

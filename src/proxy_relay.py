@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import socket
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -84,6 +85,7 @@ class ProxyRelay:
         self.local_host = local_host
         self.local_port: Optional[int] = None
         self._process: Optional[asyncio.subprocess.Process] = None
+        self._server_handle = None  # For in-process pproxy (frozen exe)
         self._started = False
 
     @property
@@ -104,6 +106,9 @@ class ProxyRelay:
         """
         Запускает proxy relay.
 
+        In frozen (PyInstaller) mode: runs pproxy in-process via asyncio.
+        In dev mode: spawns pproxy_wrapper.py as subprocess.
+
         Returns:
             URL локального HTTP прокси (http://127.0.0.1:PORT)
         """
@@ -115,36 +120,16 @@ class ProxyRelay:
         listen_uri = f"http://{self.local_host}:{self.local_port}"
         remote_uri = self.config.to_pproxy_uri()
 
-        wrapper_path = os.path.join(os.path.dirname(__file__), "pproxy_wrapper.py")
-
-        cmd = [
-            "python", wrapper_path,
-            "-l", listen_uri,
-            "-r", remote_uri,
-            "-v"  # Verbose для отладки
-        ]
-
         logger.info("Starting local HTTP relay...")
         logger.debug("Listen: %s", listen_uri)
         logger.debug("Remote: %s://%s:%s", self.config.protocol, self.config.host, self.config.port)
 
-        self._process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        if getattr(sys, 'frozen', False):
+            await self._start_in_process(listen_uri, remote_uri)
+        else:
+            await self._start_subprocess(listen_uri, remote_uri)
 
-        await asyncio.sleep(0.5)
-
-        if self._process.returncode is not None:
-            stderr = await self._process.stderr.read()
-            self._process = None
-            raise RuntimeError(f"ProxyRelay failed to start: {stderr.decode()}")
-
-        logger.debug("ProxyRelay process started (PID: %d)", self._process.pid)
-
-        # FIX-011: Health check - проверяем что relay слушает на порту
-        # FIX-B: Kill subprocess if health check fails (prevents zombie pproxy)
+        # Health check — verify relay is listening
         try:
             for retry in range(10):
                 try:
@@ -161,12 +146,7 @@ class ProxyRelay:
                             f"Proxy relay not responding on {self.local_host}:{self.local_port}"
                         )
         except Exception:
-            if self._process:
-                try:
-                    self._process.kill()
-                except ProcessLookupError:
-                    pass
-                self._process = None
+            await self._cleanup_on_failure()
             raise
 
         self._started = True
@@ -174,8 +154,66 @@ class ProxyRelay:
 
         return self.local_url
 
+    async def _start_in_process(self, listen_uri: str, remote_uri: str) -> None:
+        """Start pproxy relay in-process (for frozen exe — no subprocess needed)."""
+        import pproxy
+
+        server = pproxy.Server(listen_uri)
+        remote = pproxy.Connection(remote_uri)
+        self._server_handle = await server.start_server({'rserver': [remote]})
+        logger.debug("ProxyRelay started in-process (frozen mode)")
+
+    async def _start_subprocess(self, listen_uri: str, remote_uri: str) -> None:
+        """Start pproxy relay as subprocess (dev mode)."""
+        wrapper_path = os.path.join(os.path.dirname(__file__), "pproxy_wrapper.py")
+
+        cmd = [
+            "python", wrapper_path,
+            "-l", listen_uri,
+            "-r", remote_uri,
+            "-v"
+        ]
+
+        self._process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        await asyncio.sleep(0.5)
+
+        if self._process.returncode is not None:
+            stderr = await self._process.stderr.read()
+            self._process = None
+            raise RuntimeError(f"ProxyRelay failed to start: {stderr.decode()}")
+
+        logger.debug("ProxyRelay process started (PID: %d)", self._process.pid)
+
+    async def _cleanup_on_failure(self) -> None:
+        """Cleanup relay resources after health check failure."""
+        if self._server_handle:
+            self._server_handle.close()
+            self._server_handle = None
+        if self._process:
+            try:
+                self._process.kill()
+            except ProcessLookupError:
+                pass
+            self._process = None
+
     async def stop(self):
-        """Останавливает proxy relay"""
+        """Останавливает proxy relay (subprocess or in-process)."""
+        # In-process server (frozen mode)
+        if self._server_handle:
+            try:
+                self._server_handle.close()
+                logger.debug("ProxyRelay in-process server closed")
+            except Exception as e:
+                logger.warning("Error closing in-process relay: %s", e)
+            finally:
+                self._server_handle = None
+
+        # Subprocess (dev mode)
         if self._process:
             pid = self._process.pid
             try:

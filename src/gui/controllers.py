@@ -32,8 +32,8 @@ class AppController:
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         self.db_path = data_dir / "tgwebauth.db"
-        # Use "accounts/" for session storage — same as CLI (was data/sessions/)
-        self.sessions_dir = Path("accounts")
+        from ..paths import ACCOUNTS_DIR
+        self.sessions_dir = ACCOUNTS_DIR
         self.db: Optional[Database] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 

@@ -345,41 +345,6 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
             token_b64 += '=' * padding
         return base64.urlsafe_b64decode(token_b64)
 
-    # Try Node.js jsQR first (handles Telegram rounded corners better)
-    try:
-        import subprocess
-        import tempfile
-        import os
-
-        temp_path = None
-        try:
-            # Save image to temp file
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                temp_path = f.name
-                image.save(f, 'PNG')
-
-            # Call Node.js decoder
-            script_path = os.path.join(os.path.dirname(__file__), '..', 'decode_qr.js')
-            result = subprocess.run(
-                ['node', script_path, temp_path],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode == 0 and result.stdout.strip():
-                data = result.stdout.strip()
-                if data != 'QR_NOT_FOUND' and 'tg://login?token=' in data:
-                    token_bytes = extract_token(data)
-                    if token_bytes:
-                        logger.info("Decoded QR with jsQR (Node.js)")
-                        return token_bytes
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.unlink(temp_path)
-    except Exception as e:
-        logger.debug("jsQR error: %s", e)
-
     # Try zxing-cpp with morphological preprocessing (handles Telegram dot-style QR)
     try:
         import zxingcpp
@@ -972,9 +937,8 @@ class TelegramAuth:
         Ждёт появления QR-кода и извлекает токен.
 
         Использует несколько методов:
-        1. jsQR library injected in browser (most reliable)
-        2. JS extraction - напрямую из DOM/переменных страницы
-        3. Canvas screenshot + OpenCV decoding
+        1. JS extraction - напрямую из DOM/переменных страницы
+        2. Canvas screenshot + external decoding (zxing-cpp / OpenCV / pyzbar)
 
         Returns:
             Token bytes или screenshot bytes (для дальнейшего декодирования)
@@ -1027,96 +991,7 @@ class TelegramAuth:
                     if token_bytes:
                         return token_bytes
 
-                # Метод 0b: Инжектируем jsQR и декодируем canvas прямо в браузере
-                # Это работает лучше чем внешние декодеры для стилизованных QR Telegram
-                # Загружаем jsQR из локального файла (CDN блокируется CSP)
-                # FIX-1.4: Verify jsQR is actually available (SPA navigation loses injected scripts)
-                if hasattr(self, '_jsqr_injected') and self._jsqr_injected:
-                    try:
-                        jsqr_available = await page.evaluate("() => typeof window.jsQR === 'function'")
-                        if not jsqr_available:
-                            self._jsqr_injected = False
-                            logger.debug("jsQR lost after SPA navigation, will re-inject")
-                    except Exception:
-                        self._jsqr_injected = False
-
-                if not hasattr(self, '_jsqr_injected') or not self._jsqr_injected:
-                    try:
-                        import os
-                        jsqr_path = os.path.join(
-                            os.path.dirname(__file__), '..', 'node_modules', 'jsqr', 'dist', 'jsQR.js'
-                        )
-                        if os.path.exists(jsqr_path):
-                            await page.add_script_tag(path=jsqr_path)
-                            self._jsqr_injected = True
-                            logger.debug("jsQR injected into page")
-                        else:
-                            logger.debug(f"jsQR not found at {jsqr_path}")
-                    except Exception as e:
-                        logger.debug(f"jsQR injection error: {e}")
-
-                # FIX-1.1b: For WebGL canvas, use OffscreenCanvas to get imageData
-                qr_from_browser = await page.evaluate("""
-                    () => {
-                        const canvas = document.querySelector('canvas');
-                        if (!canvas) return null;
-
-                        if (typeof jsQR !== 'function') {
-                            return { error: 'jsQR not available' };
-                        }
-
-                        const width = canvas.width;
-                        const height = canvas.height;
-
-                        // Guard: zero-dimension canvas (not yet rendered or hidden)
-                        if (width === 0 || height === 0) {
-                            return { error: 'Canvas has zero dimensions' };
-                        }
-
-                        // Try getContext('2d') first (fastest path)
-                        let ctx = canvas.getContext('2d');
-                        let imageData;
-                        if (ctx) {
-                            imageData = ctx.getImageData(0, 0, width, height);
-                        } else {
-                            // WebGL canvas: draw to offscreen 2d canvas
-                            try {
-                                const offscreen = document.createElement('canvas');
-                                offscreen.width = width;
-                                offscreen.height = height;
-                                const ctx2 = offscreen.getContext('2d');
-                                if (!ctx2) return { error: 'Cannot create 2d context' };
-                                ctx2.drawImage(canvas, 0, 0);
-                                imageData = ctx2.getImageData(0, 0, width, height);
-                            } catch(e) {
-                                return { error: 'WebGL canvas copy failed: ' + e.message };
-                            }
-                        }
-
-                        const code = jsQR(imageData.data, width, height, {
-                            inversionAttempts: 'attemptBoth'
-                        });
-
-                        if (code && code.data) {
-                            return { qrData: code.data };
-                        }
-
-                        return { error: 'QR not decoded', width, height };
-                    }
-                """)
-
-                if qr_from_browser:
-                    if qr_from_browser.get('qrData'):
-                        qr_data = qr_from_browser['qrData']
-                        logger.info(f"Token decoded via browser jsQR")
-                        if 'tg://login?token=' in qr_data:
-                            token_bytes = extract_token_from_tg_url(qr_data)
-                            if token_bytes:
-                                return token_bytes
-                    elif qr_from_browser.get('error'):
-                        logger.debug(f"Browser jsQR: {qr_from_browser.get('error')}")
-
-                # Fallback: Получить canvas data для внешнего декодирования
+                # Получить canvas data для внешнего декодирования (zxing-cpp / OpenCV / pyzbar)
                 # FIX-1.1: toDataURL() works on both 2d AND WebGL canvases
                 # without needing getContext('2d') — which returns null on WebGL
                 qr_from_canvas = await page.evaluate("""
@@ -1302,9 +1177,6 @@ class TelegramAuth:
         for retry in range(self.QR_MAX_RETRIES):
             if retry > 0:
                 logger.info(f"QR retry {retry + 1}/{self.QR_MAX_RETRIES}...")
-                # Сбрасываем флаг jsQR при reload (скрипт теряется)
-                if hasattr(self, '_jsqr_injected'):
-                    delattr(self, '_jsqr_injected')
                 # Обновляем страницу для нового QR
                 try:
                     await page.reload(wait_until="domcontentloaded", timeout=30000)

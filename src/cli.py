@@ -73,8 +73,7 @@ except ImportError as e:
     raise ImportError("click not installed. Run: pip install click") from e
 
 
-ACCOUNTS_DIR = Path("accounts")
-PROFILES_DIR = Path("profiles")
+from .paths import ACCOUNTS_DIR, PROFILES_DIR
 
 # FIX #6: Default cooldown между аккаунтами (safe: 60-120s = 10-20 logins/hour)
 DEFAULT_COOLDOWN = 90  # секунд (центр безопасного диапазона 60-120)
@@ -369,7 +368,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
 
         # FIX-2.4: --fresh flag deletes browser_data ONLY for resolved (failed) accounts
         if fresh and retry_failed and accounts:
-            profiles_dir = Path("profiles")
+            profiles_dir = PROFILES_DIR
             failed_names = {d.name for d in accounts}
             deleted = 0
             if profiles_dir.exists():

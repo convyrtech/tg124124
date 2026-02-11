@@ -74,7 +74,7 @@ docs/                    # Plans, research, session notes
 | SOCKS5 proxy relay | proxy_relay.py | Working, has process leaks |
 | Parallel migration (CLI) | telegram_auth.py | Working (ParallelMigrationController) |
 | Worker pool (GUI, web+fragment) | worker_pool.py | Working (MigrationWorkerPool) |
-| Fragment.com OAuth | fragment_auth.py | Rewritten, needs real-site testing |
+| Fragment.com OAuth | fragment_auth.py | Live verified 1/1 (3388c58), CSS checked via Playwright MCP, ready for canary |
 | Fragment batch auth (GUI) | worker_pool.py + gui/app.py | Working (Fragment All button) |
 | SQLite state management | database.py | Working (5 tables, WAL + busy_timeout) |
 | Proxy import/check/replace | proxy_manager.py, proxy_health.py | Working |
@@ -103,7 +103,7 @@ docs/                    # Plans, research, session notes
 | ~~BrowserManager not closed on pool exit~~ | ~~P0~~ FIXED | worker_pool.py (FIX-C: run() try/finally) |
 | ~~taskkill /IM kills parallel workers~~ | ~~P0~~ FIXED | browser_manager.py (FIX-E: removed, log only) |
 | ~~GUI double-click race condition~~ | ~~P1~~ FIXED | gui/app.py (FIX-F/G: guard + button disable) |
-| Fragment CSS selectors unverified | P0 for Fragment | fragment_auth.py |
+| ~~Fragment CSS selectors unverified~~ | ~~P0~~ VERIFIED | fragment_auth.py (Playwright MCP snapshots + fallback selectors) |
 | Worker pool not in CLI | P1 | cli.py (deprioritized — GUI is production path) |
 | migration_state.py still imported | P2 dead code | cli.py |
 | QR decode len check wrong (FIX-001) | P2 | telegram_auth.py |
@@ -158,6 +158,14 @@ Step 6: Run: pytest -v --tb=short (check test status)
 Step 7: Resume work from where you left off
 ```
 
+### Available MCP Tools (USE PROACTIVELY)
+These tools are available via MCP servers. **Always check for them after context loss:**
+- **Serena** — symbolic code editing: `find_symbol`, `replace_symbol_body`, `search_for_pattern`, `get_symbols_overview`
+- **Context7** — library docs: `resolve-library-id` → `query-docs`
+- **Playwright MCP** — browser automation: `browser_snapshot`, `browser_click`, `browser_navigate`
+- **Tavily** — web search: `tavily_search`, `tavily_extract`, `tavily_research`
+- **Filesystem MCP** — file ops: `read_text_file`, `write_file`, `edit_file`, `directory_tree`
+
 ---
 
 ## 7. PROGRESS TRACKER
@@ -171,8 +179,8 @@ Phase A: Stabilization         [x] DONE (Phase 1 of production plan complete)
   A.3: Worker pool in CLI      [ ] NOT STARTED (deprioritized — GUI is production path)
   A.4: Dead code cleanup       [ ] NOT STARTED (after canary)
 
-Phase B: Fragment.com          [~] IN PROGRESS
-  B.1: Verify on real site     [ ] NOT STARTED
+Phase B: Fragment.com          [x] DONE
+  B.1: Verify on real site     [x] DONE (CSS verified via Playwright MCP, live test 1/1 in 3388c58)
   B.2: Batch Fragment via GUI  [x] DONE (Fragment All button, mode=fragment in pool)
 
 Phase C: Production            [ ] READY TO START (Phase 1 blockers resolved)

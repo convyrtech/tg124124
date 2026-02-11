@@ -14,6 +14,7 @@ import traceback
 from .theme import create_hacker_theme, create_status_themes
 from .controllers import AppController
 from ..database import AccountRecord, ProxyRecord
+from .. import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,8 @@ class TGWebAuthApp:
     """Main application window."""
 
     def __init__(self, data_dir: Optional[Path] = None):
-        self.data_dir = data_dir or Path("data")
+        from ..paths import DATA_DIR
+        self.data_dir = data_dir or DATA_DIR
         self._2fa_password: Optional[str] = None
         self._status_themes: dict = {}
         self._controller = AppController(self.data_dir)
@@ -243,7 +245,7 @@ class TGWebAuthApp:
 
         # Create viewport
         dpg.create_viewport(
-            title="TG Web Auth",
+            title=f"TG Web Auth v{__version__}",
             width=1200,
             height=800,
             min_width=800,
@@ -420,6 +422,14 @@ class TGWebAuthApp:
 
     def _create_logs_tab(self) -> None:
         """Create logs tab."""
+        with dpg.group(horizontal=True):
+            dpg.add_button(
+                label="Collect Logs",
+                callback=self._collect_diagnostics
+            )
+            dpg.add_text("", tag="diagnostics_status", color=(150, 150, 150))
+
+        dpg.add_spacer(height=5)
         dpg.add_input_text(
             tag="log_output",
             multiline=True,
@@ -428,6 +438,99 @@ class TGWebAuthApp:
             height=-1,
             default_value="[System] TG Web Auth started\n"
         )
+
+    def _collect_diagnostics(self, sender=None, app_data=None) -> None:
+        """Collect logs + system info into a ZIP for support."""
+        try:
+            import os
+            import zipfile
+            import platform
+            import subprocess as sp
+            from datetime import datetime
+            from ..paths import APP_ROOT, LOGS_DIR, DATA_DIR
+
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            zip_name = f"diagnostics_{timestamp}.zip"
+            zip_path = APP_ROOT / zip_name
+
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                # app.log (last 5000 lines)
+                log_file = LOGS_DIR / "app.log"
+                if log_file.exists():
+                    try:
+                        lines = log_file.read_text(encoding='utf-8', errors='replace').splitlines()
+                        zf.writestr("app.log", "\n".join(lines[-5000:]))
+                    except Exception:
+                        pass
+
+                # last_crash.txt
+                crash_file = LOGS_DIR / "last_crash.txt"
+                if crash_file.exists():
+                    try:
+                        zf.write(crash_file, "last_crash.txt")
+                    except Exception:
+                        pass
+
+                # Database copy (strip proxy credentials)
+                db_file = DATA_DIR / "tgwebauth.db"
+                if db_file.exists():
+                    try:
+                        import sqlite3
+                        import shutil
+                        import tempfile
+                        # Copy DB to temp, strip proxy credentials
+                        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
+                            tmp_path = tmp.name
+                        shutil.copy2(db_file, tmp_path)
+                        conn = sqlite3.connect(tmp_path)
+                        conn.execute("UPDATE proxies SET username=NULL, password=NULL")
+                        conn.commit()
+                        conn.close()
+                        zf.write(tmp_path, "tgwebauth_sanitized.db")
+                        os.unlink(tmp_path)
+                    except Exception as e:
+                        logger.debug("DB copy for diagnostics failed: %s", e)
+
+                # System info
+                try:
+                    import psutil
+                    mem = psutil.virtual_memory()
+                    disk = psutil.disk_usage(str(APP_ROOT))
+                    system_info = (
+                        f"App: TG Web Auth v{__version__}\n"
+                        f"OS: {platform.platform()}\n"
+                        f"Python: {sys.version}\n"
+                        f"Frozen: {getattr(sys, 'frozen', False)}\n"
+                        f"CPU cores: {psutil.cpu_count()}\n"
+                        f"RAM: {mem.total // (1024**2)} MB (available: {mem.available // (1024**2)} MB)\n"
+                        f"Disk: {disk.total // (1024**3)} GB (free: {disk.free // (1024**3)} GB)\n"
+                        f"App root: {APP_ROOT}\n"
+                    )
+                except Exception:
+                    system_info = (
+                        f"App: TG Web Auth v{__version__}\n"
+                        f"OS: {platform.platform()}\n"
+                        f"Python: {sys.version}\n"
+                        f"Frozen: {getattr(sys, 'frozen', False)}\n"
+                    )
+                zf.writestr("system_info.txt", system_info)
+
+            self._log(f"[Diagnostics] Created: {zip_path}")
+
+            # Update status label
+            if dpg.does_item_exist("diagnostics_status"):
+                dpg.set_value("diagnostics_status", f"Saved: {zip_name}")
+
+            # Open Explorer with file selected (Windows)
+            if sys.platform == 'win32':
+                try:
+                    sp.Popen(['explorer', '/select,', str(zip_path)])
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.error("Collect diagnostics error: %s\n%s", e, traceback.format_exc())
+            self._log(f"[Error] Diagnostics: {e}")
 
     def _show_2fa_dialog(self) -> None:
         """Show 2FA password input dialog on startup."""
@@ -1506,13 +1609,56 @@ class TGWebAuthApp:
         self._run_async(do_replace())
 
 
+def _startup_health_check() -> None:
+    """Verify critical dependencies before launching GUI.
+
+    Checks:
+    - Camoufox binary presence
+    - Required directories exist (creates if missing)
+    """
+    from ..paths import ACCOUNTS_DIR, PROFILES_DIR, DATA_DIR, LOGS_DIR
+
+    # Create required directories
+    for d in (ACCOUNTS_DIR, PROFILES_DIR, DATA_DIR, LOGS_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+    # Check Camoufox binary
+    try:
+        from camoufox.pkgman import launch_path
+        lp = launch_path()
+        if not Path(lp).exists():
+            raise FileNotFoundError(f"Camoufox binary not found at {lp}")
+    except Exception:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "TG Web Auth — Error",
+                "Camoufox browser not found.\n\n"
+                "Install with: python -m camoufox fetch\n\n"
+                "App will try to continue but migration will fail."
+            )
+            root.destroy()
+        except Exception:
+            pass
+        logger.warning("Camoufox binary not found — migration will fail")
+
+
 def main():
     """Entry point."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s | %(levelname)-7s | %(name)s | %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
+    # Install global crash handler first
+    from ..exception_handler import install_exception_handlers
+    install_exception_handlers()
+
+    # Setup logging (RotatingFileHandler + console)
+    from ..logger import setup_logging
+    setup_logging(level=logging.INFO)
+
+    # Startup health check
+    _startup_health_check()
+
     app = TGWebAuthApp()
     app.run()
 

@@ -21,11 +21,11 @@ It contains: project context, all available tools, work methodology, safety rule
 
 ### Что работает
 - Programmatic QR Login (без ручного сканирования)
-- Multi-decoder QR (jsQR, OpenCV, pyzbar)
+- Multi-decoder QR (zxing-cpp primary, OpenCV, pyzbar fallbacks)
 - Camoufox antidetect browser с persistent profiles
 - SOCKS5 proxy с auth через pproxy relay
 - Batch миграция (sequential + parallel через ParallelMigrationController)
-- Fragment.com OAuth popup flow (переписан, требует тестирования на реальных аккаунтах)
+- Fragment.com OAuth popup flow (live verified 1/1, commit 3388c58)
 - SQLite metadata (accounts, proxies, migrations, batches, operation_log) + WAL + busy_timeout=30s
 - Worker pool (asyncio queue, retry, circuit breaker, mode web/fragment) - интегрирован в GUI
 - Shared BrowserManager в worker pool (LRU eviction работает глобально)
@@ -35,6 +35,8 @@ It contains: project context, all available tools, work methodology, safety rule
 - Resource monitor (CPU/RAM, adaptive concurrency)
 - PID-based force-kill zombie browsers (psutil, не taskkill /IM)
 - QR decode: zxing-cpp + morphological preprocessing (100% rate на dot-style и thin-line QR)
+- BrowserWatchdog: thread-based kill при зависании page.goto() на Windows (240s timeout)
+- Pre-check: skip browser launch for already-migrated profiles (storage_state.json user_auth check)
 - GUI (DearPyGui, 90% complete): Migrate All, Retry Failed, Fragment All, STOP, progress throttle, fragment_status column
 - CLI: 9 команд (migrate, open, list, check, health, fragment, check-proxies, proxy-refresh, init)
 - CLI atexit: psutil orphan killer (pproxy via cmdline, camoufox/firefox via name)
@@ -47,11 +49,10 @@ It contains: project context, all available tools, work methodology, safety rule
 - Async zip I/O in ProfileLifecycleManager (run_in_executor)
 - Proxy credentials stripped from profile_config.json and error messages
 - assign_proxy() checks for already-assigned proxy
-- 287 тестов проходят
+- 332 теста проходят
 
 ### Что НЕ работает / НЕ доделано
-- **Fragment auth** - CSS-селекторы не проверены на реальном fragment.com
-- **Fragment receive_updates=False** - может мешать получению кодов от 777000
+- **Fragment auth** - live verified 1/1 (commit 3388c58), CSS проверены через Playwright MCP, fallback по text content. Ready for canary (10 акков)
 - **FIX-005** - 2FA selector hardcoded
 - **migration_state.py** - deprecated, не используется (можно удалить)
 - **psutil.cpu_percent** - блокирует event loop 100ms (P2)
@@ -107,7 +108,7 @@ Camoufox → fragment.com → Click "Log in"
 Browser ──HTTP──> pproxy (localhost:random) ──SOCKS5+auth──> Remote Proxy
 ```
 
-## File Structure (9565 строк src/, 269 тестов)
+## File Structure (9565 строк src/, 332 теста)
 ```
 tg-web-auth/
 ├── accounts/                # Исходные session файлы (.gitignore)
@@ -130,15 +131,17 @@ tg-web-auth/
 │   ├── proxy_health.py      # Batch TCP check (103 строк)
 │   ├── resource_monitor.py  # CPU/RAM monitoring (159 строк)
 │   ├── security_check.py    # Fingerprint/WebRTC check (372 строк)
+│   ├── paths.py             # Centralized path resolution (dev + frozen exe)
+│   ├── exception_handler.py # Global crash hook (sys.excepthook + asyncio)
 │   ├── migration_state.py   # DEPRECATED JSON state (321 строк)
 │   ├── utils.py             # Proxy parsing helpers (103 строк)
-│   ├── logger.py            # Logging setup (83 строк)
-│   ├── pproxy_wrapper.py    # pproxy process (23 строк)
+│   ├── logger.py            # Logging setup + RotatingFileHandler (107 строк)
+│   ├── pproxy_wrapper.py    # pproxy process (dev mode only, 23 строк)
 │   └── gui/
-│       ├── app.py           # DearPyGui main window (1292 строк)
+│       ├── app.py           # DearPyGui main window + diagnostics
 │       ├── controllers.py   # GUI business logic (278 строк)
 │       └── theme.py         # Hacker dark green theme (99 строк)
-├── tests/                   # 287 тестов
+├── tests/                   # 332 теста
 │   ├── test_telegram_auth.py
 │   ├── test_fragment_auth.py
 │   ├── test_browser_manager.py
@@ -154,8 +157,8 @@ tg-web-auth/
 │   └── conftest.py
 ├── scripts/                 # Эксперименты (не в git, dead code)
 ├── docs/                    # Документация
-├── decode_qr.js             # Node.js jsQR decoder
-├── package.json
+├── TGWebAuth.spec           # PyInstaller spec (one-folder dist)
+├── build_exe.py             # Build script: PyInstaller + Camoufox copy + ZIP
 ├── requirements.txt
 ├── CLAUDE.md
 └── .gitignore
@@ -167,7 +170,7 @@ tg-web-auth/
 - **Camoufox** - Antidetect browser (Firefox-based)
 - **Playwright** - Browser automation
 - **pproxy** - SOCKS5 auth relay
-- **zxing-cpp/OpenCV/pyzbar/jsQR** - QR decoding (zxing-cpp primary, 3 fallbacks)
+- **zxing-cpp/OpenCV/pyzbar** - QR decoding (zxing-cpp primary, 2 fallbacks)
 - **Click** - CLI
 - **aiosqlite** - Async SQLite
 - **DearPyGui** - GUI
@@ -178,7 +181,7 @@ tg-web-auth/
 ### Установка
 ```bash
 pip install -r requirements.txt
-npm install                  # для jsQR decoder
+python -m camoufox fetch     # скачать Camoufox browser
 ```
 
 ### Миграция
@@ -224,7 +227,7 @@ python -m src.gui.app                                  # Запуск GUI
 
 ### Тесты
 ```bash
-pytest                    # Все 269 тестов
+pytest                    # Все 332 теста
 pytest -v                 # Verbose
 pytest tests/test_proxy_manager.py -v  # Конкретный файл
 ```
@@ -281,7 +284,7 @@ operation_log (id, account_id, operation, success, error_message,
 ## Quality Gates
 
 ### Перед завершением любой задачи
-1. [ ] `pytest` проходит без ошибок (269 тестов)
+1. [ ] `pytest` проходит без ошибок (332 теста)
 2. [ ] Self-review на типичные ошибки
 3. [ ] Нет секретов в логах
 4. [ ] Все ресурсы закрываются (async with, try/finally)
@@ -325,10 +328,33 @@ Telegram Web K валидирует сессии на сервере. Единс
 All critical resource leaks fixed: PID-based kill (psutil), proxy_relay cleanup (FIX-A/B),
 worker pool cleanup (FIX-C/D), GUI guards (FIX-F/G), shutdown handler (atexit+signal+psutil).
 
-### Fragment Auth (требует тестирования)
-- CSS-селекторы не проверены на реальном fragment.com
-- asyncio.Event race condition в GUI context
-- Regex ловит любые 5-6 цифр как код подтверждения
+### Fragment Auth
+- Live verified 1/1 (commit 3388c58), CSS проверены через Playwright MCP
+- Fallback по text content для устойчивости к UI-изменениям
+- Ready for canary (10 аккаунтов)
 
 ### Unfixed Bugs
 - FIX-005: 2FA selector hardcoded
+
+## Packaging (PyInstaller EXE)
+
+### Сборка дистрибутива
+```bash
+pip install pyinstaller
+python build_exe.py         # -> dist/TGWebAuth.zip (~400MB)
+```
+
+### Frozen exe особенности
+- `src/paths.py`: `sys.frozen` → `sys.executable.parent` (вместо `__file__`)
+- `src/proxy_relay.py`: in-process pproxy (no subprocess) when frozen
+- `src/browser_manager.py`: `executable_path` → `APP_ROOT/camoufox/camoufox.exe` when frozen
+- Camoufox binary copied by `build_exe.py` into `dist/TGWebAuth/camoufox/`
+
+## Available MCP Tools (preserve after compaction)
+
+**ALWAYS use these tools proactively:**
+- **Serena** — symbolic code editing: `find_symbol`, `replace_symbol_body`, `search_for_pattern`, `get_symbols_overview`
+- **Context7** — library docs lookup: `resolve-library-id` → `query-docs`
+- **Playwright MCP** — browser automation: `browser_snapshot`, `browser_click`, `browser_navigate`, `browser_take_screenshot`
+- **Tavily** — web search/extract: `tavily_search`, `tavily_extract`, `tavily_research`
+- **Filesystem MCP** — file operations: `read_text_file`, `write_file`, `edit_file`, `directory_tree`

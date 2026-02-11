@@ -13,25 +13,32 @@ Usage:
 
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+
+from .paths import LOGS_DIR
 
 
 def setup_logging(
     level: int = logging.INFO,
     log_file: Optional[Path] = None,
-    format_string: Optional[str] = None
+    format_string: Optional[str] = None,
+    enable_file_logging: bool = True
 ) -> None:
     """
     Configure root logger with consistent formatting.
 
     Args:
         level: Logging level (DEBUG, INFO, WARNING, ERROR)
-        log_file: Optional file path to write logs
+        log_file: Optional file path to write logs (overrides default)
         format_string: Custom format string (uses default if None)
+        enable_file_logging: If True, always write to LOGS_DIR/app.log with rotation
     """
     if format_string is None:
         format_string = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
+
+    formatter = logging.Formatter(format_string, datefmt="%Y-%m-%d %H:%M:%S")
 
     # Configure root logger
     root_logger = logging.getLogger()
@@ -43,15 +50,32 @@ def setup_logging(
     # Console handler (stderr for visibility)
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(level)
-    console_handler.setFormatter(logging.Formatter(format_string, datefmt="%Y-%m-%d %H:%M:%S"))
+    console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
 
-    # File handler (optional)
+    # Rotating file handler — always enabled (5MB x 3 files)
+    if enable_file_logging:
+        try:
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            rotating_handler = RotatingFileHandler(
+                LOGS_DIR / "app.log",
+                maxBytes=5 * 1024 * 1024,
+                backupCount=3,
+                encoding='utf-8'
+            )
+            rotating_handler.setLevel(level)
+            rotating_handler.setFormatter(formatter)
+            root_logger.addHandler(rotating_handler)
+        except Exception as e:
+            # Don't crash if log dir is read-only
+            print(f"Warning: could not enable file logging: {e}", file=sys.stderr)
+
+    # Optional additional file handler (for CLI --log-file)
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(level)
-        file_handler.setFormatter(logging.Formatter(format_string, datefmt="%Y-%m-%d %H:%M:%S"))
+        file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
 
 

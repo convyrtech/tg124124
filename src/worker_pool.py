@@ -18,6 +18,8 @@ import logging
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .paths import PROFILES_DIR
 from typing import Callable, Optional
 
 from .browser_manager import BrowserManager
@@ -516,7 +518,7 @@ class MigrationWorkerPool:
                     if auth_result.user_info else None
                 )
                 profile_path = (
-                    str(Path("profiles") / auth_result.profile_name)
+                    str(PROFILES_DIR / auth_result.profile_name)
                     if auth_result.profile_name else None
                 )
                 await self._complete_migration_safe(
