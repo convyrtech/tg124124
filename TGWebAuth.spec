@@ -13,7 +13,7 @@ binaries = []
 hiddenimports = []
 
 # Camoufox: playwright-based, needs its driver
-for pkg in ('playwright', 'camoufox'):
+for pkg in ('playwright', 'camoufox', 'browserforge'):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -44,13 +44,13 @@ hiddenimports += [
     'tkinter',
     'tkinter.filedialog',
     'tkinter.messagebox',
-    'PySocks',
+    'socks',  # PySocks package imports as 'socks'
     'socks',
     'sqlite3',
 ]
 
 a = Analysis(
-    ['src/gui/app.py'],
+    ['main.py'],
     pathex=['.'],
     binaries=binaries,
     datas=datas,
