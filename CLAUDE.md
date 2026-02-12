@@ -52,11 +52,23 @@ It contains: project context, all available tools, work methodology, safety rule
 - PyInstaller EXE packaging (one-folder dist, frozen exe support)
 - 326 тестов проходят
 
+### Pre-production Audit (2026-02-12, commit ee5957b)
+6 критических багов найдены и исправлены:
+1. **FloodWait detection** — `"FLOOD_WAIT" in "FloodWait: 30s"` = False → case-insensitive match
+2. **CancelledError leak** — `except Exception` не ловит CancelledError (Python 3.11+) → `except BaseException`
+3. **Batch pause deadlock** — workers на `batch_pause_event.wait()` не потребляли stop sentinels → `event.set()` before sentinels
+4. **migrate_accounts_parallel dedup** — дубли → AUTH_KEY_DUPLICATED → `dict.fromkeys()`
+5. **ParallelMigrationController cooldown=5s** — 7200 логинов/час → `max(cooldown, MIN_COOLDOWN)`
+6. **GUI shutdown mid-flight** — `loop.stop()` без ожидания workers → poll `_active_pool` up to 30s
+
 ### Что НЕ работает / НЕ доделано
-- **Fragment auth** - live verified 1/1 (commit 3388c58), ready for canary (10 акков)
-- **FIX-005** - 2FA selector hardcoded
+- **FIX-005** - 2FA selector hardcoded (P2)
 - **psutil.cpu_percent** - блокирует event loop 100ms (P2)
 - **operation_log** - растёт без ротации (P2)
+- **Sync sqlite3.connect(timeout=10)** в async-коде (P2, telegram_auth.py:647, fragment_auth.py:97)
+- **find_free_port TOCTOU** — порт может быть занят между bind и pproxy startup (P2, proxy_relay.py:61)
+- **_collect_diagnostics** блокирует GUI main thread при 1000 профилях (P2)
+- **_migration_cancel** — мёртвый код, flag выставляется но нигде не читается (P3)
 
 ## Architecture
 
@@ -266,7 +278,7 @@ operation_log (id, account_id, operation, success, error_message,
 ### ЗАПРЕЩЕНО
 - Hardcoded credentials
 - `print()` вместо `logging`
-- Bare `except:` (только `except Exception as e:`)
+- Bare `except:` (используй `except Exception as e:` или `except BaseException:` для cleanup)
 - Игнорирование возвращаемых ошибок
 - Использование одной session из двух клиентов одновременно
 
@@ -308,6 +320,8 @@ operation_log (id, account_id, operation, success, error_message,
 - BrowserManager: close_all() in finally of any method that creates browsers
 - asyncio.Queue: task_done() MUST be in finally block, never after try/except
 - GUI batch ops: disable buttons + check _active_pool guard before starting
+- CancelledError: use `except BaseException` (not Exception) when cleaning up resources in async code
+- Batch pause: always `set()` batch_pause_event before sending stop sentinels to workers
 
 ### Windows Gotchas
 - NEVER use `taskkill /IM` — kills ALL instances including parallel workers
@@ -330,13 +344,25 @@ Telegram Web K валидирует сессии на сервере. Единс
 All critical resource leaks fixed: PID-based kill (psutil), proxy_relay cleanup (FIX-A/B),
 worker pool cleanup (FIX-C/D), GUI guards (FIX-F/G), shutdown handler (atexit+signal+psutil).
 
+### Pre-prod Audit Fixes (2026-02-12, commit ee5957b)
+- FloodWait detection: case-insensitive match in worker_pool.py
+- CancelledError: `except BaseException` in browser_manager.py launch()
+- Batch pause deadlock: `batch_pause_event.set()` before stop sentinels
+- Dedup: `dict.fromkeys()` in migrate_accounts_parallel()
+- Min cooldown: `max(cooldown, MIN_COOLDOWN)` in ParallelMigrationController
+- GUI shutdown: poll _active_pool for graceful worker completion
+
 ### Fragment Auth
 - Live verified 1/1 (commit 3388c58), CSS проверены через Playwright MCP
 - Fallback по text content для устойчивости к UI-изменениям
 - Ready for canary (10 аккаунтов)
 
-### Unfixed Bugs
+### Unfixed Bugs (P2/P3)
 - FIX-005: 2FA selector hardcoded
+- Sync sqlite3.connect() blocks event loop (telegram_auth.py:647, fragment_auth.py:97)
+- find_free_port TOCTOU race (proxy_relay.py:61)
+- _collect_diagnostics blocks GUI thread with 1000 profiles
+- _migration_cancel dead code (app.py:1388)
 
 ## Packaging (PyInstaller EXE)
 
