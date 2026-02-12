@@ -78,3 +78,7 @@ poc_qr_login.py
 scripts/
 
 # Proxy configs (sensitive)
+прокси.txt
+
+# Fonts (downloaded at runtime to %APPDATA%)
+fonts/
