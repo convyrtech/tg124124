@@ -91,13 +91,17 @@ class FragmentAuth:
         device = self.account.device
 
         # WAL mode for SQLite session
+        # Offloaded to executor: sqlite3.connect(timeout=10) can block up to 10s
         session_path = self.account.session_path
         if session_path.exists():
+            def _enable_wal(path: str) -> None:
+                c = sqlite3.connect(path, timeout=10)
+                c.execute('PRAGMA journal_mode=WAL')
+                c.execute('PRAGMA busy_timeout=10000')
+                c.close()
             try:
-                conn = sqlite3.connect(str(session_path), timeout=10)
-                conn.execute('PRAGMA journal_mode=WAL')
-                conn.execute('PRAGMA busy_timeout=10000')
-                conn.close()
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, _enable_wal, str(session_path))
             except sqlite3.Error as e:
                 logger.warning("Could not set WAL mode for session: %s", e)
 

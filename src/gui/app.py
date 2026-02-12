@@ -81,7 +81,7 @@ class TGWebAuthApp:
         # Track active browser contexts for cleanup
         self._active_browsers: List = []
         self._shutting_down: bool = False
-        self._migration_cancel: bool = False
+
         self._active_pool = None
         self._last_table_refresh: float = 0.0
         # Fix #10: O(1) log append with bounded deque instead of O(n) string concat
@@ -458,7 +458,12 @@ class TGWebAuthApp:
         )
 
     def _collect_diagnostics(self, sender=None, app_data=None) -> None:
-        """Collect logs + system info into a ZIP for support."""
+        """Collect logs + system info into a ZIP for support (runs async to avoid GUI freeze)."""
+        self._schedule_ui(lambda: dpg.set_value("diagnostics_status", "Collecting..."))
+        self._run_async(self._collect_diagnostics_async())
+
+    async def _collect_diagnostics_async(self) -> None:
+        """Async wrapper: offloads heavy I/O (rglob, DB copy) to executor."""
         try:
             import os
             import zipfile
@@ -467,135 +472,137 @@ class TGWebAuthApp:
             from datetime import datetime
             from ..paths import APP_ROOT, LOGS_DIR, DATA_DIR
 
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-            zip_name = f"diagnostics_{timestamp}.zip"
-            zip_path = APP_ROOT / zip_name
+            def _build_zip() -> str:
+                timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+                zip_name = f"diagnostics_{timestamp}.zip"
+                zip_path = APP_ROOT / zip_name
 
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                # app.log (last 5000 lines)
-                log_file = LOGS_DIR / "app.log"
-                if log_file.exists():
-                    try:
-                        lines = log_file.read_text(encoding='utf-8', errors='replace').splitlines()
-                        zf.writestr("app.log", "\n".join(lines[-5000:]))
-                    except Exception as e:
-                        logger.warning("Diagnostics: failed to collect app.log: %s", e)
-                        zf.writestr("app.log.error", f"Could not include app.log: {e}")
-
-                # last_crash.txt
-                crash_file = LOGS_DIR / "last_crash.txt"
-                if crash_file.exists():
-                    try:
-                        zf.write(crash_file, "last_crash.txt")
-                    except Exception as e:
-                        logger.warning("Diagnostics: failed to collect last_crash.txt: %s", e)
-
-                # Database copy (strip proxy credentials)
-                db_file = DATA_DIR / "tgwebauth.db"
-                if db_file.exists():
-                    tmp_path = None
-                    try:
-                        import sqlite3
-                        import shutil
-                        import tempfile
-                        # Copy DB to temp, strip proxy credentials
-                        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
-                            tmp_path = tmp.name
-                        shutil.copy2(db_file, tmp_path)
-                        conn = sqlite3.connect(tmp_path)
-                        conn.execute("UPDATE proxies SET username=NULL, password=NULL")
-                        conn.commit()
-                        conn.close()
-                        zf.write(tmp_path, "tgwebauth_sanitized.db")
-                    except Exception as e:
-                        logger.warning("DB copy for diagnostics failed: %s", e)
-                    finally:
-                        if tmp_path and os.path.exists(tmp_path):
-                            os.unlink(tmp_path)
-
-                # System info
-                try:
-                    import psutil
-                    mem = psutil.virtual_memory()
-                    disk = psutil.disk_usage(str(APP_ROOT))
-                    system_info = (
-                        f"App: TG Web Auth v{__version__}\n"
-                        f"OS: {platform.platform()}\n"
-                        f"Python: {sys.version}\n"
-                        f"Frozen: {getattr(sys, 'frozen', False)}\n"
-                        f"CPU cores: {psutil.cpu_count()}\n"
-                        f"RAM: {mem.total // (1024**2)} MB (available: {mem.available // (1024**2)} MB)\n"
-                        f"Disk: {disk.total // (1024**3)} GB (free: {disk.free // (1024**3)} GB)\n"
-                        f"App root: {APP_ROOT}\n"
-                    )
-                except Exception:
-                    system_info = (
-                        f"App: TG Web Auth v{__version__}\n"
-                        f"OS: {platform.platform()}\n"
-                        f"Python: {sys.version}\n"
-                        f"Frozen: {getattr(sys, 'frozen', False)}\n"
-                    )
-                # Camoufox version
-                try:
-                    from camoufox import __version__ as cfx_ver
-                    system_info += f"Camoufox: {cfx_ver}\n"
-                except Exception:
-                    system_info += "Camoufox: unknown\n"
-                zf.writestr("system_info.txt", system_info)
-
-                # Profiles summary (count + sizes, no sensitive data)
-                try:
-                    from ..paths import PROFILES_DIR
-                    prof_lines = []
-                    if PROFILES_DIR.exists():
-                        for p in sorted(PROFILES_DIR.iterdir()):
-                            if p.is_dir():
-                                size = sum(
-                                    f.stat().st_size for f in p.rglob("*") if f.is_file()
-                                )
-                                prof_lines.append(f"  {p.name}: {size // 1024} KB")
-                    header = f"Total profiles: {len(prof_lines)}\n"
-                    zf.writestr("profiles_info.txt", header + "\n".join(prof_lines))
-                except Exception as e:
-                    logger.warning("Diagnostics: failed to collect profiles info: %s", e)
-
-                # Recent errors from operation_log
-                if db_file.exists():
-                    try:
-                        import sqlite3 as _sql
-                        _conn = _sql.connect(str(db_file), timeout=5)
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    # app.log (last 5000 lines)
+                    log_file = LOGS_DIR / "app.log"
+                    if log_file.exists():
                         try:
-                            rows = _conn.execute(
-                                "SELECT created_at, operation, error_message "
-                                "FROM operation_log WHERE success=0 "
-                                "ORDER BY created_at DESC LIMIT 50"
-                            ).fetchall()
+                            lines = log_file.read_text(encoding='utf-8', errors='replace').splitlines()
+                            zf.writestr("app.log", "\n".join(lines[-5000:]))
+                        except Exception as e:
+                            logger.warning("Diagnostics: failed to collect app.log: %s", e)
+                            zf.writestr("app.log.error", f"Could not include app.log: {e}")
+
+                    # last_crash.txt
+                    crash_file = LOGS_DIR / "last_crash.txt"
+                    if crash_file.exists():
+                        try:
+                            zf.write(crash_file, "last_crash.txt")
+                        except Exception as e:
+                            logger.warning("Diagnostics: failed to collect last_crash.txt: %s", e)
+
+                    # Database copy (strip proxy credentials)
+                    db_file = DATA_DIR / "tgwebauth.db"
+                    if db_file.exists():
+                        tmp_path = None
+                        try:
+                            import sqlite3
+                            import shutil
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
+                                tmp_path = tmp.name
+                            shutil.copy2(db_file, tmp_path)
+                            conn = sqlite3.connect(tmp_path)
+                            conn.execute("UPDATE proxies SET username=NULL, password=NULL")
+                            conn.commit()
+                            conn.close()
+                            zf.write(tmp_path, "tgwebauth_sanitized.db")
+                        except Exception as e:
+                            logger.warning("DB copy for diagnostics failed: %s", e)
                         finally:
-                            _conn.close()
-                        if rows:
-                            errors_text = "\n".join(
-                                f"{r[0]} | {r[1]} | {r[2]}" for r in rows
-                            )
-                            zf.writestr("recent_errors.txt", errors_text)
+                            if tmp_path and os.path.exists(tmp_path):
+                                os.unlink(tmp_path)
+
+                    # System info
+                    try:
+                        import psutil
+                        mem = psutil.virtual_memory()
+                        disk = psutil.disk_usage(str(APP_ROOT))
+                        system_info = (
+                            f"App: TG Web Auth v{__version__}\n"
+                            f"OS: {platform.platform()}\n"
+                            f"Python: {sys.version}\n"
+                            f"Frozen: {getattr(sys, 'frozen', False)}\n"
+                            f"CPU cores: {psutil.cpu_count()}\n"
+                            f"RAM: {mem.total // (1024**2)} MB (available: {mem.available // (1024**2)} MB)\n"
+                            f"Disk: {disk.total // (1024**3)} GB (free: {disk.free // (1024**3)} GB)\n"
+                            f"App root: {APP_ROOT}\n"
+                        )
+                    except Exception:
+                        system_info = (
+                            f"App: TG Web Auth v{__version__}\n"
+                            f"OS: {platform.platform()}\n"
+                            f"Python: {sys.version}\n"
+                            f"Frozen: {getattr(sys, 'frozen', False)}\n"
+                        )
+                    try:
+                        from camoufox import __version__ as cfx_ver
+                        system_info += f"Camoufox: {cfx_ver}\n"
+                    except Exception:
+                        system_info += "Camoufox: unknown\n"
+                    zf.writestr("system_info.txt", system_info)
+
+                    # Profiles summary (count + sizes, no sensitive data)
+                    try:
+                        from ..paths import PROFILES_DIR
+                        prof_lines = []
+                        if PROFILES_DIR.exists():
+                            for p in sorted(PROFILES_DIR.iterdir()):
+                                if p.is_dir():
+                                    size = sum(
+                                        f.stat().st_size for f in p.rglob("*") if f.is_file()
+                                    )
+                                    prof_lines.append(f"  {p.name}: {size // 1024} KB")
+                        header = f"Total profiles: {len(prof_lines)}\n"
+                        zf.writestr("profiles_info.txt", header + "\n".join(prof_lines))
                     except Exception as e:
-                        logger.warning("Diagnostics: failed to collect operation_log: %s", e)
+                        logger.warning("Diagnostics: failed to collect profiles info: %s", e)
 
-            self._log(f"[Diagnostics] Created: {zip_path}")
+                    # Recent errors from operation_log
+                    if db_file.exists():
+                        try:
+                            import sqlite3 as _sql
+                            _conn = _sql.connect(str(db_file), timeout=5)
+                            try:
+                                rows = _conn.execute(
+                                    "SELECT created_at, operation, error_message "
+                                    "FROM operation_log WHERE success=0 "
+                                    "ORDER BY created_at DESC LIMIT 50"
+                                ).fetchall()
+                            finally:
+                                _conn.close()
+                            if rows:
+                                errors_text = "\n".join(
+                                    f"{r[0]} | {r[1]} | {r[2]}" for r in rows
+                                )
+                                zf.writestr("recent_errors.txt", errors_text)
+                        except Exception as e:
+                            logger.warning("Diagnostics: failed to collect operation_log: %s", e)
 
-            # Update status label
-            if dpg.does_item_exist("diagnostics_status"):
-                dpg.set_value("diagnostics_status", f"Saved: {zip_name}")
+                return zip_name, str(zip_path)
+
+            loop = asyncio.get_running_loop()
+            zip_name, zip_path_str = await loop.run_in_executor(None, _build_zip)
+
+            self._log(f"[Diagnostics] Created: {zip_path_str}")
+            self._schedule_ui(lambda: dpg.set_value("diagnostics_status", f"Saved: {zip_name}"))
 
             # Open Explorer with file selected (Windows)
             if sys.platform == 'win32':
                 try:
-                    sp.Popen(['explorer', '/select,', str(zip_path)])
+                    sp.Popen(['explorer', '/select,', zip_path_str])
                 except Exception:
                     pass
 
         except Exception as e:
             logger.error("Collect diagnostics error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Diagnostics: {e}")
+            self._schedule_ui(lambda: dpg.set_value("diagnostics_status", "Error!"))
 
     def _show_2fa_dialog(self) -> None:
         """Show 2FA password input dialog on startup."""
@@ -1328,7 +1335,7 @@ class TGWebAuthApp:
             # Disable buttons immediately on main thread
             self._set_batch_buttons_enabled(False)
             self._log(f"[Migrate] Starting migration of {len(selected_ids)} selected accounts...")
-            self._migration_cancel = False
+
             self._run_async(self._batch_migrate(selected_ids))
         except Exception as e:
             logger.error("Migrate selected error: %s", e)
@@ -1344,7 +1351,7 @@ class TGWebAuthApp:
         # Disable buttons immediately on main thread to prevent race
         self._set_batch_buttons_enabled(False)
         self._log("[Migrate] Starting batch migration of all pending...")
-        self._migration_cancel = False
+
 
         async def get_pending_ids():
             accounts = await self._controller.db.list_accounts(status="pending")
@@ -1380,7 +1387,7 @@ class TGWebAuthApp:
         # Disable buttons immediately on main thread
         self._set_batch_buttons_enabled(False)
         self._log("[Retry] Retrying failed accounts...")
-        self._migration_cancel = False
+
 
         async def get_error_ids():
             accounts = await self._controller.db.list_accounts(status="error")
@@ -1399,7 +1406,7 @@ class TGWebAuthApp:
 
     def _stop_migration(self, sender=None, app_data=None) -> None:
         """Stop ongoing migration."""
-        self._migration_cancel = True
+
         if hasattr(self, '_active_pool') and self._active_pool:
             self._active_pool.request_shutdown()
         self._log("[Migrate] STOP requested - finishing active accounts...")
@@ -1454,7 +1461,7 @@ class TGWebAuthApp:
         # Disable buttons immediately on main thread
         self._set_batch_buttons_enabled(False)
         self._log("[Fragment] Starting batch fragment auth for healthy accounts...")
-        self._migration_cancel = False
+
 
         async def get_healthy_ids():
             accounts = await self._controller.db.list_accounts(status="healthy")

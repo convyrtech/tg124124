@@ -641,16 +641,20 @@ class TelegramAuth:
 
         # FIX-002: Включить WAL режим для SQLite session перед открытием
         # Это позволяет параллельное чтение и уменьшает блокировки
+        # Offloaded to executor: sqlite3.connect(timeout=10) can block up to 10s
         session_path = self.account.session_path
         if session_path.exists():
+            def _enable_wal(path: str) -> None:
+                c = sqlite3.connect(path, timeout=10)
+                c.execute('PRAGMA journal_mode=WAL')
+                c.execute('PRAGMA busy_timeout=10000')
+                c.close()
             try:
-                conn = sqlite3.connect(str(session_path), timeout=10)
-                conn.execute('PRAGMA journal_mode=WAL')
-                conn.execute('PRAGMA busy_timeout=10000')  # 10 секунд ожидания
-                conn.close()
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, _enable_wal, str(session_path))
                 logger.debug("SQLite WAL mode enabled for session")
             except sqlite3.Error as e:
-                logger.warning(f"Could not set WAL mode for session: {e}")
+                logger.warning("Could not set WAL mode for session: %s", e)
 
         # FIX #3: DEVICE SYNC - передаём device параметры
         client = TelegramClient(
