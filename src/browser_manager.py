@@ -675,8 +675,9 @@ class BrowserManager:
 
             self._active_browsers[profile.name] = ctx
             return ctx
-        except Exception:
+        except BaseException:
             # Cleanup proxy_relay on ANY unhandled exception in launch flow
+            # BaseException catches CancelledError (Python 3.11+: not subclass of Exception)
             if proxy_relay:
                 try:
                     await proxy_relay.stop()

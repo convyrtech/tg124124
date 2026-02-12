@@ -227,6 +227,11 @@ class MigrationWorkerPool:
                     join_timeout,
                 )
 
+            # Ensure workers aren't stuck on batch pause before sending sentinels.
+            # Without this, workers blocked on batch_pause_event.wait() would never
+            # consume the sentinels, causing asyncio.gather to hang.
+            self._batch_pause_event.set()
+
             # Send stop sentinels for each worker
             for _ in range(self._num_workers):
                 await self._queue.put(_STOP_SENTINEL)
@@ -332,7 +337,7 @@ class MigrationWorkerPool:
                 if not self._shutdown_event.is_set() and not is_retry:
                     await self._cooldown(
                         completed,
-                        is_flood_wait="FLOOD_WAIT" in (account_result.error or ""),
+                        is_flood_wait="flood" in (account_result.error or "").lower(),
                     )
             finally:
                 self._queue.task_done()

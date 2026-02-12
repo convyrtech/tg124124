@@ -135,9 +135,23 @@ class TGWebAuthApp:
         self._shutting_down = True
         logger.info("Shutting down application...")
 
-        # Stop active worker pool
-        if hasattr(self, '_active_pool') and self._active_pool:
-            self._active_pool.request_shutdown()
+        # Stop active worker pool — request shutdown and give workers time to finish
+        # their current tasks gracefully (prevents mid-flight browser/Telethon interruption
+        # which could corrupt session files).
+        pool = getattr(self, '_active_pool', None)
+        if pool:
+            pool.request_shutdown()
+            # Wait for pool workers to finish current tasks.
+            # pool.run() is running as a coroutine on the async loop — it checks
+            # shutdown_event and drains gracefully. We poll _active_pool which is
+            # set to None by _batch_migrate/_batch_fragment after pool.run() returns.
+            if self._loop:
+                import time as _time
+                deadline = _time.monotonic() + 30
+                while self._active_pool is not None and _time.monotonic() < deadline:
+                    _time.sleep(0.5)
+                if self._active_pool is not None:
+                    logger.warning("Pool did not finish within 30s, proceeding with shutdown")
             self._active_pool = None
 
         # Close all tracked browser contexts

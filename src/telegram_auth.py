@@ -2130,7 +2130,8 @@ class ParallelMigrationController:
         circuit_breaker: Optional[CircuitBreaker] = None
     ):
         self.max_concurrent = max_concurrent
-        self.cooldown = cooldown
+        # Enforce minimum cooldown to prevent mass bans at scale
+        self.cooldown = max(cooldown, MIN_COOLDOWN)
         self.resource_monitor = resource_monitor
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self._shutdown_requested = False
@@ -2362,6 +2363,9 @@ async def migrate_accounts_parallel(
     Returns:
         List of AuthResult in same order as account_dirs
     """
+    # Deduplicate to prevent AUTH_KEY_DUPLICATED from parallel same-session access
+    account_dirs = list(dict.fromkeys(account_dirs))
+
     semaphore = asyncio.Semaphore(max_concurrent)
     results: dict[int, AuthResult] = {}
     completed = 0
