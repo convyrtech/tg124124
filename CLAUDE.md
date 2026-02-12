@@ -63,12 +63,8 @@ It contains: project context, all available tools, work methodology, safety rule
 
 ### Что НЕ работает / НЕ доделано
 - **FIX-005** - 2FA selector hardcoded (P2)
-- **psutil.cpu_percent** - блокирует event loop 100ms (P2)
-- **operation_log** - растёт без ротации (P2)
-- **Sync sqlite3.connect(timeout=10)** в async-коде (P2, telegram_auth.py:647, fragment_auth.py:97)
-- **find_free_port TOCTOU** — порт может быть занят между bind и pproxy startup (P2, proxy_relay.py:61)
-- **_collect_diagnostics** блокирует GUI main thread при 1000 профилях (P2)
-- **_migration_cancel** — мёртвый код, flag выставляется но нигде не читается (P3)
+- **psutil.cpu_percent** - первый вызов возвращает 0.0 (P3, cosmetic)
+- **find_free_port TOCTOU** — порт может быть занят между bind и pproxy startup (P3, retry handles it)
 
 ## Architecture
 
@@ -359,10 +355,7 @@ worker pool cleanup (FIX-C/D), GUI guards (FIX-F/G), shutdown handler (atexit+si
 
 ### Unfixed Bugs (P2/P3)
 - FIX-005: 2FA selector hardcoded
-- Sync sqlite3.connect() blocks event loop (telegram_auth.py:647, fragment_auth.py:97)
-- find_free_port TOCTOU race (proxy_relay.py:61)
-- _collect_diagnostics blocks GUI thread with 1000 profiles
-- _migration_cancel dead code (app.py:1388)
+- find_free_port TOCTOU race (proxy_relay.py:61) — mitigated by health check + retry
 
 ## Packaging (PyInstaller EXE)
 

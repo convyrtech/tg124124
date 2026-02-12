@@ -91,9 +91,7 @@ docs/plans/              # Active plans (3 files)
 | Issue | Severity | Where |
 |-------|----------|-------|
 | 2FA selector hardcoded (FIX-005) | P2 | telegram_auth.py |
-| psutil.cpu_percent blocks event loop 100ms | P2 | resource_monitor.py |
-| operation_log grows without rotation | P2 | database.py |
-| Worker pool not in CLI | P1 | cli.py (deprioritized — GUI is production path) |
+| find_free_port TOCTOU race | P3 | proxy_relay.py (mitigated by retry) |
 | Fragment canary (10 accounts) | P1 | Ready, needs live sessions |
 | Production smoke test | P1 | Needs accounts with live Telethon sessions |
 
