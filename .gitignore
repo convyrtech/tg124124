@@ -25,18 +25,21 @@ profiles/
 *.session
 api.json
 ___config.json
-прокси.txt
 
-# Debug files
+# Debug/temp files
 debug_*.png
 popup_debug_*.html
 *.png
+*_snapshot.md
+*_snapshot_*.md
+--db-path
 
 # Storage analysis (contains auth_key!)
 storage_analysis/
 
 # Logs
 *.log
+logs/
 
 # OS
 .DS_Store
@@ -47,7 +50,7 @@ Thumbs.db
 .coverage
 htmlcov/
 
-# Node.js
+# Node.js (not used in project)
 node_modules/
 package-lock.json
 
@@ -56,14 +59,15 @@ temp_pyzbar/
 nul
 *.exe
 
-# MCP config (local paths)
+# MCP / AI tool configs (local paths)
 .mcp.json
+.serena/
+.playwright-mcp/
 
 # Claude local configs
 .claude/settings.local.json
 .claude/ralph-loop.local.md
 .claude/MASTER_PROMPT.md
-.playwright-mcp/
 
 # Data files
 data/
@@ -72,3 +76,5 @@ migration_state.json
 # Experimental/dead code
 poc_qr_login.py
 scripts/
+
+# Proxy configs (sensitive)

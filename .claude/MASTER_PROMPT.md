@@ -1,7 +1,7 @@
 # TG WEB AUTH - MASTER PROMPT
 
 > **READ THIS FIRST.** If you lost context or this is a new session, read this entire file.
-> Then read: `docs/ACTION_PLAN_2026-02-08.md` for current tasks.
+> Then read: `docs/plans/2026-02-09-production-1000-design.md` for current tasks.
 
 ---
 
@@ -12,7 +12,7 @@ for web.telegram.org (QR login) and fragment.com (Telegram Login Widget).
 
 **Hardware:** Ryzen 5600U (6C/12T), 16GB RAM, NVMe SSD, Windows.
 **Priority:** Stability > Anti-ban safety > Speed.
-**Codebase:** ~10K lines src/, 287 tests, Python 3.11+ async.
+**Codebase:** ~11K lines src/, 326 tests, Python 3.11+ async.
 
 ### How QR Login Works
 ```
@@ -35,28 +35,29 @@ After: SetAuthorizationTTL(365 days) extends session to 1 year
 
 ### File Structure
 ```
-src/telegram_auth.py     # Core QR auth (2038 lines) - main flow
-src/fragment_auth.py     # Fragment.com OAuth popup + fragment_account() (689 lines)
-src/browser_manager.py   # Camoufox + ProfileLifecycleManager + PID kill (761 lines)
-src/worker_pool.py       # Asyncio queue pool, mode web/fragment (622 lines)
-src/cli.py               # CLI 9 commands (978 lines)
-src/database.py          # SQLite: accounts, proxies, migrations, WAL (907 lines)
-src/proxy_manager.py     # Import, health check, auto-replace (442 lines)
-src/proxy_relay.py       # SOCKS5->HTTP relay via pproxy (280 lines)
-src/proxy_health.py      # Batch TCP check (103 lines)
-src/resource_monitor.py  # CPU/RAM monitoring (159 lines)
-src/security_check.py    # Fingerprint/WebRTC check (372 lines)
-src/migration_state.py   # DEPRECATED JSON state (to be deleted)
+src/telegram_auth.py     # Core QR auth (2454 lines) - main flow
+src/fragment_auth.py     # Fragment.com OAuth popup + fragment_account() (742 lines)
+src/browser_manager.py   # Camoufox + ProfileLifecycleManager + PID kill (849 lines)
+src/worker_pool.py       # Asyncio queue pool, mode web/fragment (746 lines)
+src/cli.py               # CLI 9 commands (1291 lines)
+src/database.py          # SQLite: accounts, proxies, migrations, WAL (1073 lines)
+src/proxy_manager.py     # Import, health check, auto-replace (438 lines)
+src/proxy_relay.py       # SOCKS5->HTTP relay via pproxy (329 lines)
+src/proxy_health.py      # Batch TCP check (244 lines)
+src/resource_monitor.py  # CPU/RAM monitoring (162 lines)
+src/security_check.py    # Fingerprint/WebRTC check (380 lines)
 src/utils.py             # Proxy parsing helpers (103 lines)
-src/logger.py            # Logging setup (83 lines)
-src/gui/app.py           # DearPyGui main window (1292 lines, 85% complete)
-src/gui/controllers.py   # GUI business logic (278 lines)
+src/logger.py            # Logging setup (115 lines)
+src/exception_handler.py # Global crash hook (86 lines)
+src/paths.py             # Centralized path resolution (21 lines)
+src/gui/app.py           # DearPyGui main window (1720 lines, 90% complete)
+src/gui/controllers.py   # GUI business logic (266 lines)
 src/gui/theme.py         # Hacker-style dark green theme (99 lines)
-tests/                   # 287 tests
+tests/                   # 326 tests
 accounts/                # Source session files (gitignored)
 profiles/                # Browser profiles (gitignored)
 data/                    # SQLite database (tgwebauth.db)
-docs/                    # Plans, research, session notes
+docs/plans/              # Active plans (3 files)
 ```
 
 ---
@@ -66,12 +67,12 @@ docs/                    # Plans, research, session notes
 | Feature | Module | Status |
 |---------|--------|--------|
 | QR Login (single + batch) | telegram_auth.py | Working |
-| Multi-decoder QR | telegram_auth.py | Working (jsQR, OpenCV, pyzbar) |
+| Multi-decoder QR | telegram_auth.py | Working (zxing-cpp, OpenCV, pyzbar) |
 | Camoufox antidetect | browser_manager.py | Working |
 | PID-based force-kill browsers | browser_manager.py | Working (psutil, per-PID) |
 | Profile hot/cold tiering | browser_manager.py | Working (ProfileLifecycleManager) |
 | Shared BrowserManager in pool | worker_pool.py | Working (global LRU) |
-| SOCKS5 proxy relay | proxy_relay.py | Working, has process leaks |
+| SOCKS5 proxy relay | proxy_relay.py | Working (process leaks fixed) |
 | Parallel migration (CLI) | telegram_auth.py | Working (ParallelMigrationController) |
 | Worker pool (GUI, web+fragment) | worker_pool.py | Working (MigrationWorkerPool) |
 | Fragment.com OAuth | fragment_auth.py | Live verified 1/1 (3388c58), CSS checked via Playwright MCP, ready for canary |
@@ -82,33 +83,19 @@ docs/                    # Plans, research, session notes
 | Resource monitor | resource_monitor.py | Working |
 | Security fingerprint check | security_check.py | Working |
 | CLI (9 commands) | cli.py | Working |
-| GUI (DearPyGui) | gui/ | 85% complete |
+| GUI (DearPyGui) | gui/ | 90% complete |
+| PyInstaller EXE | build_exe.py, TGWebAuth.spec | Working (one-folder dist) |
 
-## 3. WHAT'S BROKEN / TODO
+## 3. REMAINING TODO
 
 | Issue | Severity | Where |
 |-------|----------|-------|
-| ~~Zombie browsers at close() timeout~~ | ~~P0~~ FIXED | browser_manager.py (PID kill) |
-| ~~taskkill /IM kills ALL browsers~~ | ~~P0~~ FIXED | browser_manager.py (per-PID) |
-| ~~SQLite "database is locked" parallel~~ | ~~P0~~ FIXED | database.py (WAL + busy_timeout) |
-| ~~No shared BrowserManager~~ | ~~P1~~ FIXED | worker_pool.py |
-| ~~No batch Fragment auth~~ | ~~P1~~ FIXED | worker_pool.py + gui/app.py |
-| ~~GUI shutdown leaves zombies~~ | ~~P1~~ FIXED | gui/app.py |
-| ~~GUI progress rebuilds 1000x~~ | ~~P2~~ FIXED | gui/app.py (throttle 3s) |
-| ~~proxy_relay process leak on retry~~ | ~~P1~~ FIXED | proxy_relay.py (FIX-B: kill on health check fail) |
-| ~~proxy_relay leak on non-timeout exception~~ | ~~P0~~ FIXED | browser_manager.py (FIX-A: outer try/except) |
-| ~~proxy_relay broken state on retry~~ | ~~P1~~ FIXED | browser_manager.py (relay recreation on retry) |
-| ~~CLI no orphan cleanup on exit~~ | ~~P1~~ FIXED | cli.py (atexit psutil killer + KeyboardInterrupt) |
-| ~~task_done() deadlock on exception~~ | ~~P0~~ FIXED | worker_pool.py (FIX-D: finally block) |
-| ~~BrowserManager not closed on pool exit~~ | ~~P0~~ FIXED | worker_pool.py (FIX-C: run() try/finally) |
-| ~~taskkill /IM kills parallel workers~~ | ~~P0~~ FIXED | browser_manager.py (FIX-E: removed, log only) |
-| ~~GUI double-click race condition~~ | ~~P1~~ FIXED | gui/app.py (FIX-F/G: guard + button disable) |
-| ~~Fragment CSS selectors unverified~~ | ~~P0~~ VERIFIED | fragment_auth.py (Playwright MCP snapshots + fallback selectors) |
-| Worker pool not in CLI | P1 | cli.py (deprioritized — GUI is production path) |
-| migration_state.py still imported | P2 dead code | cli.py |
-| QR decode len check wrong (FIX-001) | P2 | telegram_auth.py |
 | 2FA selector hardcoded (FIX-005) | P2 | telegram_auth.py |
-| Duplicate proxy parsing in 4 files | P2 cleanup | various |
+| psutil.cpu_percent blocks event loop 100ms | P2 | resource_monitor.py |
+| operation_log grows without rotation | P2 | database.py |
+| Worker pool not in CLI | P1 | cli.py (deprioritized — GUI is production path) |
+| Fragment canary (10 accounts) | P1 | Ready, needs live sessions |
+| Production smoke test | P1 | Needs accounts with live Telethon sessions |
 
 ---
 
@@ -150,7 +137,7 @@ If you lost context (auto-compaction, new session, etc.):
 
 ```
 Step 1: Read this file (.claude/MASTER_PROMPT.md)
-Step 2: Read docs/ACTION_PLAN_2026-02-08.md
+Step 2: Read docs/plans/2026-02-09-production-1000-design.md
 Step 3: Run: TaskList (check in-progress tasks)
 Step 4: Run: git log --oneline -10 (see recent commits)
 Step 5: Run: git diff --stat (see uncommitted changes)
@@ -170,74 +157,25 @@ These tools are available via MCP servers. **Always check for them after context
 
 ## 7. PROGRESS TRACKER
 
-Update this section as phases complete:
-
 ```
-Phase A: Stabilization         [x] DONE (Phase 1 of production plan complete)
-  A.1: Resource leaks fix      [x] DONE (FIX-A/B/C/D/E — proxy_relay, browser, pool, task_done)
-  A.2: Critical bugs fix       [x] DONE (SQLite WAL, GUI race conditions FIX-F/G)
-  A.3: Worker pool in CLI      [ ] NOT STARTED (deprioritized — GUI is production path)
-  A.4: Dead code cleanup       [ ] NOT STARTED (after canary)
-
-Phase B: Fragment.com          [x] DONE
-  B.1: Verify on real site     [x] DONE (CSS verified via Playwright MCP, live test 1/1 in 3388c58)
-  B.2: Batch Fragment via GUI  [x] DONE (Fragment All button, mode=fragment in pool)
-
-Phase C: Production            [ ] READY TO START (Phase 1 blockers resolved)
+Phase A: Stabilization         [x] DONE
+Phase B: Fragment.com          [x] DONE (live verified 1/1, commit 3388c58)
+Phase C: Production            [ ] READY TO START
   C.1: Pre-flight checks       [ ] NOT STARTED
-  C.2: Canary (5-10 accs)      [ ] NOT STARTED
+  C.2: Canary (5-10 accs)      [ ] NOT STARTED (needs live sessions)
   C.3: Production (990 accs)   [ ] NOT STARTED
   C.4: Keep-alive setup        [ ] NOT STARTED
-
-Phase D: GUI Polish            [~] IN PROGRESS
-  D.1: Fragment All button     [x] DONE
-  D.2: Shutdown kills pool     [x] DONE
-  D.3: Progress throttle       [x] DONE
-  D.4: Button disable/guard    [x] DONE (FIX-F + FIX-G)
+Phase D: GUI Polish            [~] 90% DONE
   D.5: Full button testing     [ ] NOT STARTED
+Phase E: Packaging             [x] DONE (PyInstaller EXE, one-folder dist)
+Phase F: Cleanup               [x] DONE (2026-02-12)
+  F.1: Dead code removal       [x] DONE (migration_state.py deleted)
+  F.2: Docs cleanup            [x] DONE (12 outdated docs removed)
+  F.3: Junk files cleanup      [x] DONE (screenshots, node_modules, temp files)
+  F.4: .gitignore update       [x] DONE (.serena/, snapshots, --db-path)
 ```
 
-Previously completed (not tracked here):
-- Core QR login, batch migration, CLI, SQLite, worker pool,
-  profile lifecycle, proxy management, auth TTL, resource monitor,
-  fragment auth rewrite, GUI 85%, 269 tests.
-
-Completed in session 2026-02-09 (early):
-- PID-based force-kill zombie browsers (psutil, not taskkill /IM)
-- SQLite WAL + busy_timeout=30s
-- Shared BrowserManager across worker pool (global LRU)
-- Fragment batch auth (mode=fragment in worker_pool + GUI Fragment All)
-- GUI shutdown stops active pool
-- GUI progress throttle (3s interval)
-
-Completed in session 2026-02-09 (Phase 1 implementation):
-- FIX-A: proxy_relay cleanup on ANY exception in browser launch (outer try/except)
-- FIX-B: proxy_relay.start() kills subprocess on health check failure
-- FIX-C: worker_pool run() try/finally with browser_manager.close_all()
-- FIX-D: task_done() moved to finally block (prevents queue deadlock)
-- FIX-E: Removed dangerous taskkill /IM fallback (prevents killing parallel workers)
-- FIX-F: _migrate_all() + _migrate_selected() active pool guard
-- FIX-G: Button tags + _set_batch_buttons_enabled() disable during batch ops
-- Code review: fixed double proxy_relay.stop(), added missing guard in _migrate_selected()
-- 14 new tests (255 → 269)
-
-Completed in session 2026-02-10:
-- Proxy relay recreation on browser launch retry (stop old → new ProxyRelay → fresh port)
-- CLI atexit orphan killer (psutil cmdline for pproxy, name for camoufox/firefox)
-- CLI KeyboardInterrupt handler for fragment --all
-- 2 new tests (269 → 271)
-- Audit: found & fixed pproxy cmdline detection bug (python.exe -m pproxy, not "pproxy")
-- Smoke test attempt: account 573189220650 has dead session (expected — needs live sessions)
-
-Production audit (5 parallel agents, 50+ findings → 18 fixes):
-- Block 1 Anti-ban (7): circuit breaker single-probe, global batch pause, dedup accounts,
-  QR stale token non-retryable, queue.join timeout, shared BrowserManager in CLI, cooldown after completion
-- Block 2 Resource leaks (6): fragment_single BrowserManager P0, per-row buttons disable,
-  log deque(500), incremental table update, async zip I/O, CLI fragment shared BrowserManager
-- Block 3 Security (5): proxy creds stripped from configs/logs/errors, assign_proxy check
-- 16 new tests (271 → 287), reviewer verdict: SHIP IT
-
-**STOPPED AT:** Phase 2 — Smoke Test. Need accounts with live Telethon sessions.
+**STOPPED AT:** Phase C — Production Smoke Test. Need accounts with live Telethon sessions.
 Next: find/verify 10 accounts with live sessions → GUI "Migrate All" → monitor RAM/zombies.
 
-Last updated: 2026-02-10
+Last updated: 2026-02-12

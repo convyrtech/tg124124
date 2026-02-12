@@ -7,8 +7,8 @@ It contains: project context, all available tools, work methodology, safety rule
 **Key documents:**
 - `.claude/MASTER_PROMPT.md` - Master operating guide (READ FIRST)
 - `docs/plans/2026-02-09-production-1000-design.md` - **CURRENT** production plan (Phase 1 done, Phase 2 next)
-- `docs/ACTION_PLAN_2026-02-08.md` - Legacy plan (partially superseded by production plan above)
-- `PROMPTS.md` - Prompt generator and plugin guide
+- `docs/plans/2026-02-10-full-audit-plan.md` - Production audit findings (85% ready)
+- `docs/plans/2026-02-11-exe-packaging-plan.md` - PyInstaller EXE packaging plan
 
 ## Project Goal
 Автоматическая миграция Telegram session файлов (Telethon) в браузерные профили для:
@@ -17,7 +17,7 @@ It contains: project context, all available tools, work methodology, safety rule
 
 Масштаб: **1000 аккаунтов**, переносимость между ПК.
 
-## Current Status (2026-02-09)
+## Current Status (2026-02-12)
 
 ### Что работает
 - Programmatic QR Login (без ручного сканирования)
@@ -49,12 +49,12 @@ It contains: project context, all available tools, work methodology, safety rule
 - Async zip I/O in ProfileLifecycleManager (run_in_executor)
 - Proxy credentials stripped from profile_config.json and error messages
 - assign_proxy() checks for already-assigned proxy
-- 332 теста проходят
+- PyInstaller EXE packaging (one-folder dist, frozen exe support)
+- 326 тестов проходят
 
 ### Что НЕ работает / НЕ доделано
-- **Fragment auth** - live verified 1/1 (commit 3388c58), CSS проверены через Playwright MCP, fallback по text content. Ready for canary (10 акков)
+- **Fragment auth** - live verified 1/1 (commit 3388c58), ready for canary (10 акков)
 - **FIX-005** - 2FA selector hardcoded
-- **migration_state.py** - deprecated, не используется (можно удалить)
 - **psutil.cpu_percent** - блокирует event loop 100ms (P2)
 - **operation_log** - растёт без ротации (P2)
 
@@ -108,7 +108,7 @@ Camoufox → fragment.com → Click "Log in"
 Browser ──HTTP──> pproxy (localhost:random) ──SOCKS5+auth──> Remote Proxy
 ```
 
-## File Structure (9565 строк src/, 332 теста)
+## File Structure (11156 строк src/, 326 тестов)
 ```
 tg-web-auth/
 ├── accounts/                # Исходные session файлы (.gitignore)
@@ -119,29 +119,28 @@ tg-web-auth/
 ├── profiles/                # Browser profiles (.gitignore)
 ├── data/                    # SQLite database (.gitignore)
 │   └── tgwebauth.db
-├── src/                     # 9565 строк
-│   ├── telegram_auth.py     # QR auth + AcceptLoginToken (2038 строк)
-│   ├── fragment_auth.py     # Fragment.com OAuth popup + fragment_account() (689 строк)
-│   ├── browser_manager.py   # Camoufox + ProfileLifecycleManager + PID kill (761 строк)
-│   ├── worker_pool.py       # Asyncio queue pool, mode web/fragment (622 строк)
-│   ├── cli.py               # CLI 9 команд (978 строк)
-│   ├── database.py          # SQLite: accounts, proxies, migrations, WAL (907 строк)
-│   ├── proxy_manager.py     # Import, health check, auto-replace (442 строк)
-│   ├── proxy_relay.py       # SOCKS5→HTTP relay via pproxy (280 строк)
-│   ├── proxy_health.py      # Batch TCP check (103 строк)
-│   ├── resource_monitor.py  # CPU/RAM monitoring (159 строк)
-│   ├── security_check.py    # Fingerprint/WebRTC check (372 строк)
+├── src/                     # 11156 строк
+│   ├── telegram_auth.py     # QR auth + AcceptLoginToken (2454 строк)
+│   ├── fragment_auth.py     # Fragment.com OAuth popup + fragment_account() (742 строк)
+│   ├── browser_manager.py   # Camoufox + ProfileLifecycleManager + PID kill (849 строк)
+│   ├── worker_pool.py       # Asyncio queue pool, mode web/fragment (746 строк)
+│   ├── cli.py               # CLI 9 команд (1291 строк)
+│   ├── database.py          # SQLite: accounts, proxies, migrations, WAL (1073 строк)
+│   ├── proxy_manager.py     # Import, health check, auto-replace (438 строк)
+│   ├── proxy_relay.py       # SOCKS5→HTTP relay via pproxy (329 строк)
+│   ├── proxy_health.py      # Batch TCP check (244 строк)
+│   ├── resource_monitor.py  # CPU/RAM monitoring (162 строк)
+│   ├── security_check.py    # Fingerprint/WebRTC check (380 строк)
 │   ├── paths.py             # Centralized path resolution (dev + frozen exe)
 │   ├── exception_handler.py # Global crash hook (sys.excepthook + asyncio)
-│   ├── migration_state.py   # DEPRECATED JSON state (321 строк)
 │   ├── utils.py             # Proxy parsing helpers (103 строк)
-│   ├── logger.py            # Logging setup + RotatingFileHandler (107 строк)
+│   ├── logger.py            # Logging setup + RotatingFileHandler (115 строк)
 │   ├── pproxy_wrapper.py    # pproxy process (dev mode only, 23 строк)
 │   └── gui/
-│       ├── app.py           # DearPyGui main window + diagnostics
-│       ├── controllers.py   # GUI business logic (278 строк)
+│       ├── app.py           # DearPyGui main window + diagnostics (1720 строк)
+│       ├── controllers.py   # GUI business logic (266 строк)
 │       └── theme.py         # Hacker dark green theme (99 строк)
-├── tests/                   # 332 теста
+├── tests/                   # 326 тестов
 │   ├── test_telegram_auth.py
 │   ├── test_fragment_auth.py
 │   ├── test_browser_manager.py
@@ -151,14 +150,17 @@ tg-web-auth/
 │   ├── test_worker_pool.py
 │   ├── test_resource_monitor.py
 │   ├── test_database.py
-│   ├── test_migration_state.py
 │   ├── test_integration.py
 │   ├── test_utils.py
 │   └── conftest.py
-├── scripts/                 # Эксперименты (не в git, dead code)
-├── docs/                    # Документация
+├── docs/                    # Документация (3 плана)
+│   └── plans/
+│       ├── 2026-02-09-production-1000-design.md
+│       ├── 2026-02-10-full-audit-plan.md
+│       └── 2026-02-11-exe-packaging-plan.md
 ├── TGWebAuth.spec           # PyInstaller spec (one-folder dist)
 ├── build_exe.py             # Build script: PyInstaller + Camoufox copy + ZIP
+├── main.py                  # Entry point for PyInstaller EXE
 ├── requirements.txt
 ├── CLAUDE.md
 └── .gitignore
@@ -227,7 +229,7 @@ python -m src.gui.app                                  # Запуск GUI
 
 ### Тесты
 ```bash
-pytest                    # Все 332 теста
+pytest                    # Все 326 тестов
 pytest -v                 # Verbose
 pytest tests/test_proxy_manager.py -v  # Конкретный файл
 ```
@@ -284,7 +286,7 @@ operation_log (id, account_id, operation, success, error_message,
 ## Quality Gates
 
 ### Перед завершением любой задачи
-1. [ ] `pytest` проходит без ошибок (332 теста)
+1. [ ] `pytest` проходит без ошибок (326 тестов)
 2. [ ] Self-review на типичные ошибки
 3. [ ] Нет секретов в логах
 4. [ ] Все ресурсы закрываются (async with, try/finally)
