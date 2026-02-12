@@ -173,6 +173,10 @@ Phase F: Cleanup               [x] DONE (2026-02-12)
   F.2: Docs cleanup            [x] DONE (12 outdated docs removed)
   F.3: Junk files cleanup      [x] DONE (screenshots, node_modules, temp files)
   F.4: .gitignore update       [x] DONE (.serena/, snapshots, --db-path)
+Phase G: Pre-prod Audit        [x] DONE (2026-02-12, commit ee5957b)
+  G.1: Concurrency audit       [x] DONE (6 bugs fixed)
+  G.2: Anti-ban audit           [x] DONE (cooldown floor, dedup, FloodWait detect)
+  G.3: GUI reliability audit   [x] DONE (shutdown race fixed)
 ```
 
 **STOPPED AT:** Phase C — Production Smoke Test. Need accounts with live Telethon sessions.
