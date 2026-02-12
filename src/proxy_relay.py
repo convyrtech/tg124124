@@ -168,7 +168,7 @@ class ProxyRelay:
         wrapper_path = os.path.join(os.path.dirname(__file__), "pproxy_wrapper.py")
 
         cmd = [
-            "python", wrapper_path,
+            sys.executable, wrapper_path,
             "-l", listen_uri,
             "-r", remote_uri,
             "-v"

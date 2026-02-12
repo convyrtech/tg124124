@@ -167,11 +167,10 @@ class ProxyManager:
         if not host or not port:
             return None
 
-        # Check if exists
-        existing = await self.db.list_proxies()
-        for p in existing:
-            if p.host == host and p.port == port:
-                return p.id
+        # O(1) lookup via UNIQUE(host, port) index
+        existing_id = await self.db.find_proxy_by_host_port(host, port)
+        if existing_id is not None:
+            return existing_id
 
         try:
             return await self.db.add_proxy(
@@ -181,11 +180,7 @@ class ProxyManager:
             )
         except sqlite3.IntegrityError:
             # Race condition: created between check and insert
-            existing = await self.db.list_proxies()
-            for p in existing:
-                if p.host == host and p.port == port:
-                    return p.id
-            return None
+            return await self.db.find_proxy_by_host_port(host, port)
 
     async def import_from_file(self, file_path: Path) -> dict[str, int]:
         """Import proxies from text file.

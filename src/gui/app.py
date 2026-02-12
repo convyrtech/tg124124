@@ -464,20 +464,22 @@ class TGWebAuthApp:
                     try:
                         lines = log_file.read_text(encoding='utf-8', errors='replace').splitlines()
                         zf.writestr("app.log", "\n".join(lines[-5000:]))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Diagnostics: failed to collect app.log: %s", e)
+                        zf.writestr("app.log.error", f"Could not include app.log: {e}")
 
                 # last_crash.txt
                 crash_file = LOGS_DIR / "last_crash.txt"
                 if crash_file.exists():
                     try:
                         zf.write(crash_file, "last_crash.txt")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Diagnostics: failed to collect last_crash.txt: %s", e)
 
                 # Database copy (strip proxy credentials)
                 db_file = DATA_DIR / "tgwebauth.db"
                 if db_file.exists():
+                    tmp_path = None
                     try:
                         import sqlite3
                         import shutil
@@ -491,9 +493,11 @@ class TGWebAuthApp:
                         conn.commit()
                         conn.close()
                         zf.write(tmp_path, "tgwebauth_sanitized.db")
-                        os.unlink(tmp_path)
                     except Exception as e:
-                        logger.debug("DB copy for diagnostics failed: %s", e)
+                        logger.warning("DB copy for diagnostics failed: %s", e)
+                    finally:
+                        if tmp_path and os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
 
                 # System info
                 try:
@@ -538,26 +542,29 @@ class TGWebAuthApp:
                                 prof_lines.append(f"  {p.name}: {size // 1024} KB")
                     header = f"Total profiles: {len(prof_lines)}\n"
                     zf.writestr("profiles_info.txt", header + "\n".join(prof_lines))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Diagnostics: failed to collect profiles info: %s", e)
 
                 # Recent errors from operation_log
-                try:
-                    import sqlite3 as _sql
-                    _conn = _sql.connect(str(db_file))
-                    rows = _conn.execute(
-                        "SELECT created_at, operation, error_message "
-                        "FROM operation_log WHERE success=0 "
-                        "ORDER BY created_at DESC LIMIT 50"
-                    ).fetchall()
-                    _conn.close()
-                    if rows:
-                        errors_text = "\n".join(
-                            f"{r[0]} | {r[1]} | {r[2]}" for r in rows
-                        )
-                        zf.writestr("recent_errors.txt", errors_text)
-                except Exception:
-                    pass
+                if db_file.exists():
+                    try:
+                        import sqlite3 as _sql
+                        _conn = _sql.connect(str(db_file), timeout=5)
+                        try:
+                            rows = _conn.execute(
+                                "SELECT created_at, operation, error_message "
+                                "FROM operation_log WHERE success=0 "
+                                "ORDER BY created_at DESC LIMIT 50"
+                            ).fetchall()
+                        finally:
+                            _conn.close()
+                        if rows:
+                            errors_text = "\n".join(
+                                f"{r[0]} | {r[1]} | {r[2]}" for r in rows
+                            )
+                            zf.writestr("recent_errors.txt", errors_text)
+                    except Exception as e:
+                        logger.warning("Diagnostics: failed to collect operation_log: %s", e)
 
             self._log(f"[Diagnostics] Created: {zip_path}")
 
@@ -1398,7 +1405,8 @@ class TGWebAuthApp:
 
             pool = MigrationWorkerPool(
                 db=self._controller.db,
-                num_workers=3,
+                num_workers=5,
+                batch_pause_every=50,
                 password_2fa=self._2fa_password,
                 on_progress=lambda completed, total, result:
                     self._throttled_refresh(completed, total),
@@ -1456,7 +1464,8 @@ class TGWebAuthApp:
 
             pool = MigrationWorkerPool(
                 db=self._controller.db,
-                num_workers=3,
+                num_workers=5,
+                batch_pause_every=50,
                 password_2fa=self._2fa_password,
                 on_progress=lambda completed, total, result:
                     self._throttled_refresh(completed, total),

@@ -20,12 +20,24 @@ def _write_crash_file(exc_type, exc_value, exc_tb) -> None:
     try:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         crash_path = LOGS_DIR / "last_crash.txt"
-        with open(crash_path, 'w', encoding='utf-8') as f:
+        # Truncate if grown too large (>1MB) to prevent unbounded growth
+        try:
+            if crash_path.exists() and crash_path.stat().st_size > 1_000_000:
+                crash_path.unlink()
+        except OSError:
+            pass
+        with open(crash_path, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*60}\n")
             f.write(f"Crash at: {datetime.now().isoformat()}\n")
             f.write(f"Exception: {exc_type.__name__}: {exc_value}\n\n")
             traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
-    except Exception:
-        pass  # Don't crash in crash handler
+    except Exception as write_err:
+        # Last resort: stderr (may be visible even in frozen exe with console=False)
+        try:
+            print(f"[CRASH HANDLER] Could not write crash file: {write_err}", file=sys.stderr)
+            traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
+        except Exception:
+            pass  # Truly nothing we can do
 
 
 def _excepthook(exc_type, exc_value, exc_tb) -> None:
@@ -47,7 +59,10 @@ def _asyncio_exception_handler(loop, context) -> None:
     message = context.get('message', 'Unknown asyncio error')
 
     if exception:
-        logger.error("Asyncio unhandled: %s — %s", message, exception, exc_info=exception)
+        logger.error(
+            "Asyncio unhandled: %s — %s", message, exception,
+            exc_info=(type(exception), exception, exception.__traceback__)
+        )
         _write_crash_file(type(exception), exception, exception.__traceback__)
     else:
         logger.error("Asyncio error: %s", message)

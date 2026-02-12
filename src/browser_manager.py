@@ -92,8 +92,11 @@ def _get_driver_pid(camoufox_instance) -> Optional[int]:
     try:
         transport = camoufox_instance._connection._transport
         return transport._proc.pid
+    except AttributeError:
+        logger.debug("Could not extract driver PID: internal API not accessible")
+        return None
     except Exception as e:
-        logger.debug("Could not extract driver PID: %s", e)
+        logger.warning("Unexpected error extracting driver PID: %s (%s)", e, type(e).__name__)
         return None
 
 
@@ -119,8 +122,11 @@ def _get_browser_pid(camoufox_instance) -> Optional[int]:
                 return child.pid
         # Fallback: return node_pid (kill node -> cascade kill children)
         return node_pid
+    except AttributeError:
+        logger.debug("Could not extract browser PID: internal API not accessible")
+        return None
     except Exception as e:
-        logger.debug("Could not extract browser PID: %s", e)
+        logger.warning("Unexpected error extracting browser PID: %s (%s)", e, type(e).__name__)
         return None
 
 
@@ -284,14 +290,13 @@ class ProfileLifecycleManager:
         self._access_order.append(name)
 
     def _hot_count(self) -> int:
-        """Count currently hot profiles by scanning filesystem."""
-        if not self.profiles_dir.exists():
-            return 0
-        count = 0
-        for entry in self.profiles_dir.iterdir():
-            if entry.is_dir() and (entry / "browser_data").exists():
-                count += 1
-        return count
+        """Count currently hot profiles using in-memory LRU tracking.
+
+        Uses _access_order length instead of scanning filesystem.
+        At 1000 profiles, fs scan is O(1000) per call — too expensive
+        when called in a while loop during eviction.
+        """
+        return len(self._access_order)
 
     async def _evict_if_needed(self, protected: Optional[set[str]] = None) -> None:
         """Evict LRU profiles until under max_hot capacity."""

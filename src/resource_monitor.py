@@ -81,7 +81,10 @@ class ResourceMonitor:
         """
         try:
             memory = psutil.virtual_memory()
-            cpu = psutil.cpu_percent(interval=0.1)
+            # interval=0 returns cached value since last call (non-blocking).
+            # interval=0.1 blocks the event loop for 100ms — unacceptable
+            # when called from async workers (5 workers × 100ms = 500ms blocked).
+            cpu = psutil.cpu_percent(interval=0)
 
             return {
                 'cpu_percent': cpu,

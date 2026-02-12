@@ -101,7 +101,7 @@ class MigrationWorkerPool:
         num_workers: int = 3,
         cooldown_range: tuple[float, float] = (60.0, 120.0),
         batch_pause_every: int = 10,
-        batch_pause_range: tuple[float, float] = (300.0, 600.0),
+        batch_pause_range: tuple[float, float] = (120.0, 180.0),
         max_retries: int = 2,
         task_timeout: float = 300.0,
         resource_monitor: Optional[ResourceMonitor] = None,
@@ -130,7 +130,7 @@ class MigrationWorkerPool:
             mode: "web" for QR login migration, "fragment" for fragment.com auth.
         """
         self._db = db
-        self._num_workers = max(1, min(num_workers, 8))
+        self._num_workers = max(1, min(num_workers, 20))
         self._cooldown_range = cooldown_range
         self._batch_pause_every = batch_pause_every
         self._batch_pause_range = batch_pause_range
@@ -148,9 +148,10 @@ class MigrationWorkerPool:
         self._browser_manager = BrowserManager()
 
         self._shutdown_event = asyncio.Event()
-        self._queue: asyncio.Queue[int] = asyncio.Queue(
-            maxsize=self._num_workers * 2
-        )
+        # Unlimited queue: retries go back into the queue, bounded buffer
+        # would drop retries after 30s timeout when full. Memory is trivial
+        # for 1000 ints. Backpressure is naturally regulated by worker count.
+        self._queue: asyncio.Queue[int] = asyncio.Queue()
 
         # Shared counter for completed items
         self._completed_count = 0
@@ -188,8 +189,8 @@ class MigrationWorkerPool:
         self._shutdown_event.clear()
         self._completed_count = 0
         self._retry_counts.clear()
-        # Recreate queue to ensure clean state
-        self._queue = asyncio.Queue(maxsize=self._num_workers * 2)
+        # Recreate queue to ensure clean state (unlimited — see __init__ comment)
+        self._queue = asyncio.Queue()
         # FIX #5: Reset batch pause event to running state
         self._batch_pause_event = asyncio.Event()
         self._batch_pause_event.set()
@@ -415,8 +416,27 @@ class MigrationWorkerPool:
                     error="SKIP: Resources exhausted after wait",
                 )
 
-        # Build proxy string
+        # Build proxy string + validate proxy availability
         proxy_str = await self._build_proxy_string(account)
+        if account.proxy_id and not proxy_str:
+            # Proxy was assigned but disappeared/dead — fail fast instead
+            # of launching browser without proxy (which triggers circuit breaker
+            # cascade when all proxies die mid-batch).
+            error_msg = "SKIP: Assigned proxy not found or dead"
+            self._log(f"[W{worker_id}] {name} - {error_msg}")
+            try:
+                await self._db.update_account(
+                    account_id, status="error",
+                    error_message="Proxy unavailable"
+                )
+            except Exception as exc:
+                logger.warning("DB update failed for %s: %s", name, exc)
+            return AccountResult(
+                account_id=account_id,
+                account_name=name,
+                success=False,
+                error=error_msg,
+            )
 
         # Validate session dir exists
         session_path = Path(account.session_path)

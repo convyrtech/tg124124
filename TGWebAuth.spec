@@ -45,7 +45,6 @@ hiddenimports += [
     'tkinter.filedialog',
     'tkinter.messagebox',
     'socks',  # PySocks package imports as 'socks'
-    'socks',
     'sqlite3',
 ]
 

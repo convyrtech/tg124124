@@ -63,9 +63,9 @@ def copy_camoufox() -> None:
         from camoufox.pkgman import launch_path
         src = Path(launch_path()).parent
     except Exception as e:
-        print(f"  WARNING: Could not find Camoufox: {e}")
+        print(f"  ERROR: Could not find Camoufox: {e}")
         print("  Install with: python -m camoufox fetch")
-        return
+        sys.exit(1)
 
     dest = APP_DIR / "camoufox"
     if dest.exists():

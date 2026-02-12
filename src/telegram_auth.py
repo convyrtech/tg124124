@@ -1584,6 +1584,11 @@ class TelegramAuth:
                     profile_name=profile.name,
                 )
                 watchdog.start()
+            else:
+                logger.warning(
+                    "No browser PIDs available — watchdog disabled for '%s'",
+                    profile.name,
+                )
 
             # Устанавливаем viewport для корректного отображения QR
             await page.set_viewport_size({"width": 1280, "height": 800})
@@ -1593,7 +1598,16 @@ class TelegramAuth:
             try:
                 await page.goto(self.TELEGRAM_WEB_URL, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
-                logger.warning(f"Page load warning: {e}")
+                error_str = str(e).lower()
+                # Fail fast for non-recoverable network/proxy errors
+                fatal_patterns = (
+                    'err_proxy', 'err_tunnel', 'ns_error_proxy',
+                    'err_name_not_resolved', 'connection_refused',
+                    'target closed', 'net::err_name', 'net::err_connection',
+                )
+                if any(p in error_str for p in fatal_patterns):
+                    raise RuntimeError(f"Page load failed (non-recoverable): {e}") from e
+                logger.warning("Page load warning (will retry): %s", e)
 
             # Ждём загрузки страницы (до 15 секунд)
             logger.debug("Waiting for page to load...")

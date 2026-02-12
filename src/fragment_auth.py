@@ -587,7 +587,16 @@ class FragmentAuth:
             try:
                 await page.goto(FRAGMENT_URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
             except Exception as e:
-                logger.warning("Page load warning: %s", e)
+                error_str = str(e).lower()
+                # Fail fast for non-recoverable network/proxy errors
+                fatal_patterns = (
+                    'err_proxy', 'err_tunnel', 'ns_error_proxy',
+                    'err_name_not_resolved', 'connection_refused',
+                    'target closed', 'net::err_name', 'net::err_connection',
+                )
+                if any(p in error_str for p in fatal_patterns):
+                    raise RuntimeError(f"Page load failed (non-recoverable): {e}") from e
+                logger.warning("Page load warning (will retry): %s", e)
 
             # Wait for page JS to initialize
             state = "loading"

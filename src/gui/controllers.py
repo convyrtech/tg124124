@@ -154,11 +154,10 @@ class AppController:
             if not host or not port:
                 return None
 
-            # Check if proxy already exists
-            existing = await self.db.list_proxies()
-            for p in existing:
-                if p.host == host and p.port == port:
-                    return p.id
+            # O(1) lookup via UNIQUE(host, port) index
+            existing_id = await self.db.find_proxy_by_host_port(host, port)
+            if existing_id is not None:
+                return existing_id
 
             # Create new proxy
             return await self.db.add_proxy(
