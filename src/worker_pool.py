@@ -155,6 +155,8 @@ class MigrationWorkerPool:
 
         # Shared counter for completed items
         self._completed_count = 0
+        # Lock to prevent race condition on _completed_count + batch pause check
+        self._count_lock = asyncio.Lock()
 
         # Retry tracking: account_id -> attempts_used
         self._retry_counts: dict[int, int] = {}
@@ -331,9 +333,16 @@ class MigrationWorkerPool:
                     # Update completed count only for final results (not retries).
                     # Counting retries inflates progress and triggers batch pause
                     # too frequently (every 3-4 accounts instead of every 10).
-                    self._completed_count += 1
-
-                completed = self._completed_count
+                    # FIX BUG-1/5: Lock prevents two workers from both triggering
+                    # batch pause when they increment _completed_count concurrently.
+                    async with self._count_lock:
+                        self._completed_count += 1
+                        completed = self._completed_count
+                        should_pause = (
+                            self._batch_pause_every > 0
+                            and completed > 0
+                            and completed % self._batch_pause_every == 0
+                        )
 
                 if self._on_progress and not is_retry:
                     try:
@@ -346,6 +355,7 @@ class MigrationWorkerPool:
                     await self._cooldown(
                         completed,
                         is_flood_wait="flood" in (account_result.error or "").lower(),
+                        should_pause=should_pause,
                     )
             finally:
                 self._queue.task_done()
@@ -730,7 +740,8 @@ class MigrationWorkerPool:
         return f"{proxy.protocol}:{proxy.host}:{proxy.port}"
 
     async def _cooldown(
-        self, completed_total: int, is_flood_wait: bool = False
+        self, completed_total: int, is_flood_wait: bool = False,
+        should_pause: bool = False,
     ) -> None:
         """
         Apply per-worker cooldown and global batch pause.
@@ -738,17 +749,18 @@ class MigrationWorkerPool:
         FIX #5: Batch pause uses shared asyncio.Event to pause ALL workers,
         not just the one whose modulo count happens to hit the threshold.
 
+        FIX BUG-1/5: should_pause is determined under _count_lock in the
+        worker loop to prevent race condition on _completed_count.
+
         Args:
             completed_total: Total completed across all workers.
             is_flood_wait: If True, triple the cooldown.
+            should_pause: If True, trigger batch pause (determined under lock).
         """
-        # FIX #5: Batch pause check — CLEAR event to block ALL workers,
-        # then SET after pause to release them.
-        if (
-            self._batch_pause_every > 0
-            and completed_total > 0
-            and completed_total % self._batch_pause_every == 0
-        ):
+        # FIX #5 + BUG-1/5: Batch pause check — CLEAR event to block ALL
+        # workers, then SET after pause to release them.
+        # should_pause is pre-computed under _count_lock to avoid race.
+        if should_pause:
             pause = random.uniform(*self._batch_pause_range)
             self._log(
                 f"[Pool] Batch pause {pause / 60:.1f} min "

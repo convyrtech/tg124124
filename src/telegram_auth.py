@@ -773,6 +773,17 @@ class TelegramAuth:
             "unknown" - неизвестное состояние
         """
         try:
+            # Quick browser alive check — detect dead browser immediately
+            # instead of falling through all selectors with silent exceptions.
+            try:
+                await page.evaluate("1")
+            except Exception as e:
+                err = str(e).lower()
+                if any(p in err for p in ("target closed", "connection closed", "has been closed", "browser has been")):
+                    logger.debug("Browser dead: %s", e)
+                    return "dead"
+                # Other errors (e.g. execution context) — continue with DOM checks
+
             # Проверяем URL
             current_url = page.url
             logger.debug(f"Checking page state, URL: {current_url}")
@@ -933,6 +944,11 @@ class TelegramAuth:
 
         except Exception as e:
             error_msg = str(e).encode('ascii', 'replace').decode('ascii')
+            # Detect dead browser from any unhandled Playwright exception
+            err_lower = error_msg.lower()
+            if any(p in err_lower for p in ("target closed", "connection closed", "has been closed", "browser has been")):
+                logger.debug(f"Browser dead (from exception): {error_msg}")
+                return "dead"
             logger.debug(f"Error checking page state: {error_msg}")
             return "unknown"
 
@@ -1176,6 +1192,16 @@ class TelegramAuth:
 
         FIX-001: Используем проверку формата вместо размера для определения типа.
         """
+        # Clean up old debug screenshots (keep only last 10)
+        try:
+            debug_dir = Path("profiles")
+            for pattern in ["debug_qr_*.png", "debug_2fa_*.png"]:
+                files = sorted(debug_dir.glob(pattern), key=lambda f: f.stat().st_mtime)
+                for f in files[:-10]:  # Keep last 10
+                    f.unlink(missing_ok=True)
+        except Exception:
+            pass  # Non-critical cleanup
+
         profile_name = self.account.name.replace(' ', '_').replace('/', '_')
 
         for retry in range(self.QR_MAX_RETRIES):
@@ -1632,6 +1658,8 @@ class TelegramAuth:
             current_state = "unknown"
             for state_check in range(10):
                 current_state = await self._check_page_state(page)
+                if current_state == "dead":
+                    break
                 if current_state != "unknown" and current_state != "loading":
                     break
                 await asyncio.sleep(1)
@@ -1639,6 +1667,14 @@ class TelegramAuth:
                     logger.debug(f"Checking page state... ({state_check}s)")
 
             logger.info(f"Current page state: {current_state}")
+
+            if current_state == "dead":
+                logger.error("Browser crashed or disconnected during auth")
+                return AuthResult(
+                    success=False,
+                    profile_name=profile.name,
+                    error="Browser crashed (target closed)"
+                )
 
             if current_state == "authorized":
                 logger.info("Already authorized! Skipping QR login.")
@@ -2384,6 +2420,8 @@ async def migrate_accounts_parallel(
     completed = 0
     total = len(account_dirs)
     lock = asyncio.Lock()
+    # Shared BrowserManager for LRU eviction across all parallel workers
+    shared_browser_manager = BrowserManager()
 
     async def migrate_with_semaphore(index: int, account_dir: Path):
         nonlocal completed
@@ -2392,7 +2430,8 @@ async def migrate_accounts_parallel(
                 result = await migrate_account(
                     account_dir=account_dir,
                     password_2fa=password_2fa,
-                    headless=headless
+                    headless=headless,
+                    browser_manager=shared_browser_manager,
                 )
             except Exception as e:
                 result = AuthResult(
@@ -2412,18 +2451,25 @@ async def migrate_accounts_parallel(
 
             return result
 
-    # Create tasks with staggered start (rate limiting with jitter)
-    tasks = []
-    for i, account_dir in enumerate(account_dirs):
-        task = asyncio.create_task(migrate_with_semaphore(i, account_dir))
-        tasks.append(task)
-        # Stagger task creation with randomized delay to avoid pattern detection
-        if i < len(account_dirs) - 1 and cooldown > 0:
-            jittered = get_randomized_cooldown(cooldown)
-            await asyncio.sleep(jittered)
+    try:
+        # Create tasks with staggered start (rate limiting with jitter)
+        tasks = []
+        for i, account_dir in enumerate(account_dirs):
+            task = asyncio.create_task(migrate_with_semaphore(i, account_dir))
+            tasks.append(task)
+            # Stagger task creation with randomized delay to avoid pattern detection
+            if i < len(account_dirs) - 1 and cooldown > 0:
+                jittered = get_randomized_cooldown(cooldown)
+                await asyncio.sleep(jittered)
 
-    # Wait for all to complete
-    await asyncio.gather(*tasks, return_exceptions=True)
+        # Wait for all to complete
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        # Always clean up shared BrowserManager
+        try:
+            await shared_browser_manager.close_all()
+        except Exception as e:
+            logger.warning("BrowserManager cleanup error in migrate_accounts_parallel: %s", e)
 
     # Return results in original order
     return [results[i] for i in range(len(account_dirs))]

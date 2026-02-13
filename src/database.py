@@ -77,6 +77,9 @@ class Database:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._connection: Optional[aiosqlite.Connection] = None
+        # BUG-2 FIX: Lock to serialize multi-step write operations
+        # across concurrent workers sharing a single aiosqlite connection.
+        self._db_lock: asyncio.Lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Create database and tables if not exist."""
@@ -435,36 +438,39 @@ class Database:
         Uses atomic check-and-update to prevent TOCTOU race where
         two accounts could get the same proxy assigned.
 
+        BUG-2 FIX: Wrapped in _db_lock to prevent interleaving.
+
         Raises:
             ValueError: If proxy is already assigned to a different account.
         """
-        # FIX-P1: Atomic check-and-update — only assigns if unassigned
-        # or already assigned to this same account
-        async with self._connection.execute(
-            """UPDATE proxies
-               SET assigned_account_id = ?
-               WHERE id = ?
-                 AND (assigned_account_id IS NULL OR assigned_account_id = ?)""",
-            (account_id, proxy_id, account_id)
-        ) as cursor:
-            if cursor.rowcount == 0:
-                # Either proxy doesn't exist or is assigned to another account
-                async with self._connection.execute(
-                    "SELECT assigned_account_id FROM proxies WHERE id = ?",
-                    (proxy_id,)
-                ) as check:
-                    row = await check.fetchone()
-                    if row is None:
-                        raise ValueError(f"Proxy {proxy_id} not found")
-                    raise ValueError(
-                        f"Proxy {proxy_id} already assigned to account {row[0]}"
-                    )
+        async with self._db_lock:
+            # FIX-P1: Atomic check-and-update — only assigns if unassigned
+            # or already assigned to this same account
+            async with self._connection.execute(
+                """UPDATE proxies
+                   SET assigned_account_id = ?
+                   WHERE id = ?
+                     AND (assigned_account_id IS NULL OR assigned_account_id = ?)""",
+                (account_id, proxy_id, account_id)
+            ) as cursor:
+                if cursor.rowcount == 0:
+                    # Either proxy doesn't exist or is assigned to another account
+                    async with self._connection.execute(
+                        "SELECT assigned_account_id FROM proxies WHERE id = ?",
+                        (proxy_id,)
+                    ) as check:
+                        row = await check.fetchone()
+                        if row is None:
+                            raise ValueError(f"Proxy {proxy_id} not found")
+                        raise ValueError(
+                            f"Proxy {proxy_id} already assigned to account {row[0]}"
+                        )
 
-        await self._connection.execute(
-            "UPDATE accounts SET proxy_id = ? WHERE id = ?",
-            (proxy_id, account_id)
-        )
-        await self._commit_with_retry()
+            await self._connection.execute(
+                "UPDATE accounts SET proxy_id = ? WHERE id = ?",
+                (proxy_id, account_id)
+            )
+            await self._commit_with_retry()
 
     async def delete_proxy(self, proxy_id: int) -> None:
         """Delete proxy by ID."""
@@ -566,24 +572,35 @@ class Database:
     # ==================== Migration Tracking ====================
 
     async def start_migration(self, account_id: int) -> int:
-        """
-        Record migration start. Returns migration record ID.
+        """Record migration start. Returns migration record ID.
 
-        Updates account status to 'migrating'.
-        """
-        # Update account status
-        await self.update_account(account_id, status="migrating")
+        Updates account status to 'migrating' and creates migration record
+        in a single transaction to prevent inconsistency if one step fails.
 
-        # Create migration record
-        async with self._connection.execute(
-            """
-            INSERT INTO migrations (account_id, started_at)
-            VALUES (?, datetime('now'))
-            """,
-            (account_id,)
-        ) as cursor:
+        BUG-4 FIX: Replaced two separate commits (update_account + INSERT)
+        with a single atomic transaction under _db_lock.
+
+        Args:
+            account_id: Account ID to start migration for.
+
+        Returns:
+            Migration record ID.
+        """
+        async with self._db_lock:
+            await self._connection.execute(
+                "UPDATE accounts SET status = ? WHERE id = ?",
+                ("migrating", account_id)
+            )
+            async with self._connection.execute(
+                """
+                INSERT INTO migrations (account_id, started_at)
+                VALUES (?, ?)
+                """,
+                (account_id, datetime.now().isoformat())
+            ) as cursor:
+                migration_id = cursor.lastrowid
             await self._commit_with_retry()
-            return cursor.lastrowid
+            return migration_id
 
     async def complete_migration(
         self,
@@ -592,41 +609,44 @@ class Database:
         error_message: Optional[str] = None,
         profile_path: Optional[str] = None
     ) -> None:
-        """
-        Record migration completion.
+        """Record migration completion.
 
         Updates both migrations and accounts tables in a single
         transaction to prevent data inconsistency on crash.
+
+        BUG-2 FIX: Wrapped in _db_lock to prevent interleaving
+        with concurrent workers.
         """
-        # FIX-P1: Single transaction for both migration + account update
-        await self._connection.execute(
-            """
-            UPDATE migrations
-            SET completed_at = datetime('now'),
-                success = ?,
-                error_message = ?,
-                profile_path = ?
-            WHERE id = ?
-            """,
-            (1 if success else 0, error_message, profile_path, migration_id)
-        )
+        async with self._db_lock:
+            # FIX-P1: Single transaction for both migration + account update
+            await self._connection.execute(
+                """
+                UPDATE migrations
+                SET completed_at = datetime('now'),
+                    success = ?,
+                    error_message = ?,
+                    profile_path = ?
+                WHERE id = ?
+                """,
+                (1 if success else 0, error_message, profile_path, migration_id)
+            )
 
-        # Get account_id and update status BEFORE committing
-        async with self._connection.execute(
-            "SELECT account_id FROM migrations WHERE id = ?",
-            (migration_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                account_id = row["account_id"]
-                new_status = "healthy" if success else "error"
-                await self._connection.execute(
-                    "UPDATE accounts SET status = ?, error_message = ? WHERE id = ?",
-                    (new_status, error_message, account_id)
-                )
+            # Get account_id and update status BEFORE committing
+            async with self._connection.execute(
+                "SELECT account_id FROM migrations WHERE id = ?",
+                (migration_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    account_id = row["account_id"]
+                    new_status = "healthy" if success else "error"
+                    await self._connection.execute(
+                        "UPDATE accounts SET status = ?, error_message = ? WHERE id = ?",
+                        (new_status, error_message, account_id)
+                    )
 
-        # Single commit covers both tables
-        await self._commit_with_retry()
+            # Single commit covers both tables
+            await self._commit_with_retry()
 
     async def get_pending_migrations(self) -> List[AccountRecord]:
         """
@@ -755,8 +775,10 @@ class Database:
     # ==================== Batch Management ====================
 
     async def start_batch(self, account_names: list[str]) -> str:
-        """
-        Start a new migration batch.
+        """Start a new migration batch.
+
+        BUG-2 FIX: Wrapped in _db_lock to prevent interleaving
+        with concurrent workers during multi-step INSERT operations.
 
         Args:
             account_names: List of account names in this batch.
@@ -764,42 +786,43 @@ class Database:
         Returns:
             Batch ID (UUID-based).
         """
-        # FIX D3: Auto-close orphaned batches from previous crashes
-        await self._connection.execute(
-            "UPDATE batches SET finished_at = ? WHERE finished_at IS NULL",
-            (datetime.now().isoformat(),)
-        )
+        async with self._db_lock:
+            # FIX D3: Auto-close orphaned batches from previous crashes
+            await self._connection.execute(
+                "UPDATE batches SET finished_at = ? WHERE finished_at IS NULL",
+                (datetime.now().isoformat(),)
+            )
 
-        batch_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+            batch_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
 
-        async with self._connection.execute(
-            """
-            INSERT INTO batches (batch_id, total_count)
-            VALUES (?, ?)
-            """,
-            (batch_id, len(account_names))
-        ) as cursor:
-            db_id = cursor.lastrowid
-
-        # Create pending migration records linked to batch
-        for name in account_names:
-            # Find or skip account — caller must ensure accounts exist in DB
             async with self._connection.execute(
-                "SELECT id FROM accounts WHERE name = ?", (name,)
+                """
+                INSERT INTO batches (batch_id, total_count)
+                VALUES (?, ?)
+                """,
+                (batch_id, len(account_names))
             ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    await self._connection.execute(
-                        """
-                        INSERT INTO migrations (account_id, batch_id)
-                        VALUES (?, ?)
-                        """,
-                        (row["id"], db_id)
-                    )
+                db_id = cursor.lastrowid
 
-        await self._commit_with_retry()
-        logger.info("Started batch %s with %d accounts", batch_id, len(account_names))
-        return batch_id
+            # Create pending migration records linked to batch
+            for name in account_names:
+                # Find or skip account — caller must ensure accounts exist in DB
+                async with self._connection.execute(
+                    "SELECT id FROM accounts WHERE name = ?", (name,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        await self._connection.execute(
+                            """
+                            INSERT INTO migrations (account_id, batch_id)
+                            VALUES (?, ?)
+                            """,
+                            (row["id"], db_id)
+                        )
+
+            await self._commit_with_retry()
+            logger.info("Started batch %s with %d accounts", batch_id, len(account_names))
+            return batch_id
 
     async def get_active_batch(self) -> Optional[dict]:
         """
@@ -830,61 +853,79 @@ class Database:
     async def mark_batch_account_completed(
         self, batch_id: int, account_name: str
     ) -> None:
-        """
-        Mark an account's migration as completed within a batch.
+        """Mark an account's migration as completed within a batch.
+
+        BUG-11 FIX: Inlined account UPDATE SQL instead of calling
+        update_account() to avoid double-commit. Single transaction
+        for both migration + account status update.
 
         Args:
             batch_id: Internal batch row ID.
             account_name: Account name.
         """
-        async with self._connection.execute(
-            "SELECT id FROM accounts WHERE name = ?", (account_name,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return
-            account_id = row["id"]
+        async with self._db_lock:
+            async with self._connection.execute(
+                "SELECT id FROM accounts WHERE name = ?", (account_name,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return
+                account_id = row["id"]
 
-        await self._connection.execute(
-            """
-            UPDATE migrations
-            SET completed_at = datetime('now'), success = 1
-            WHERE batch_id = ? AND account_id = ? AND completed_at IS NULL
-            """,
-            (batch_id, account_id)
-        )
-        await self.update_account(account_id, status="healthy")
-        await self._commit_with_retry()
+            await self._connection.execute(
+                """
+                UPDATE migrations
+                SET completed_at = datetime('now'), success = 1
+                WHERE batch_id = ? AND account_id = ? AND completed_at IS NULL
+                """,
+                (batch_id, account_id)
+            )
+            # BUG-11 FIX: Inline account update instead of self.update_account()
+            # to avoid double-commit (update_account commits internally)
+            await self._connection.execute(
+                "UPDATE accounts SET status = ? WHERE id = ?",
+                ("healthy", account_id)
+            )
+            await self._commit_with_retry()
 
     async def mark_batch_account_failed(
         self, batch_id: int, account_name: str, error: str
     ) -> None:
-        """
-        Mark an account's migration as failed within a batch.
+        """Mark an account's migration as failed within a batch.
+
+        BUG-11 FIX: Inlined account UPDATE SQL instead of calling
+        update_account() to avoid double-commit. Single transaction
+        for both migration + account status update.
 
         Args:
             batch_id: Internal batch row ID.
             account_name: Account name.
             error: Error message.
         """
-        async with self._connection.execute(
-            "SELECT id FROM accounts WHERE name = ?", (account_name,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return
-            account_id = row["id"]
+        async with self._db_lock:
+            async with self._connection.execute(
+                "SELECT id FROM accounts WHERE name = ?", (account_name,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return
+                account_id = row["id"]
 
-        await self._connection.execute(
-            """
-            UPDATE migrations
-            SET completed_at = datetime('now'), success = 0, error_message = ?
-            WHERE batch_id = ? AND account_id = ? AND completed_at IS NULL
-            """,
-            (error, batch_id, account_id)
-        )
-        await self.update_account(account_id, status="error", error_message=error)
-        await self._commit_with_retry()
+            await self._connection.execute(
+                """
+                UPDATE migrations
+                SET completed_at = datetime('now'), success = 0, error_message = ?
+                WHERE batch_id = ? AND account_id = ? AND completed_at IS NULL
+                """,
+                (error, batch_id, account_id)
+            )
+            # BUG-11 FIX: Inline account update instead of self.update_account()
+            # to avoid double-commit (update_account commits internally)
+            await self._connection.execute(
+                "UPDATE accounts SET status = ?, error_message = ? WHERE id = ?",
+                ("error", error, account_id)
+            )
+            await self._commit_with_retry()
 
     async def get_batch_pending(self, batch_id: int) -> list[str]:
         """

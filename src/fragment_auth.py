@@ -36,7 +36,7 @@ FRAGMENT_URL = "https://fragment.com"
 TELEGRAM_SERVICE_USER_ID = 777000
 
 # Timeouts
-PAGE_LOAD_TIMEOUT = 60000  # ms
+PAGE_LOAD_TIMEOUT = 30000  # ms
 CONFIRM_TIMEOUT = 60  # seconds - wait for Telethon confirmation
 AUTH_COMPLETE_TIMEOUT = 30  # seconds - wait for fragment.com state change
 
@@ -601,6 +601,26 @@ class FragmentAuth:
         client = None
         browser_ctx = None
 
+        # Suppress Telethon background read errors (IncompleteReadError, ConnectionError)
+        # When auto_reconnect=False and receive_updates=True, Telethon's background reader
+        # task can get IncompleteReadError if the connection drops (e.g. during long page loads).
+        # Nobody awaits that task's Future, causing "Future exception was never retrieved".
+        loop = asyncio.get_running_loop()
+        original_handler = loop.get_exception_handler()
+
+        def _suppress_telethon_bg_errors(loop_: asyncio.AbstractEventLoop, context: dict) -> None:
+            exc = context.get('exception')
+            if isinstance(exc, (asyncio.IncompleteReadError, ConnectionError, OSError)):
+                logger.debug("Suppressed background error: %s: %s", type(exc).__name__, exc)
+                return
+            # For all other errors, delegate to original handler or default
+            if original_handler:
+                original_handler(loop_, context)
+            else:
+                loop_.default_exception_handler(context)
+
+        loop.set_exception_handler(_suppress_telethon_bg_errors)
+
         try:
             # 1. Connect Telethon client
             logger.info("[1/6] Connecting Telethon client...")
@@ -630,9 +650,12 @@ class FragmentAuth:
             await page.set_viewport_size({"width": 1280, "height": 800})
 
             # 3. Open fragment.com
+            # Use wait_until="commit" - fires when first response bytes arrive.
+            # fragment.com is a TON blockchain SPA where "domcontentloaded" fires late
+            # or never, causing a 60s timeout on EVERY account (wasting 16+ hours at scale).
             logger.info("[3/6] Opening fragment.com...")
             try:
-                await page.goto(FRAGMENT_URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+                await page.goto(FRAGMENT_URL, wait_until="commit", timeout=30000)
             except Exception as e:
                 error_str = str(e).lower()
                 # Fail fast for non-recoverable network/proxy errors
@@ -645,7 +668,8 @@ class FragmentAuth:
                     raise RuntimeError(f"Page load failed (non-recoverable): {e}") from e
                 logger.warning("Page load warning (will retry): %s", e)
 
-            # Wait for page JS to initialize
+            # Wait for page JS to initialize (needed after "commit" since DOM may not be ready)
+            await asyncio.sleep(2)
             state = "loading"
             for _ in range(10):
                 await asyncio.sleep(0.5)
@@ -754,6 +778,9 @@ class FragmentAuth:
                 error=str(e)
             )
         finally:
+            # Restore original exception handler
+            loop.set_exception_handler(original_handler)
+
             # Close browser
             if browser_ctx:
                 try:

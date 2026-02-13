@@ -309,7 +309,7 @@ class TestParallelMigration:
         max_concurrent = 0
         call_order = []
 
-        async def mock_migrate(account_dir, password_2fa=None, headless=False):
+        async def mock_migrate(account_dir, password_2fa=None, headless=False, **kwargs):
             nonlocal concurrent_count, max_concurrent
             concurrent_count += 1
             max_concurrent = max(max_concurrent, concurrent_count)
@@ -326,7 +326,8 @@ class TestParallelMigration:
             d.mkdir()
             account_dirs.append(d)
 
-        with patch('src.telegram_auth.migrate_account', side_effect=mock_migrate):
+        with patch('src.telegram_auth.migrate_account', side_effect=mock_migrate), \
+             patch('src.telegram_auth.BrowserManager'):
             from src.telegram_auth import migrate_accounts_parallel
             results = await migrate_accounts_parallel(
                 account_dirs=account_dirs,
@@ -349,7 +350,7 @@ class TestParallelMigration:
         def on_progress(completed, total, result):
             progress_calls.append((completed, total, result.profile_name if result else None))
 
-        async def mock_migrate(account_dir, password_2fa=None, headless=False):
+        async def mock_migrate(account_dir, password_2fa=None, headless=False, **kwargs):
             await asyncio.sleep(0.01)
             return AuthResult(success=True, profile_name=account_dir.name)
 
@@ -357,7 +358,8 @@ class TestParallelMigration:
         for d in account_dirs:
             d.mkdir()
 
-        with patch('src.telegram_auth.migrate_account', side_effect=mock_migrate):
+        with patch('src.telegram_auth.migrate_account', side_effect=mock_migrate), \
+             patch('src.telegram_auth.BrowserManager'):
             from src.telegram_auth import migrate_accounts_parallel
             await migrate_accounts_parallel(
                 account_dirs=account_dirs,
@@ -376,7 +378,7 @@ class TestParallelMigration:
         """Verify one error doesn't stop others."""
         import asyncio
 
-        async def mock_migrate(account_dir, password_2fa=None, headless=False):
+        async def mock_migrate(account_dir, password_2fa=None, headless=False, **kwargs):
             if "fail" in account_dir.name:
                 raise Exception("Simulated failure")
             return AuthResult(success=True, profile_name=account_dir.name)
@@ -385,7 +387,8 @@ class TestParallelMigration:
         for d in dirs:
             d.mkdir()
 
-        with patch('src.telegram_auth.migrate_account', side_effect=mock_migrate):
+        with patch('src.telegram_auth.migrate_account', side_effect=mock_migrate), \
+             patch('src.telegram_auth.BrowserManager'):
             from src.telegram_auth import migrate_accounts_parallel
             results = await migrate_accounts_parallel(
                 account_dirs=dirs,
