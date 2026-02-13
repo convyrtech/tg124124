@@ -299,6 +299,14 @@ class MigrationWorkerPool:
                         "[W%d] Unhandled error processing account %d: %s",
                         worker_id, account_id, exc,
                     )
+                    # FIX: Mark account as error in DB so it doesn't stay as "migrating"
+                    try:
+                        await self._db.update_account(
+                            account_id, status="error",
+                            error_message=f"Internal error: {exc}"
+                        )
+                    except Exception:
+                        pass  # DB update is best-effort
                     account_result = AccountResult(
                         account_id=account_id,
                         account_name=f"id={account_id}",
@@ -622,6 +630,23 @@ class MigrationWorkerPool:
                 "DB update fragment_status failed for %s: %s", name, exc,
             )
 
+    # Terminal errors that should NOT be retried — retrying wastes time and
+    # pollutes the circuit breaker with expected failures.
+    NON_RETRYABLE_PATTERNS = (
+        "phonenumberbanned", "userdeactivated", "authkeyunregistered",
+        "session is not authorized", "not authorized", "dead session",
+        "sessionpasswordneeded", "2fa required", "2fa password",
+        "unique constraint", "auth_key_duplicated",
+    )
+
+    def _is_retryable(self, error: str) -> bool:
+        """Check if an error is transient and worth retrying."""
+        error_lower = error.lower()
+        for pattern in self.NON_RETRYABLE_PATTERNS:
+            if pattern in error_lower:
+                return False
+        return True
+
     async def _maybe_retry(
         self,
         account_id: int,
@@ -635,6 +660,17 @@ class MigrationWorkerPool:
         knows not to count it as final. The re-enqueued item gets its own
         queue.task_done() call when processed.
         """
+        # FIX: Skip retry for terminal errors (dead sessions, banned, 2FA, etc.)
+        if not self._is_retryable(error):
+            self._log(f"[Pool] {name} - non-retryable error, no retry: {error[:80]}")
+            return AccountResult(
+                account_id=account_id,
+                account_name=name,
+                success=False,
+                error=error,
+                retries_used=retries_used,
+            )
+
         if retries_used < self._max_retries and not self._shutdown_event.is_set():
             self._retry_counts[account_id] = retries_used + 1
             self._log(

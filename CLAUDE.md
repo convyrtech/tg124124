@@ -1,14 +1,19 @@
 # TG Web Auth Migration Tool
 
 ## MANDATORY: Read Before ANY Work
-**ALWAYS read `.claude/MASTER_PROMPT.md` at the start of EVERY session or after context loss.**
-It contains: project context, all available tools, work methodology, safety rules, progress tracker, and context recovery protocol.
+**Step 1**: Activate Serena project: `activate_project("tg-web-auth")`
+**Step 2**: Read Serena memory `session-state` — contains CURRENT task, git state, what to do next
+**Step 3**: Read other memories as needed: `project-architecture`, `audit-results`
+**Step 4**: Read `.claude/MASTER_PROMPT.md` only if memories are insufficient
+
+**IMPORTANT**: After completing major milestones, UPDATE the `session-state` memory via `edit_memory` or `write_memory`.
 
 **Key documents:**
-- `.claude/MASTER_PROMPT.md` - Master operating guide (READ FIRST)
-- `docs/plans/2026-02-09-production-1000-design.md` - **CURRENT** production plan (Phase 1 done, Phase 2 next)
-- `docs/plans/2026-02-10-full-audit-plan.md` - Production audit findings (85% ready)
-- `docs/plans/2026-02-11-exe-packaging-plan.md` - PyInstaller EXE packaging plan
+- Serena memories (`list_memories`) - **CURRENT STATE** (survives compaction!)
+- `.claude/MASTER_PROMPT.md` - Master operating guide (architecture, phases)
+- `docs/plans/2026-02-09-production-1000-design.md` - Production plan
+- `docs/plans/2026-02-10-full-audit-plan.md` - Audit findings
+- `docs/plans/2026-02-11-exe-packaging-plan.md` - EXE packaging plan
 
 ## Project Goal
 Автоматическая миграция Telegram session файлов (Telethon) в браузерные профили для:
