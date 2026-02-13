@@ -67,8 +67,8 @@ def setup_logging(
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
             rotating_handler = RotatingFileHandler(
                 LOGS_DIR / "app.log",
-                maxBytes=5 * 1024 * 1024,
-                backupCount=3,
+                maxBytes=10 * 1024 * 1024,
+                backupCount=5,
                 encoding='utf-8'
             )
             rotating_handler.setLevel(level)
