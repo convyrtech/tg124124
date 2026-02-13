@@ -385,11 +385,16 @@ class FragmentAuth:
         logger.info("Submitting phone: %s", _mask_phone(formatted))
 
         # Set phone value via JS (bypasses country code selection complexity)
+        # FIX-A1: Dispatch 'input' and 'change' events so React/Vue frameworks detect the change
         await popup.evaluate("""(phone) => {
             const codeEl = document.getElementById('login-phone-code');
             const phoneEl = document.getElementById('login-phone');
             if (codeEl) codeEl.value = '';
-            if (phoneEl) phoneEl.value = phone;
+            if (phoneEl) {
+                phoneEl.value = phone;
+                phoneEl.dispatchEvent(new Event('input', {bubbles: true}));
+                phoneEl.dispatchEvent(new Event('change', {bubbles: true}));
+            }
         }""", formatted)
 
         # FIX-3.2: Click submit with fallback
@@ -404,6 +409,26 @@ class FragmentAuth:
                     if (btn) btn.click();
                 }
             """)
+
+        # FIX-A4: Check for CAPTCHA after phone submit
+        await asyncio.sleep(1)
+        try:
+            has_captcha = await popup.evaluate("""() => {
+                if (document.querySelector('img[src*="captcha"]')) return true;
+                if (document.querySelector('#captcha')) return true;
+                if (document.querySelector('.captcha')) return true;
+                const inputs = document.querySelectorAll('input');
+                for (const inp of inputs) {
+                    if (/captcha/i.test(inp.name) || /captcha/i.test(inp.placeholder)
+                        || /captcha/i.test(inp.id)) return true;
+                }
+                return false;
+            }""")
+            if has_captcha:
+                logger.error("CAPTCHA detected on OAuth popup — manual intervention required")
+                return False
+        except Exception as e:
+            logger.debug("CAPTCHA check error: %s", e)
 
         # Wait for confirmation form to appear (#login-form loses .hide class)
         try:
@@ -420,9 +445,9 @@ class FragmentAuth:
                 logger.error("OAuth phone error: %s", error)
             return False
 
-    async def _confirm_via_telethon(self, client: TelegramClient, timeout: int = CONFIRM_TIMEOUT) -> bool:
+    def _create_confirmation_handler(self, client: TelegramClient, confirmed: asyncio.Event):
         """
-        Перехватывает и подтверждает login request через Telethon.
+        Create a Telethon event handler for confirmation messages from 777000.
 
         Handles multiple confirmation types:
         - Inline button (KeyboardButtonCallback): clicks Confirm/Accept
@@ -430,15 +455,12 @@ class FragmentAuth:
         - URL auth button: logs for investigation
 
         Args:
-            client: Connected TelegramClient
-            timeout: Max seconds to wait for confirmation message
+            client: Connected TelegramClient (used for button clicks)
+            confirmed: Event to set when confirmation is received
 
         Returns:
-            True if confirmation was handled
+            Handler function (to be registered with client.add_event_handler)
         """
-        confirmed = asyncio.Event()
-
-        @client.on(events.NewMessage(from_users=TELEGRAM_SERVICE_USER_ID))
         async def handler(event):
             msg = event.message
 
@@ -475,6 +497,26 @@ class FragmentAuth:
             # it may be an unrelated stale message from 777000
             logger.warning("Unknown message from 777000 (not confirming): %s", event.raw_text[:100])
 
+        return handler
+
+    async def _confirm_via_telethon(self, client: TelegramClient, timeout: int = CONFIRM_TIMEOUT) -> bool:
+        """
+        Перехватывает и подтверждает login request через Telethon.
+
+        NOTE: This method is kept for backward compatibility but the main flow
+        (FIX-A2) now registers the handler BEFORE phone submit to avoid race conditions.
+
+        Args:
+            client: Connected TelegramClient
+            timeout: Max seconds to wait for confirmation message
+
+        Returns:
+            True if confirmation was handled
+        """
+        confirmed = asyncio.Event()
+        handler = self._create_confirmation_handler(client, confirmed)
+        client.add_event_handler(handler, events.NewMessage(from_users=TELEGRAM_SERVICE_USER_ID))
+
         try:
             await asyncio.wait_for(confirmed.wait(), timeout=timeout)
             return True
@@ -507,20 +549,20 @@ class FragmentAuth:
                     return True
             except Exception as e:
                 logger.debug("State check error (page may be reloading): %s", e)
+
+            # FIX-A3: Check stel_ssid cookie INSIDE the loop (not only after timeout)
+            # JS state (Aj.state.unAuth) may not initialize properly in headless mode,
+            # but cookies are a reliable indicator of server-side auth success.
+            try:
+                cookies = await page.context.cookies(["https://fragment.com"])
+                if any(c["name"] == "stel_ssid" for c in cookies):
+                    logger.info("Fragment auth detected via stel_ssid cookie (JS state unavailable)")
+                    return True
+            except Exception as e:
+                logger.debug("Cookie check in loop failed: %s", e)
+
             if i % 5 == 0 and i > 0:
                 logger.debug("Waiting for fragment auth... (%ds)", i)
-
-        # Fallback: check if stel_ssid cookie exists on fragment.com
-        # JS state (Aj.state.unAuth) may not initialize properly in headless mode,
-        # but cookies are a reliable indicator of server-side auth success.
-        try:
-            cookies = await page.context.cookies(["https://fragment.com"])
-            has_ssid = any(c["name"] == "stel_ssid" for c in cookies)
-            if has_ssid:
-                logger.info("Fragment auth detected via stel_ssid cookie (JS state unavailable)")
-                return True
-        except Exception as e:
-            logger.debug("Cookie check failed: %s", e)
 
         logger.warning("Fragment auth timeout after %ds", timeout)
         return False
@@ -645,32 +687,45 @@ class FragmentAuth:
                     )
                 logger.info("[6/6] Skipping Telethon confirmation (existing session)")
             else:
-                # 6. Submit phone on popup
-                logger.info("[5/6] Submitting phone on OAuth popup...")
-                if not await self._submit_phone_on_popup(popup, phone):
-                    return FragmentResult(
-                        success=False,
-                        account_name=self.account.name,
-                        error="Phone submission failed on OAuth popup"
-                    )
+                # FIX-A2: Register Telethon event handler BEFORE phone submit
+                # to avoid race condition where 777000 code arrives before handler is ready
+                confirmed = asyncio.Event()
+                handler = self._create_confirmation_handler(client, confirmed)
+                client.add_event_handler(handler, events.NewMessage(from_users=TELEGRAM_SERVICE_USER_ID))
 
-                # 7. Confirm via Telethon (Telethon listens, popup polls /auth/login)
-                logger.info("[6/6] Waiting for Telethon confirmation...")
-                if not await self._confirm_via_telethon(client, timeout=CONFIRM_TIMEOUT):
-                    return FragmentResult(
-                        success=False,
-                        account_name=self.account.name,
-                        error="Confirmation timeout — no message from Telegram"
-                    )
+                try:
+                    # 6. Submit phone on popup
+                    logger.info("[5/6] Submitting phone on OAuth popup...")
+                    if not await self._submit_phone_on_popup(popup, phone):
+                        return FragmentResult(
+                            success=False,
+                            account_name=self.account.name,
+                            error="Phone submission failed on OAuth popup"
+                        )
+
+                    # 7. Wait for Telethon confirmation (handler already registered)
+                    logger.info("[6/6] Waiting for Telethon confirmation...")
+                    try:
+                        await asyncio.wait_for(confirmed.wait(), timeout=CONFIRM_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        logger.warning("Confirmation timeout after %ds", CONFIRM_TIMEOUT)
+                        return FragmentResult(
+                            success=False,
+                            account_name=self.account.name,
+                            error="Confirmation timeout — no message from Telegram"
+                        )
+                finally:
+                    client.remove_event_handler(handler)
 
             # 8. Wait for fragment.com to show authorized
             # After OAuth confirmation, popup may close and redirect.
             # Give it a moment then reload to pick up the new auth state.
             await self._human_delay(2.0, 3.0)
+            # FIX-A5: Log exception instead of silent pass
             try:
                 await page.reload(timeout=15000)
-            except Exception:
-                pass  # Page might have already navigated
+            except Exception as e:
+                logger.debug("page.reload() after OAuth: %s", e)
             if not await self._wait_for_fragment_auth(page, timeout=AUTH_COMPLETE_TIMEOUT):
                 return FragmentResult(
                     success=False,

@@ -714,7 +714,7 @@ class Database:
         return count
 
     async def get_migration_stats(self) -> dict:
-        """Get migration statistics."""
+        """Get migration statistics using SQL COUNT + GROUP BY."""
         stats = {
             "total": 0,
             "pending": 0,
@@ -724,12 +724,14 @@ class Database:
             "success_rate": 0.0
         }
 
-        accounts = await self.list_accounts()
-        stats["total"] = len(accounts)
-
-        for acc in accounts:
-            if acc.status in stats:
-                stats[acc.status] += 1
+        async with self._connection.execute(
+            "SELECT status, COUNT(*) as cnt FROM accounts GROUP BY status"
+        ) as cursor:
+            async for row in cursor:
+                status = row["status"]
+                if status in stats:
+                    stats[status] = row["cnt"]
+                stats["total"] += row["cnt"]
 
         completed = stats["healthy"] + stats["error"]
         if completed > 0:
@@ -749,6 +751,12 @@ class Database:
         Returns:
             Batch ID (UUID-based).
         """
+        # FIX D3: Auto-close orphaned batches from previous crashes
+        await self._connection.execute(
+            "UPDATE batches SET finished_at = ? WHERE finished_at IS NULL",
+            (datetime.now().isoformat(),)
+        )
+
         batch_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
 
         async with self._connection.execute(

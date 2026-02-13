@@ -848,14 +848,18 @@ def health(account: str):
 @cli.command()
 @click.option("--account", "-a", help="Имя аккаунта для авторизации на Fragment")
 @click.option("--all", "fragment_all", is_flag=True, help="Авторизовать все аккаунты")
+@click.option("--retry-failed", "retry_failed", is_flag=True,
+              help="Повторить упавшие fragment авторизации (fragment_status='error')")
 @click.option("--headed", is_flag=True, help="Запуск с GUI (по умолчанию headless)")
 @click.option("--cooldown", "-c", default=DEFAULT_COOLDOWN, type=int,
               help=f"Секунды между аккаунтами при --all (default: {DEFAULT_COOLDOWN})")
-def fragment(account: Optional[str], fragment_all: bool, headed: bool, cooldown: int):
+def fragment(account: Optional[str], fragment_all: bool, retry_failed: bool,
+             headed: bool, cooldown: int):
     """Авторизация на fragment.com через Telegram Login Widget"""
     from .telegram_auth import AccountConfig
     from .fragment_auth import FragmentAuth
     from .browser_manager import BrowserManager
+    from .database import Database
 
     setup_logging(level=logging.INFO)
 
@@ -863,8 +867,8 @@ def fragment(account: Optional[str], fragment_all: bool, headed: bool, cooldown:
     # and Fragment auth works fully in headless (popup is intercepted by Playwright).
     headless = not headed
 
-    if not account and not fragment_all:
-        click.echo("Укажите --account или --all")
+    if not account and not fragment_all and not retry_failed:
+        click.echo("Укажите --account, --all, или --retry-failed")
         return
 
     async def _run_single(account_dir: Path, browser_manager: "BrowserManager") -> Optional["FragmentResult"]:
@@ -885,6 +889,117 @@ def fragment(account: Optional[str], fragment_all: bool, headed: bool, cooldown:
             click.echo(click.style(f"  FAIL {config.name}: {result.error}", fg="red"))
         return result
 
+    async def _get_filtered_account_dirs() -> Optional[list[Path]]:
+        """FIX-B1/B2: Filter account dirs using DB fragment_status."""
+        all_dirs = find_account_dirs()
+        if not all_dirs:
+            click.echo(f"Нет аккаунтов в {ACCOUNTS_DIR}/")
+            return None
+
+        # Open DB to check fragment_status
+        db = Database()
+        await db.initialize()
+        try:
+            accounts = await db.list_accounts()
+        finally:
+            await db.close()
+
+        # Build name → fragment_status map
+        status_map = {a.name: a.fragment_status for a in accounts}
+
+        if retry_failed:
+            # FIX-B2: Only accounts with fragment_status = 'error'
+            filtered = [d for d in all_dirs if status_map.get(d.name) == "error"]
+            if not filtered:
+                click.echo("Нет упавших fragment авторизаций для повтора")
+                return None
+            click.echo(f"Повтор {len(filtered)} упавших fragment авторизаций:")
+            for d in filtered:
+                click.echo(f"  - {d.name}")
+        else:
+            # FIX-B1: Skip already authorized (like GUI does at app.py:1469)
+            already_auth = [d.name for d in all_dirs if status_map.get(d.name) == "authorized"]
+            filtered = [d for d in all_dirs if status_map.get(d.name) != "authorized"]
+            if already_auth:
+                click.echo(click.style(
+                    f"Пропущено {len(already_auth)} уже авторизованных аккаунтов",
+                    fg="cyan"
+                ))
+            if not filtered:
+                click.echo("Все аккаунты уже авторизованы на fragment.com!")
+                return None
+
+        return filtered
+
+    async def _run_batch(account_dirs: list[Path], browser_manager: "BrowserManager") -> None:
+        """Run fragment auth for a batch of accounts with cooldown and summary."""
+        label = "retry" if retry_failed else "batch"
+        click.echo(f"Fragment auth ({label}) для {len(account_dirs)} аккаунтов (headless={headless})")
+        results = []
+
+        for i, account_dir in enumerate(account_dirs):
+            click.echo(f"\n[{i+1}/{len(account_dirs)}] {account_dir.name}")
+            result = await _run_single(account_dir, browser_manager)
+            results.append((account_dir.name, result))
+
+            # Cooldown between accounts (skip after last)
+            if i < len(account_dirs) - 1:
+                actual_cooldown = cooldown + random.randint(-10, 10)
+                actual_cooldown = max(10, actual_cooldown)
+                await asyncio.sleep(actual_cooldown)
+
+        # Categorized summary
+        ok_new = []
+        ok_existing = []
+        fail_session = []
+        fail_ip = []
+        fail_timeout = []
+        fail_other = []
+        skipped = []
+
+        for name, r in results:
+            if r is None:
+                skipped.append(name)
+            elif r.success and r.already_authorized:
+                ok_existing.append(name)
+            elif r.success:
+                ok_new.append(name)
+            elif r.error and "not authorized" in r.error.lower():
+                fail_session.append(name)
+            elif r.error and "AuthKeyDuplicated" in (r.error or ""):
+                fail_ip.append(name)
+            elif r.error and ("timeout" in r.error.lower() or "Timeout" in (r.error or "")):
+                fail_timeout.append(name)
+            else:
+                fail_other.append((name, r.error))
+
+        total_ok = len(ok_new) + len(ok_existing)
+        total_fail = len(fail_session) + len(fail_ip) + len(fail_timeout) + len(fail_other)
+
+        click.echo(f"\n{'=' * 50}")
+        click.echo("ИТОГ FRAGMENT AUTH")
+        click.echo(f"{'=' * 50}")
+        click.echo(click.style(f"  OK: {total_ok}/{len(results)}", fg="green"))
+        if ok_new:
+            click.echo(f"    Новых: {len(ok_new)}")
+        if ok_existing:
+            click.echo(f"    Уже авторизованы: {len(ok_existing)}")
+        if total_fail > 0:
+            click.echo(click.style(f"  FAIL: {total_fail}", fg="red"))
+            if fail_session:
+                click.echo(f"    Мёртвые сессии ({len(fail_session)}): {', '.join(fail_session)}")
+            if fail_ip:
+                click.echo(f"    Конфликт IP ({len(fail_ip)}): {', '.join(fail_ip)}")
+            if fail_timeout:
+                click.echo(f"    Таймауты ({len(fail_timeout)}): {', '.join(fail_timeout)}")
+            if fail_other:
+                for name, err in fail_other:
+                    click.echo(f"    {name}: {err}")
+        if skipped:
+            click.echo(click.style(f"  SKIP: {len(skipped)}", fg="yellow"))
+        if total_fail > 0:
+            click.echo(f"\nИспользуйте --retry-failed для повтора упавших")
+
     async def _run():
         # Fix #21: Shared BrowserManager with global LRU eviction
         browser_manager = BrowserManager()
@@ -895,75 +1010,11 @@ def fragment(account: Optional[str], fragment_all: bool, headed: bool, cooldown:
                     click.echo(f"Аккаунт '{account}' не найден в {ACCOUNTS_DIR}/")
                     return
                 await _run_single(account_dir, browser_manager)
-            elif fragment_all:
-                account_dirs = find_account_dirs()
+            elif fragment_all or retry_failed:
+                account_dirs = await _get_filtered_account_dirs()
                 if not account_dirs:
-                    click.echo(f"Нет аккаунтов в {ACCOUNTS_DIR}/")
                     return
-
-                click.echo(f"Fragment auth для {len(account_dirs)} аккаунтов (headless={headless})")
-                results = []
-
-                for i, account_dir in enumerate(account_dirs):
-                    click.echo(f"\n[{i+1}/{len(account_dirs)}] {account_dir.name}")
-                    result = await _run_single(account_dir, browser_manager)
-                    results.append((account_dir.name, result))
-
-                    # Cooldown between accounts (skip after last)
-                    if i < len(account_dirs) - 1:
-                        actual_cooldown = cooldown + random.randint(-10, 10)
-                        actual_cooldown = max(10, actual_cooldown)
-                        await asyncio.sleep(actual_cooldown)
-
-                # Categorized summary
-                ok_new = []
-                ok_existing = []
-                fail_session = []
-                fail_ip = []
-                fail_timeout = []
-                fail_other = []
-                skipped = []
-
-                for name, r in results:
-                    if r is None:
-                        skipped.append(name)
-                    elif r.success and r.already_authorized:
-                        ok_existing.append(name)
-                    elif r.success:
-                        ok_new.append(name)
-                    elif r.error and "not authorized" in r.error.lower():
-                        fail_session.append(name)
-                    elif r.error and "AuthKeyDuplicated" in (r.error or ""):
-                        fail_ip.append(name)
-                    elif r.error and ("timeout" in r.error.lower() or "Timeout" in (r.error or "")):
-                        fail_timeout.append(name)
-                    else:
-                        fail_other.append((name, r.error))
-
-                total_ok = len(ok_new) + len(ok_existing)
-                total_fail = len(fail_session) + len(fail_ip) + len(fail_timeout) + len(fail_other)
-
-                click.echo(f"\n{'=' * 50}")
-                click.echo("ИТОГ FRAGMENT AUTH")
-                click.echo(f"{'=' * 50}")
-                click.echo(click.style(f"  OK: {total_ok}/{len(results)}", fg="green"))
-                if ok_new:
-                    click.echo(f"    Новых: {len(ok_new)}")
-                if ok_existing:
-                    click.echo(f"    Уже авторизованы: {len(ok_existing)}")
-                if total_fail > 0:
-                    click.echo(click.style(f"  FAIL: {total_fail}", fg="red"))
-                    if fail_session:
-                        click.echo(f"    Мёртвые сессии ({len(fail_session)}): {', '.join(fail_session)}")
-                    if fail_ip:
-                        click.echo(f"    Конфликт IP ({len(fail_ip)}): {', '.join(fail_ip)}")
-                    if fail_timeout:
-                        click.echo(f"    Таймауты ({len(fail_timeout)}): {', '.join(fail_timeout)}")
-                    if fail_other:
-                        for name, err in fail_other:
-                            click.echo(f"    {name}: {err}")
-                if skipped:
-                    click.echo(click.style(f"  SKIP: {len(skipped)}", fg="yellow"))
+                await _run_batch(account_dirs, browser_manager)
         finally:
             await browser_manager.close_all()
 

@@ -240,7 +240,9 @@ class TestFragmentAuth:
     async def test_submit_phone_on_popup_success(self, fragment_auth):
         """Test phone submission on OAuth popup - success case."""
         popup = AsyncMock()
-        popup.evaluate = AsyncMock()
+        # evaluate is called multiple times: phone input, possibly fallback click, captcha check
+        # Captcha check must return False (no captcha), other calls return None (success)
+        popup.evaluate = AsyncMock(return_value=False)
         popup.click = AsyncMock()
         popup.wait_for_selector = AsyncMock()  # success — form appeared
 
@@ -259,7 +261,7 @@ class TestFragmentAuth:
     async def test_submit_phone_on_popup_already_formatted(self, fragment_auth):
         """Test phone submission when phone already has + prefix."""
         popup = AsyncMock()
-        popup.evaluate = AsyncMock()
+        popup.evaluate = AsyncMock(return_value=False)
         popup.click = AsyncMock()
         popup.wait_for_selector = AsyncMock()
 
@@ -275,7 +277,8 @@ class TestFragmentAuth:
         popup = AsyncMock()
         popup.evaluate = AsyncMock(side_effect=[
             None,  # first call: set phone value
-            "Invalid phone number",  # second call: get error alert
+            False,  # second call: captcha check (no captcha)
+            "Invalid phone number",  # third call: get error alert
         ])
         popup.click = AsyncMock()
         popup.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
@@ -407,13 +410,10 @@ class TestFragmentAuth:
         client = MagicMock()
         handlers = []
 
-        def mock_on(event_filter):
-            def decorator(func):
-                handlers.append(func)
-                return func
-            return decorator
+        def mock_add_handler(func, event_filter=None):
+            handlers.append(func)
 
-        client.on = mock_on
+        client.add_event_handler = mock_add_handler
         client.remove_event_handler = MagicMock()
 
         async def simulate_button_message():
@@ -443,13 +443,10 @@ class TestFragmentAuth:
         client = MagicMock()
         handlers = []
 
-        def mock_on(event_filter):
-            def decorator(func):
-                handlers.append(func)
-                return func
-            return decorator
+        def mock_add_handler(func, event_filter=None):
+            handlers.append(func)
 
-        client.on = mock_on
+        client.add_event_handler = mock_add_handler
         client.remove_event_handler = MagicMock()
 
         async def simulate():
@@ -476,13 +473,10 @@ class TestFragmentAuth:
         client = MagicMock()
         handlers = []
 
-        def mock_on(event_filter):
-            def decorator(func):
-                handlers.append(func)
-                return func
-            return decorator
+        def mock_add_handler(func, event_filter=None):
+            handlers.append(func)
 
-        client.on = mock_on
+        client.add_event_handler = mock_add_handler
         client.remove_event_handler = MagicMock()
 
         async def simulate():
@@ -506,13 +500,10 @@ class TestFragmentAuth:
         client = MagicMock()
         handlers = []
 
-        def mock_on(event_filter):
-            def decorator(func):
-                handlers.append(func)
-                return func
-            return decorator
+        def mock_add_handler(func, event_filter=None):
+            handlers.append(func)
 
-        client.on = mock_on
+        client.add_event_handler = mock_add_handler
         client.remove_event_handler = MagicMock()
 
         async def simulate():
@@ -658,6 +649,8 @@ class TestFragmentAuth:
         mock_me.id = 12345
         mock_client.get_me = AsyncMock(return_value=mock_me)
         mock_client.disconnect = AsyncMock()
+        mock_client.add_event_handler = MagicMock()
+        mock_client.remove_event_handler = MagicMock()
 
         # Mock browser
         mock_page = AsyncMock()
@@ -669,6 +662,16 @@ class TestFragmentAuth:
         fragment_auth.browser_manager.get_profile = MagicMock()
         fragment_auth.browser_manager.launch = AsyncMock(return_value=mock_browser_ctx)
 
+        # FIX-A2: _create_confirmation_handler returns a handler that instantly sets confirmed
+        def mock_create_handler(client, confirmed):
+            async def handler(event):
+                confirmed.set()
+            # Immediately schedule setting the event so wait_for succeeds
+            import asyncio
+            loop = asyncio.get_event_loop()
+            loop.call_soon(confirmed.set)
+            return handler
+
         with patch.object(
             fragment_auth, '_create_telethon_client', return_value=mock_client
         ), patch.object(
@@ -676,9 +679,11 @@ class TestFragmentAuth:
         ), patch.object(
             fragment_auth, '_open_oauth_popup', return_value=mock_popup
         ), patch.object(
+            fragment_auth, '_check_popup_already_logged_in', return_value=False
+        ), patch.object(
             fragment_auth, '_submit_phone_on_popup', return_value=True
         ), patch.object(
-            fragment_auth, '_confirm_via_telethon', return_value=True
+            fragment_auth, '_create_confirmation_handler', side_effect=mock_create_handler
         ), patch.object(
             fragment_auth, '_wait_for_fragment_auth', return_value=True
         ), patch.object(
@@ -725,6 +730,8 @@ class TestFragmentAuth:
         mock_me.phone = "79991234567"
         mock_client.get_me = AsyncMock(return_value=mock_me)
         mock_client.disconnect = AsyncMock()
+        mock_client.add_event_handler = MagicMock()
+        mock_client.remove_event_handler = MagicMock()
 
         mock_page = AsyncMock()
         mock_popup = AsyncMock()
@@ -741,6 +748,8 @@ class TestFragmentAuth:
             fragment_auth, '_check_fragment_state', return_value="not_authorized"
         ), patch.object(
             fragment_auth, '_open_oauth_popup', return_value=mock_popup
+        ), patch.object(
+            fragment_auth, '_check_popup_already_logged_in', return_value=False
         ), patch.object(
             fragment_auth, '_submit_phone_on_popup', return_value=False
         ), patch.object(
@@ -758,6 +767,8 @@ class TestFragmentAuth:
         mock_me.phone = "79991234567"
         mock_client.get_me = AsyncMock(return_value=mock_me)
         mock_client.disconnect = AsyncMock()
+        mock_client.add_event_handler = MagicMock()
+        mock_client.remove_event_handler = MagicMock()
 
         mock_page = AsyncMock()
         mock_popup = AsyncMock()
@@ -768,6 +779,12 @@ class TestFragmentAuth:
         fragment_auth.browser_manager.get_profile = MagicMock()
         fragment_auth.browser_manager.launch = AsyncMock(return_value=mock_browser_ctx)
 
+        # _create_confirmation_handler returns a handler that never sets confirmed → timeout
+        def mock_create_handler_noop(client, confirmed):
+            async def handler(event):
+                pass  # never sets confirmed
+            return handler
+
         with patch.object(
             fragment_auth, '_create_telethon_client', return_value=mock_client
         ), patch.object(
@@ -775,12 +792,14 @@ class TestFragmentAuth:
         ), patch.object(
             fragment_auth, '_open_oauth_popup', return_value=mock_popup
         ), patch.object(
+            fragment_auth, '_check_popup_already_logged_in', return_value=False
+        ), patch.object(
             fragment_auth, '_submit_phone_on_popup', return_value=True
         ), patch.object(
-            fragment_auth, '_confirm_via_telethon', return_value=False
+            fragment_auth, '_create_confirmation_handler', side_effect=mock_create_handler_noop
         ), patch.object(
             fragment_auth, '_human_delay', return_value=None
-        ):
+        ), patch('src.fragment_auth.CONFIRM_TIMEOUT', 1):  # Short timeout for test
             result = await fragment_auth.connect(headless=True)
             assert not result.success
             assert "timeout" in result.error.lower() or "confirmation" in result.error.lower()

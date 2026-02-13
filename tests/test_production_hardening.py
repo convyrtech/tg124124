@@ -324,11 +324,11 @@ class TestGUIPerformance:
     """Fix 7.1-7.4: GUI performance optimizations."""
 
     def test_deque_maxlen_increased(self):
-        """Log deque maxlen should be >= 2000 for 1000-account batches."""
+        """Log deque maxlen should be >= 5000 for 1000-account batches."""
         import inspect
         from src.gui.app import TGWebAuthApp
         source = inspect.getsource(TGWebAuthApp.__init__)
-        assert "maxlen=2000" in source
+        assert "maxlen=5000" in source
 
     def test_get_counts_method_exists(self):
         """Database should have get_counts() method."""

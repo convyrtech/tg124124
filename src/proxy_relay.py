@@ -86,6 +86,7 @@ class ProxyRelay:
         self.local_port: Optional[int] = None
         self._process: Optional[asyncio.subprocess.Process] = None
         self._server_handle = None  # For in-process pproxy (frozen exe)
+        self._pproxy_task = None  # Monitoring task for in-process pproxy
         self._started = False
 
     @property
@@ -109,59 +110,86 @@ class ProxyRelay:
         In frozen (PyInstaller) mode: runs pproxy in-process via asyncio.
         In dev mode: spawns pproxy_wrapper.py as subprocess.
 
+        Retries up to 3 times to mitigate TOCTOU race on port allocation.
+
         Returns:
             URL локального HTTP прокси (http://127.0.0.1:PORT)
         """
         if self._started:
             return self.local_url
 
-        self.local_port = find_free_port()
+        last_error = None
+        for attempt in range(3):
+            try:
+                self.local_port = find_free_port()
 
-        listen_uri = f"http://{self.local_host}:{self.local_port}"
-        remote_uri = self.config.to_pproxy_uri()
+                listen_uri = f"http://{self.local_host}:{self.local_port}"
+                remote_uri = self.config.to_pproxy_uri()
 
-        logger.info("Starting local HTTP relay...")
-        logger.debug("Listen: %s", listen_uri)
-        logger.debug("Remote: %s://%s:%s", self.config.protocol, self.config.host, self.config.port)
+                logger.info("Starting local HTTP relay...")
+                logger.debug("Listen: %s", listen_uri)
+                logger.debug("Remote: %s://%s:%s", self.config.protocol, self.config.host, self.config.port)
 
-        if getattr(sys, 'frozen', False):
-            await self._start_in_process(listen_uri, remote_uri)
-        else:
-            await self._start_subprocess(listen_uri, remote_uri)
+                if getattr(sys, 'frozen', False):
+                    await self._start_in_process(listen_uri, remote_uri)
+                else:
+                    await self._start_subprocess(listen_uri, remote_uri)
 
-        # Health check — verify relay is listening
-        try:
-            for retry in range(10):
-                try:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                        sock.settimeout(1)
-                        sock.connect((self.local_host, self.local_port))
-                        logger.debug("Relay verified listening on port %d", self.local_port)
-                        break
-                except (socket.error, socket.timeout):
-                    if retry < 9:
-                        await asyncio.sleep(0.3)
-                    else:
-                        raise RuntimeError(
-                            f"Proxy relay not responding on {self.local_host}:{self.local_port}"
-                        )
-        except Exception:
-            await self._cleanup_on_failure()
-            raise
+                # Health check — verify relay is listening
+                for retry in range(10):
+                    try:
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                            sock.settimeout(1)
+                            sock.connect((self.local_host, self.local_port))
+                            logger.debug("Relay verified listening on port %d", self.local_port)
+                            break
+                    except (socket.error, socket.timeout):
+                        if retry < 9:
+                            await asyncio.sleep(0.3)
+                        else:
+                            raise RuntimeError(
+                                f"Proxy relay not responding on {self.local_host}:{self.local_port}"
+                            )
 
-        self._started = True
-        logger.info("Started on %s", self.local_url)
+                self._started = True
+                logger.info("Started on %s", self.local_url)
+                return self.local_url
 
-        return self.local_url
+            except OSError as e:
+                last_error = e
+                logger.warning("Proxy relay start attempt %d failed (port %s): %s", attempt + 1, self.local_port, e)
+                await self._cleanup_on_failure()
+                await asyncio.sleep(0.5)
+            except Exception:
+                await self._cleanup_on_failure()
+                raise
+
+        raise RuntimeError(f"Failed to start proxy relay after 3 attempts: {last_error}")
 
     async def _start_in_process(self, listen_uri: str, remote_uri: str) -> None:
-        """Start pproxy relay in-process (for frozen exe — no subprocess needed)."""
+        """Start pproxy relay in-process (for frozen exe — no subprocess needed).
+
+        Wraps pproxy server in an isolated task so crashes don't propagate
+        to the main event loop.
+        """
         import pproxy
 
         server = pproxy.Server(listen_uri)
         remote = pproxy.Connection(remote_uri)
         self._server_handle = await server.start_server({'rserver': [remote]})
+        # Wrap in a monitored task so exceptions are caught
+        self._pproxy_task = asyncio.create_task(self._monitor_pproxy_server())
         logger.debug("ProxyRelay started in-process (frozen mode)")
+
+    async def _monitor_pproxy_server(self) -> None:
+        """Monitor in-process pproxy server; log errors without crashing the loop."""
+        try:
+            # Server handle runs until closed; just await it to catch crashes
+            if self._server_handle:
+                await self._server_handle.wait_closed()
+        except Exception as e:
+            logger.error("In-process pproxy server crashed: %s", e)
+            # Don't let it propagate to the event loop
 
     async def _start_subprocess(self, listen_uri: str, remote_uri: str) -> None:
         """Start pproxy relay as subprocess (dev mode)."""
@@ -191,6 +219,9 @@ class ProxyRelay:
 
     async def _cleanup_on_failure(self) -> None:
         """Cleanup relay resources after health check failure."""
+        if self._pproxy_task and not self._pproxy_task.done():
+            self._pproxy_task.cancel()
+            self._pproxy_task = None
         if self._server_handle:
             self._server_handle.close()
             self._server_handle = None
@@ -203,6 +234,11 @@ class ProxyRelay:
 
     async def stop(self):
         """Останавливает proxy relay (subprocess or in-process)."""
+        # Cancel monitoring task for in-process pproxy
+        if self._pproxy_task and not self._pproxy_task.done():
+            self._pproxy_task.cancel()
+            self._pproxy_task = None
+
         # In-process server (frozen mode)
         if self._server_handle:
             try:

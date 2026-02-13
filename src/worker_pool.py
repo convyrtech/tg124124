@@ -427,12 +427,12 @@ class MigrationWorkerPool:
             # Proxy was assigned but disappeared/dead — fail fast instead
             # of launching browser without proxy (which triggers circuit breaker
             # cascade when all proxies die mid-batch).
-            error_msg = "SKIP: Assigned proxy not found or dead"
+            error_msg = f"Proxy unavailable for {name}. Run: python -m src.cli proxy-refresh -f proxies.txt"
             self._log(f"[W{worker_id}] {name} - {error_msg}")
             try:
                 await self._db.update_account(
                     account_id, status="error",
-                    error_message="Proxy unavailable"
+                    error_message="Proxy unavailable — run proxy-refresh"
                 )
             except Exception as exc:
                 logger.warning("DB update failed for %s: %s", name, exc)

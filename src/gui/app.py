@@ -85,8 +85,8 @@ class TGWebAuthApp:
         self._active_pool = None
         self._last_table_refresh: float = 0.0
         # Fix #10: O(1) log append with bounded deque instead of O(n) string concat
-        # FIX-7.4: 500→2000 for 1000-account batches (~3-4 messages per account)
-        self._log_lines: collections.deque = collections.deque(maxlen=2000)
+        # FIX-7.4: 500→5000 for 1000-account batches (~3-4 messages per account)
+        self._log_lines: collections.deque = collections.deque(maxlen=5000)
         self._log_lines.append("[System] TG Web Auth started")
         # Fix #9: Track per-row action buttons for disabling during batch
         self._row_action_buttons: List[int] = []
@@ -233,7 +233,13 @@ class TGWebAuthApp:
                     "fonts/ttf/JetBrainsMono-Regular.ttf"
                 )
                 try:
-                    urllib.request.urlretrieve(font_url, font_path)
+                    import socket
+                    _old_timeout = socket.getdefaulttimeout()
+                    socket.setdefaulttimeout(5)
+                    try:
+                        urllib.request.urlretrieve(font_url, font_path)
+                    finally:
+                        socket.setdefaulttimeout(_old_timeout)
                     logger.info("Font downloaded to: %s", font_path)
                 except Exception as e:
                     logger.warning("Font download failed: %s", e)
@@ -374,6 +380,7 @@ class TGWebAuthApp:
             )
             dpg.add_button(
                 label="STOP",
+                tag="btn_stop",
                 callback=self._stop_migration
             )
             dpg.add_spacer(width=20)
@@ -684,7 +691,7 @@ class TGWebAuthApp:
     def _log(self, message: str) -> None:
         """Add message to log (thread-safe).
 
-        Uses a bounded deque (maxlen=2000) to avoid O(n^2) string concat.
+        Uses a bounded deque (maxlen=5000) to avoid O(n^2) string concat.
         FIX-7.1: Rebuild only every 10th message to reduce UI freeze at scale.
         """
         def do_log():
@@ -1409,7 +1416,18 @@ class TGWebAuthApp:
 
         if hasattr(self, '_active_pool') and self._active_pool:
             self._active_pool.request_shutdown()
+            self._schedule_ui(lambda: self._disable_stop_button())
         self._log("[Migrate] STOP requested - finishing active accounts...")
+
+    def _disable_stop_button(self) -> None:
+        """Disable STOP button and change label to show stopping state."""
+        if dpg.does_item_exist("btn_stop"):
+            dpg.configure_item("btn_stop", enabled=False, label="Stopping...")
+
+    def _reset_stop_button(self) -> None:
+        """Re-enable STOP button and restore label after batch completes."""
+        if dpg.does_item_exist("btn_stop"):
+            dpg.configure_item("btn_stop", enabled=True, label="STOP")
 
     def _throttled_refresh(self, completed: int, total: int) -> None:
         """Refresh accounts table at most every 3s (last update always fires)."""
@@ -1436,6 +1454,15 @@ class TGWebAuthApp:
 
             self._active_pool = pool
 
+            # Fix C6: Ensure _status_cells is populated before batch starts
+            # so that _throttled_refresh can do incremental updates
+            if not self._status_cells:
+                accounts_list = await self._controller.search_accounts("")
+                proxies_list = await self._controller.db.list_proxies()
+                proxies_map = {p.id: p for p in proxies_list}
+                self._schedule_ui(lambda: self._update_accounts_table_sync(accounts_list, proxies_map))
+                await asyncio.sleep(0.1)
+
             result = await pool.run(account_ids)
 
             self._log(
@@ -1445,12 +1472,13 @@ class TGWebAuthApp:
             self._active_pool = None
             self._schedule_ui(lambda: self._refresh_table_async())
 
-        except Exception as e:
+        except BaseException as e:
             logger.error("Batch migrate error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Batch migrate: {e}")
             self._active_pool = None
         finally:
             self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+            self._schedule_ui(lambda: self._reset_stop_button())
 
     def _fragment_all(self, sender=None, app_data=None) -> None:
         """Start fragment.com auth for all healthy (migrated) accounts."""
@@ -1496,6 +1524,15 @@ class TGWebAuthApp:
 
             self._active_pool = pool
 
+            # Fix C6: Ensure _status_cells is populated before batch starts
+            # so that _throttled_refresh can do incremental updates
+            if not self._status_cells:
+                accounts_list = await self._controller.search_accounts("")
+                proxies_list = await self._controller.db.list_proxies()
+                proxies_map = {p.id: p for p in proxies_list}
+                self._schedule_ui(lambda: self._update_accounts_table_sync(accounts_list, proxies_map))
+                await asyncio.sleep(0.1)
+
             result = await pool.run(account_ids)
 
             self._log(
@@ -1505,12 +1542,13 @@ class TGWebAuthApp:
             self._active_pool = None
             self._schedule_ui(lambda: self._refresh_table_async())
 
-        except Exception as e:
+        except BaseException as e:
             logger.error("Batch fragment error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Batch fragment: {e}")
             self._active_pool = None
         finally:
             self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+            self._schedule_ui(lambda: self._reset_stop_button())
 
     def _auto_assign_proxies(self, sender=None, app_data=None) -> None:
         """Auto-assign free proxies to accounts without proxies."""
@@ -1698,10 +1736,16 @@ def _startup_health_check() -> None:
 
     # Check Camoufox binary
     try:
-        from camoufox.pkgman import launch_path
-        lp = launch_path()
-        if not Path(lp).exists():
-            raise FileNotFoundError(f"Camoufox binary not found at {lp}")
+        if getattr(sys, "frozen", False):
+            from ..paths import APP_ROOT
+            camoufox_path = APP_ROOT / "camoufox" / "camoufox.exe"
+            if not camoufox_path.exists():
+                raise FileNotFoundError(f"Camoufox not found: {camoufox_path}")
+        else:
+            from camoufox.pkgman import launch_path
+            lp = launch_path()
+            if not Path(lp).exists():
+                raise FileNotFoundError(f"Camoufox binary not found at {lp}")
     except Exception:
         try:
             import tkinter as tk
@@ -1710,8 +1754,8 @@ def _startup_health_check() -> None:
             root.withdraw()
             messagebox.showerror(
                 "TG Web Auth — Error",
-                "Camoufox browser not found.\n\n"
-                "Install with: python -m camoufox fetch\n\n"
+                "Camoufox browser not found." + chr(10) + chr(10) +
+                "Install with: python -m camoufox fetch" + chr(10) + chr(10) +
                 "App will try to continue but migration will fail."
             )
             root.destroy()

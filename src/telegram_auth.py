@@ -1928,42 +1928,48 @@ async def migrate_accounts_batch(
         Список AuthResult
     """
     results = []
+    # FIX D2: Shared BrowserManager for all accounts in batch
+    shared_browser_manager = BrowserManager()
 
-    for i, account_dir in enumerate(account_dirs):
-        logger.info("=" * 60)
-        logger.info(f"ACCOUNT {i + 1}/{len(account_dirs)}: {account_dir.name}")
-        logger.info("=" * 60)
+    try:
+        for i, account_dir in enumerate(account_dirs):
+            logger.info("=" * 60)
+            logger.info(f"ACCOUNT {i + 1}/{len(account_dirs)}: {account_dir.name}")
+            logger.info("=" * 60)
 
-        # FIX-H9: Per-account password from passwords_map overrides global password_2fa
-        account_password = password_2fa
-        if passwords_map and account_dir.name in passwords_map:
-            account_password = passwords_map[account_dir.name]
+            # FIX-H9: Per-account password from passwords_map overrides global password_2fa
+            account_password = password_2fa
+            if passwords_map and account_dir.name in passwords_map:
+                account_password = passwords_map[account_dir.name]
 
-        # DB proxy override (takes priority over ___config.json)
-        account_proxy = proxy_map.get(account_dir.name) if proxy_map else None
+            # DB proxy override (takes priority over ___config.json)
+            account_proxy = proxy_map.get(account_dir.name) if proxy_map else None
 
-        result = await migrate_account(
-            account_dir=account_dir,
-            password_2fa=account_password,
-            headless=headless,
-            proxy_override=account_proxy,
-        )
-        results.append(result)
+            result = await migrate_account(
+                account_dir=account_dir,
+                password_2fa=account_password,
+                headless=headless,
+                proxy_override=account_proxy,
+                browser_manager=shared_browser_manager,
+            )
+            results.append(result)
 
-        # FIX-4.2: Call per-account callback for crash-safe DB updates
-        if on_result:
-            try:
-                cb_result = on_result(result)
-                if asyncio.iscoroutine(cb_result):
-                    await cb_result
-            except Exception as e:
-                logger.warning(f"on_result callback error: {e}")
+            # FIX-4.2: Call per-account callback for crash-safe DB updates
+            if on_result:
+                try:
+                    cb_result = on_result(result)
+                    if asyncio.iscoroutine(cb_result):
+                        await cb_result
+                except Exception as e:
+                    logger.warning(f"on_result callback error: {e}")
 
-        # FIX #6: Randomized cooldown между аккаунтами (кроме последнего)
-        if i < len(account_dirs) - 1:
-            jittered_cooldown = get_randomized_cooldown(cooldown)
-            logger.info(f"Cooldown {jittered_cooldown:.1f}s before next account (base: {cooldown}s)...")
-            await asyncio.sleep(jittered_cooldown)
+            # FIX #6: Randomized cooldown между аккаунтами (кроме последнего)
+            if i < len(account_dirs) - 1:
+                jittered_cooldown = get_randomized_cooldown(cooldown)
+                logger.info(f"Cooldown {jittered_cooldown:.1f}s before next account (base: {cooldown}s)...")
+                await asyncio.sleep(jittered_cooldown)
+    finally:
+        await shared_browser_manager.close_all()
 
     return results
 
@@ -2303,8 +2309,11 @@ class ParallelMigrationController:
                 task.add_done_callback(self._active_tasks.discard)
                 tasks.append(task)
 
-            # Wait for all started tasks with batch timeout
-            BATCH_TIMEOUT = 3600  # 1 hour for entire batch
+            # Dynamic timeout: at least 2h, scales with batch size
+            # Formula: (accounts / max_concurrent) * cooldown_per_account * safety_factor
+            estimated_time = (len(account_dirs) / self.max_concurrent) * self.cooldown * 2
+            BATCH_TIMEOUT = max(7200, int(estimated_time))  # minimum 2 hours
+            logger.info(f"Batch timeout: {BATCH_TIMEOUT}s for {len(account_dirs)} accounts")
 
             if tasks:
                 done, pending = await asyncio.wait(
