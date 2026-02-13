@@ -73,7 +73,7 @@ except ImportError as e:
     raise ImportError("click not installed. Run: pip install click") from e
 
 
-from .paths import ACCOUNTS_DIR, PROFILES_DIR
+from .paths import ACCOUNTS_DIR, DATA_DIR, PROFILES_DIR
 
 # FIX #6: Default cooldown между аккаунтами (safe: 60-120s = 10-20 logins/hour)
 DEFAULT_COOLDOWN = 90  # секунд (центр безопасного диапазона 60-120)
@@ -897,8 +897,9 @@ def fragment(account: Optional[str], fragment_all: bool, retry_failed: bool,
             return None
 
         # Open DB to check fragment_status
-        db = Database()
+        db = Database(DATA_DIR / "tgwebauth.db")
         await db.initialize()
+        await db.connect()
         try:
             accounts = await db.list_accounts()
         finally:
