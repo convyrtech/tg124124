@@ -252,6 +252,9 @@ class ProfileLifecycleManager:
         Blocking zip I/O is offloaded to a thread executor so the asyncio
         event loop is not stalled when multiple workers compress in parallel.
 
+        Uses atomic write (tmp file + rename) to prevent data loss if
+        disk fills during compression.
+
         Args:
             name: Profile name.
 
@@ -260,12 +263,21 @@ class ProfileLifecycleManager:
         """
         profile_path = self.profiles_dir / name
         zip_path = self.profiles_dir / f"{name}.zip"
+        tmp_zip = self.profiles_dir / f"{name}.zip.tmp"
 
         if not self.is_hot(name):
             return None
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._compress_zip, profile_path, zip_path)
+        try:
+            # FIX: Write to tmp file first, then atomic rename
+            await loop.run_in_executor(None, self._compress_zip, profile_path, tmp_zip)
+            await loop.run_in_executor(None, tmp_zip.rename, zip_path)
+        except Exception:
+            # Clean up partial tmp file, keep original directory intact
+            if tmp_zip.exists():
+                tmp_zip.unlink(missing_ok=True)
+            raise
         await loop.run_in_executor(None, _rmtree_force, profile_path)
 
         if name in self._access_order:
