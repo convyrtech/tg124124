@@ -32,12 +32,13 @@ def _write_crash_file(exc_type, exc_value, exc_tb) -> None:
             f.write(f"Exception: {exc_type.__name__}: {exc_value}\n\n")
             traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
     except Exception as write_err:
-        # Last resort: stderr (may be visible even in frozen exe with console=False)
-        try:
-            print(f"[CRASH HANDLER] Could not write crash file: {write_err}", file=sys.stderr)
-            traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
-        except Exception:
-            pass  # Truly nothing we can do
+        # Last resort: stderr (None in frozen windowed mode)
+        if sys.stderr is not None:
+            try:
+                print(f"[CRASH HANDLER] Could not write crash file: {write_err}", file=sys.stderr)
+                traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
+            except Exception:
+                pass  # Truly nothing we can do
 
 
 def _excepthook(exc_type, exc_value, exc_tb) -> None:

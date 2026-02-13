@@ -1731,8 +1731,26 @@ def _startup_health_check() -> None:
     from ..paths import ACCOUNTS_DIR, PROFILES_DIR, DATA_DIR, LOGS_DIR
 
     # Create required directories
-    for d in (ACCOUNTS_DIR, PROFILES_DIR, DATA_DIR, LOGS_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+    try:
+        for d in (ACCOUNTS_DIR, PROFILES_DIR, DATA_DIR, LOGS_DIR):
+            d.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "TG Web Auth — Error",
+                "Cannot create data directories — permission denied." + chr(10) + chr(10) +
+                "Do NOT place TGWebAuth in Program Files or other" + chr(10) +
+                "protected directories." + chr(10) + chr(10) +
+                "Extract to Desktop or C:\\TGWebAuth\\ instead."
+            )
+            root.destroy()
+        except Exception:
+            pass
+        raise SystemExit(1)
 
     # Check Camoufox binary
     try:
@@ -1752,12 +1770,19 @@ def _startup_health_check() -> None:
             from tkinter import messagebox
             root = tk.Tk()
             root.withdraw()
-            messagebox.showerror(
-                "TG Web Auth — Error",
-                "Camoufox browser not found." + chr(10) + chr(10) +
-                "Install with: python -m camoufox fetch" + chr(10) + chr(10) +
-                "App will try to continue but migration will fail."
-            )
+            if getattr(sys, "frozen", False):
+                msg = (
+                    "Camoufox browser not found in distribution." + chr(10) + chr(10) +
+                    "Please re-download TGWebAuth.zip and extract again." + chr(10) + chr(10) +
+                    "App will try to continue but migration will fail."
+                )
+            else:
+                msg = (
+                    "Camoufox browser not found." + chr(10) + chr(10) +
+                    "Install with: python -m camoufox fetch" + chr(10) + chr(10) +
+                    "App will try to continue but migration will fail."
+                )
+            messagebox.showerror("TG Web Auth — Error", msg)
             root.destroy()
         except Exception:
             pass

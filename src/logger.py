@@ -56,10 +56,12 @@ def setup_logging(
     root_logger.handlers.clear()
 
     # Console handler (stderr for visibility)
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setLevel(level)
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
+    # In frozen windowed mode (console=False), sys.stderr is None
+    if sys.stderr is not None:
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setLevel(level)
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
 
     # Rotating file handler — always enabled (5MB x 3 files)
     if enable_file_logging:
@@ -76,7 +78,8 @@ def setup_logging(
             root_logger.addHandler(rotating_handler)
         except Exception as e:
             # Don't crash if log dir is read-only
-            print(f"Warning: could not enable file logging: {e}", file=sys.stderr)
+            if sys.stderr is not None:
+                print(f"Warning: could not enable file logging: {e}", file=sys.stderr)
 
     # Optional additional file handler (for CLI --log-file)
     if log_file:
