@@ -66,6 +66,18 @@
 5. **ParallelMigrationController cooldown=5s** — 7200 логинов/час → `max(cooldown, MIN_COOLDOWN)`
 6. **GUI shutdown mid-flight** — `loop.stop()` без ожидания workers → poll `_active_pool` up to 30s
 
+### Deep Audit (2026-02-13, commit 46f9d82)
+11 багов найдены и исправлены:
+- **P0: DB race** — asyncio.Lock для concurrent aiosqlite (N workers, 1 connection)
+- **P0: start_migration double-commit** — atomic single transaction
+- **P0: mark_batch double-commit** — eliminated redundant commit
+- **P1: Dead browser** — page.evaluate("1") liveness check + "dead" state in authorize()
+- **P1: Shared BrowserManager** — migrate_accounts_parallel() now shares BrowserManager with cleanup
+- **P1: fragment.com 60s timeout** — wait_until="commit" (was "domcontentloaded" on TON SPA)
+- **P1: IncompleteReadError** — suppress Telethon background reader errors via loop exception handler
+- **P2: Batch pause race** — asyncio.Lock on _completed_count
+- **P2: Debug screenshots** — cleanup keeps last 10 (prevents 240MB accumulation)
+
 ### Что НЕ работает / НЕ доделано
 - **FIX-005** - 2FA selector hardcoded (P2)
 - **psutil.cpu_percent** - первый вызов возвращает 0.0 (P3, cosmetic)
