@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .database import Database, ProxyRecord
-from .proxy_health import check_proxy_connection
+from .proxy_health import check_proxy_connection, check_proxy_telegram
 from .utils import mask_proxy_credentials
 
 logger = logging.getLogger(__name__)
@@ -228,12 +228,15 @@ class ProxyManager:
         return counters
 
     async def check_assigned_proxies(
-        self, concurrency: int = 50, timeout: float = 5.0
+        self, concurrency: int = 50, timeout: float = 10.0
     ) -> dict[str, list]:
         """Health check only proxies assigned to accounts.
 
+        Uses deep SOCKS5+Telegram check (not just TCP) to detect
+        broken auth or Telegram-blocked proxies.
+
         Args:
-            concurrency: Max concurrent TCP checks.
+            concurrency: Max concurrent checks.
             timeout: Timeout per check in seconds.
 
         Returns:
@@ -264,7 +267,13 @@ class ProxyManager:
 
         async def _check_one(account, proxy):
             async with sem:
-                alive = await check_proxy_connection(proxy.host, proxy.port, timeout)
+                # FIX: Use deep SOCKS5+Telegram check instead of TCP-only
+                alive, _error = await check_proxy_telegram(
+                    proxy.host, proxy.port,
+                    username=proxy.username,
+                    password=proxy.password,
+                    timeout=timeout,
+                )
             new_status = "active" if alive else "dead"
             await self.db.update_proxy(proxy.id, status=new_status)
             if alive:

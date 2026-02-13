@@ -262,11 +262,11 @@ class TestCheckAssignedProxies:
         await db.assign_proxy(aid1, pid1)
         await db.assign_proxy(aid2, pid2)
 
-        async def _mock_check(host, port, timeout=5.0):
-            return "alive" in host
+        async def _mock_check(host, port, username=None, password=None, timeout=10.0):
+            return ("alive" in host, None if "alive" in host else "connection refused")
 
         manager = ProxyManager(db)
-        with patch("src.proxy_manager.check_proxy_connection", side_effect=_mock_check):
+        with patch("src.proxy_manager.check_proxy_telegram", side_effect=_mock_check):
             result = await manager.check_assigned_proxies()
 
         assert len(result["alive"]) == 1
@@ -279,7 +279,7 @@ class TestCheckAssignedProxies:
         await db.add_account(name="no_proxy", session_path="/s1")
 
         manager = ProxyManager(db)
-        with patch("src.proxy_manager.check_proxy_connection", new_callable=AsyncMock):
+        with patch("src.proxy_manager.check_proxy_telegram", new_callable=AsyncMock, return_value=(True, None)):
             result = await manager.check_assigned_proxies()
 
         assert len(result["no_proxy"]) == 1

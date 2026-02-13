@@ -715,6 +715,13 @@ class MigrationWorkerPool:
         proxy = await self._db.get_proxy(account.proxy_id)
         if not proxy:
             return None
+        # FIX: Skip dead proxies — retrying with a known-dead proxy wastes time
+        if proxy.status == "dead":
+            self._log(
+                f"[Pool] Proxy {proxy.host}:{proxy.port} is dead for "
+                f"{account.name} — run 'proxy-refresh' to replace"
+            )
+            return None
         if proxy.username and proxy.password:
             return (
                 f"{proxy.protocol}:{proxy.host}:{proxy.port}"
