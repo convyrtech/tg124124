@@ -432,26 +432,37 @@ class Database:
     async def assign_proxy(self, account_id: int, proxy_id: int) -> None:
         """Assign proxy to account (1:1 binding).
 
+        Uses atomic check-and-update to prevent TOCTOU race where
+        two accounts could get the same proxy assigned.
+
         Raises:
             ValueError: If proxy is already assigned to a different account.
         """
-        # Check if proxy is already assigned to a different account
+        # FIX-P1: Atomic check-and-update — only assigns if unassigned
+        # or already assigned to this same account
         async with self._connection.execute(
-            "SELECT assigned_account_id FROM proxies WHERE id = ?", (proxy_id,)
+            """UPDATE proxies
+               SET assigned_account_id = ?
+               WHERE id = ?
+                 AND (assigned_account_id IS NULL OR assigned_account_id = ?)""",
+            (account_id, proxy_id, account_id)
         ) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0] is not None and row[0] != account_id:
-                raise ValueError(
-                    f"Proxy {proxy_id} already assigned to account {row[0]}"
-                )
+            if cursor.rowcount == 0:
+                # Either proxy doesn't exist or is assigned to another account
+                async with self._connection.execute(
+                    "SELECT assigned_account_id FROM proxies WHERE id = ?",
+                    (proxy_id,)
+                ) as check:
+                    row = await check.fetchone()
+                    if row is None:
+                        raise ValueError(f"Proxy {proxy_id} not found")
+                    raise ValueError(
+                        f"Proxy {proxy_id} already assigned to account {row[0]}"
+                    )
 
         await self._connection.execute(
             "UPDATE accounts SET proxy_id = ? WHERE id = ?",
             (proxy_id, account_id)
-        )
-        await self._connection.execute(
-            "UPDATE proxies SET assigned_account_id = ? WHERE id = ?",
-            (account_id, proxy_id)
         )
         await self._commit_with_retry()
 
@@ -584,8 +595,10 @@ class Database:
         """
         Record migration completion.
 
-        Updates account status to 'healthy' or 'error'.
+        Updates both migrations and accounts tables in a single
+        transaction to prevent data inconsistency on crash.
         """
+        # FIX-P1: Single transaction for both migration + account update
         await self._connection.execute(
             """
             UPDATE migrations
@@ -597,9 +610,8 @@ class Database:
             """,
             (1 if success else 0, error_message, profile_path, migration_id)
         )
-        await self._commit_with_retry()
 
-        # Get account_id from migration record
+        # Get account_id and update status BEFORE committing
         async with self._connection.execute(
             "SELECT account_id FROM migrations WHERE id = ?",
             (migration_id,)
@@ -607,13 +619,14 @@ class Database:
             row = await cursor.fetchone()
             if row:
                 account_id = row["account_id"]
-                # Update account status
                 new_status = "healthy" if success else "error"
-                await self.update_account(
-                    account_id,
-                    status=new_status,
-                    error_message=error_message
+                await self._connection.execute(
+                    "UPDATE accounts SET status = ?, error_message = ? WHERE id = ?",
+                    (new_status, error_message, account_id)
                 )
+
+        # Single commit covers both tables
+        await self._commit_with_retry()
 
     async def get_pending_migrations(self) -> List[AccountRecord]:
         """
