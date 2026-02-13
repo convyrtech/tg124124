@@ -245,9 +245,9 @@ class FragmentAuth:
         """
         # Wait for page JS to fully initialize before clicking
         await asyncio.sleep(2)
-        popup_promise = page.wait_for_event('popup', timeout=20000)
-        # FIX-3.2: Try CSS class first, then text-based fallback
-        try:
+        # Use expect_popup context manager for proper cleanup (no RuntimeWarning)
+        async with page.expect_popup(timeout=20000) as popup_info:
+            # FIX-3.2: Try CSS class first, then text-based fallback
             try:
                 await page.click('button.login-link')
             except Exception:
@@ -255,21 +255,14 @@ class FragmentAuth:
                 login_btn = await page.evaluate("""
                     () => {
                         const btn = Array.from(document.querySelectorAll('button'))
-                            .find(b => /log\\\\s*in|connect\\\\s*telegram/i.test(b.textContent));
+                            .find(b => /log\\s*in|connect\\s*telegram/i.test(b.textContent));
                         if (btn) { btn.click(); return true; }
                         return false;
                     }
                 """)
                 if not login_btn:
                     raise RuntimeError("Login button not found on fragment.com")
-            popup = await popup_promise
-        except Exception:
-            # Cleanup unawaited popup_promise to prevent RuntimeWarning
-            try:
-                await popup_promise
-            except Exception:
-                pass
-            raise
+        popup = await popup_info.value
         await popup.wait_for_load_state('domcontentloaded')
         logger.info("OAuth popup opened: %s", popup.url)
         return popup

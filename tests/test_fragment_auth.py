@@ -216,15 +216,21 @@ class TestFragmentAuth:
         mock_popup.url = "https://oauth.telegram.org/auth?..."
         mock_popup.wait_for_load_state = AsyncMock()
 
-        async def _return_popup():
+        # Mock expect_popup as async context manager
+        # popup_info.value is an async property, so 'await popup_info.value' must work
+        async def _popup_value():
             return mock_popup
 
-        page.wait_for_event = MagicMock(return_value=_return_popup())
+        popup_ctx = AsyncMock()
+        popup_ctx.__aenter__ = AsyncMock(return_value=popup_ctx)
+        popup_ctx.__aexit__ = AsyncMock(return_value=False)
+        popup_ctx.value = _popup_value()
+        page.expect_popup = MagicMock(return_value=popup_ctx)
         page.click = AsyncMock()
 
         popup = await fragment_auth._open_oauth_popup(page)
         assert popup == mock_popup
-        page.wait_for_event.assert_called_once_with('popup', timeout=20000)
+        page.expect_popup.assert_called_once_with(timeout=20000)
         page.click.assert_awaited_once_with('button.login-link')
         mock_popup.wait_for_load_state.assert_awaited_once_with('domcontentloaded')
 
