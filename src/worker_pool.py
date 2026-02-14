@@ -27,6 +27,7 @@ from .database import AccountRecord, Database
 from .fragment_auth import fragment_account
 from .resource_monitor import ResourceMonitor
 from .telegram_auth import CircuitBreaker, AuthResult, migrate_account
+from .utils import sanitize_error
 
 logger = logging.getLogger(__name__)
 
@@ -538,7 +539,7 @@ class MigrationWorkerPool:
                 account_id, name, error_msg, retries
             )
         except Exception as exc:
-            error_msg = str(exc)
+            error_msg = sanitize_error(str(exc))
             self._log(f"[W{worker_id}] {name} - ERROR: {humanize_error(error_msg)}")
             if migration_id is not None:
                 await self._complete_migration_safe(

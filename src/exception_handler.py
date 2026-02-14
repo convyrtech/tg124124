@@ -11,6 +11,7 @@ import traceback
 from datetime import datetime
 
 from .paths import LOGS_DIR
+from .utils import sanitize_error
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +30,11 @@ def _write_crash_file(exc_type, exc_value, exc_tb) -> None:
         with open(crash_path, 'a', encoding='utf-8') as f:
             f.write(f"\n{'='*60}\n")
             f.write(f"Crash at: {datetime.now().isoformat()}\n")
-            f.write(f"Exception: {exc_type.__name__}: {exc_value}\n\n")
-            traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+            f.write(f"Exception: {exc_type.__name__}: {sanitize_error(str(exc_value))}\n\n")
+            # Format traceback but sanitize each line
+            tb_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
+            for line in tb_lines:
+                f.write(sanitize_error(line))
     except Exception as write_err:
         # Last resort: stderr (None in frozen windowed mode)
         if sys.stderr is not None:

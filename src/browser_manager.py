@@ -398,7 +398,14 @@ class BrowserManager:
         self.profiles_dir = profiles_dir or self.PROFILES_DIR
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
         self._active_browsers: Dict[str, Any] = {}
+        self._profile_locks: Dict[str, asyncio.Lock] = {}
         self.lifecycle = ProfileLifecycleManager(self.profiles_dir)
+
+    def _get_profile_lock(self, name: str) -> asyncio.Lock:
+        """Get or create per-profile lock to prevent concurrent browser operations."""
+        if name not in self._profile_locks:
+            self._profile_locks[name] = asyncio.Lock()
+        return self._profile_locks[name]
 
     def get_profile(self, name: str, proxy: Optional[str] = None) -> BrowserProfile:
         """Получает или создаёт профиль"""
@@ -579,6 +586,28 @@ class BrowserManager:
         Returns:
             BrowserContext wrapper с page и методами управления
         """
+        # Per-profile lock: prevents two workers from launching same profile
+        # simultaneously (e.g., during retry while previous browser is still closing)
+        async with self._get_profile_lock(profile.name):
+            return await self._launch_impl(profile, headless, extra_args)
+
+    async def _launch_impl(
+        self,
+        profile: BrowserProfile,
+        headless: bool = False,
+        extra_args: Optional[Dict] = None
+    ) -> "BrowserContext":
+        """Internal launch implementation, called under profile lock."""
+        # Close stale browser if still active for this profile
+        if profile.name in self._active_browsers:
+            old_ctx = self._active_browsers[profile.name]
+            logger.warning("Profile '%s' has stale active browser, closing first", profile.name)
+            try:
+                await asyncio.wait_for(old_ctx.close(), timeout=20)
+            except Exception as e:
+                logger.warning("Force-closing stale browser for '%s': %s", profile.name, e)
+                self._active_browsers.pop(profile.name, None)
+
         # Hot/cold lifecycle: decompress if needed, evict LRU if at capacity
         # Protected set includes active browsers AND the current profile being launched
         protected = set(self._active_browsers.keys()) | {profile.name}

@@ -515,7 +515,7 @@ class FragmentAuth:
 
             # Variant C: unknown message format — do NOT auto-confirm,
             # it may be an unrelated stale message from 777000
-            logger.warning("Unknown message from 777000 (not confirming): %s", event.raw_text[:100])
+            logger.warning("Unknown message from 777000 (not confirming): [%d chars, redacted]", len(event.raw_text or ""))
 
         return handler
 

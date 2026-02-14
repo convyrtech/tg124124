@@ -63,6 +63,7 @@ except ImportError as e:
     raise ImportError("telethon not installed. Run: pip install telethon") from e
 
 from .browser_manager import BrowserManager, BrowserProfile, BrowserContext
+from .utils import sanitize_error
 
 if TYPE_CHECKING:
     from .resource_monitor import ResourceMonitor
@@ -1883,11 +1884,11 @@ class TelegramAuth:
                 )
 
         except Exception as e:
-            logger.error("Authorization failed for '%s': %s", profile.name, e, exc_info=True)
+            logger.error("Authorization failed for '%s': %s", profile.name, sanitize_error(str(e)), exc_info=True)
             return AuthResult(
                 success=False,
                 profile_name=profile.name,
-                error=str(e)
+                error=sanitize_error(str(e))
             )
 
         finally:
@@ -2362,7 +2363,7 @@ class ParallelMigrationController:
                     result = AuthResult(
                         success=False,
                         profile_name=account_dir.name,
-                        error=str(e)
+                        error=sanitize_error(str(e))
                     )
 
                 # Record result for circuit breaker
@@ -2495,7 +2496,7 @@ async def migrate_accounts_parallel(
                 result = AuthResult(
                     success=False,
                     profile_name=account_dir.name,
-                    error=str(e)
+                    error=sanitize_error(str(e))
                 )
 
             async with lock:

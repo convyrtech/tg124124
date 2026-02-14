@@ -510,17 +510,20 @@ class TGWebAuthApp:
                     log_file = LOGS_DIR / "app.log"
                     if log_file.exists():
                         try:
+                            from ..utils import sanitize_error
                             lines = log_file.read_text(encoding='utf-8', errors='replace').splitlines()
-                            zf.writestr("app.log", "\n".join(lines[-5000:]))
+                            sanitized_lines = [sanitize_error(l) for l in lines[-5000:]]
+                            zf.writestr("app.log", "\n".join(sanitized_lines))
                         except Exception as e:
                             logger.warning("Diagnostics: failed to collect app.log: %s", e)
                             zf.writestr("app.log.error", f"Could not include app.log: {e}")
 
-                    # last_crash.txt
+                    # last_crash.txt (sanitized)
                     crash_file = LOGS_DIR / "last_crash.txt"
                     if crash_file.exists():
                         try:
-                            zf.write(crash_file, "last_crash.txt")
+                            crash_text = crash_file.read_text(encoding='utf-8', errors='replace')
+                            zf.writestr("last_crash.txt", sanitize_error(crash_text))
                         except Exception as e:
                             logger.warning("Diagnostics: failed to collect last_crash.txt: %s", e)
 
@@ -1234,6 +1237,9 @@ class TGWebAuthApp:
             return None
         proxy = await self._controller.db.get_proxy(account.proxy_id)
         if not proxy:
+            return None
+        if proxy.status == "dead":
+            self._log(f"[Warning] Proxy {proxy.host}:{proxy.port} is dead for {account.name}")
             return None
         # Format: socks5:host:port:user:pass or socks5:host:port
         if proxy.username and proxy.password:

@@ -3,6 +3,7 @@ Utility functions for TG Web Auth.
 
 Общие функции используемые в разных модулях.
 """
+import re
 from typing import Dict, Any, Optional, Tuple
 
 
@@ -39,8 +40,8 @@ def parse_proxy_for_camoufox(proxy_str: str) -> Dict[str, Any]:
         return {"server": f"{proto}://{host}:{port}"}
 
     raise ValueError(
-        f"Invalid proxy format: '{proxy_str}'. "
-        f"Expected: 'protocol:host:port:user:pass' or 'protocol:host:port'"
+        f"Invalid proxy format (expected 'protocol:host:port[:user:pass]', "
+        f"got {len(parts)} parts)"
     )
 
 
@@ -101,3 +102,41 @@ def mask_proxy_credentials(proxy_str: str) -> str:
         proto, host, port, _, _ = parts
         return f"{proto}:{host}:{port}:***:***"
     return proxy_str
+
+
+# Regex patterns for credential-like data in error messages
+_PROXY_PATTERN = re.compile(
+    r'(socks[45]?|https?|http)([:/]+)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)(:\S+:\S+)',
+    re.IGNORECASE
+)
+_CREDENTIAL_URI_PATTERN = re.compile(
+    r'://([^:@]+):([^@]+)@',
+)
+_PHONE_PATTERN = re.compile(
+    r'\b(\+?\d{10,15})\b'
+)
+
+
+def sanitize_error(error_text: str) -> str:
+    """
+    Remove credentials, proxy passwords, phone numbers from error text.
+
+    Safe for logging, DB storage, crash files, diagnostics.
+
+    Args:
+        error_text: Raw error string that may contain sensitive data
+
+    Returns:
+        Sanitized string with credentials masked
+    """
+    if not error_text:
+        return ""
+
+    text = str(error_text)
+    # Mask proxy credentials in protocol:host:port:user:pass format
+    text = _PROXY_PATTERN.sub(r'\1\2\3:***:***', text)
+    # Mask credentials in URI format (user:pass@host)
+    text = _CREDENTIAL_URI_PATTERN.sub(r'://***:***@', text)
+    # Mask phone numbers
+    text = _PHONE_PATTERN.sub(r'[phone]', text)
+    return text

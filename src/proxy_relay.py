@@ -213,7 +213,8 @@ class ProxyRelay:
         if self._process.returncode is not None:
             stderr = await self._process.stderr.read()
             self._process = None
-            raise RuntimeError(f"ProxyRelay failed to start: {stderr.decode()}")
+            from .utils import sanitize_error
+            raise RuntimeError(f"ProxyRelay failed to start: {sanitize_error(stderr.decode())}")
 
         logger.debug("ProxyRelay process started (PID: %d)", self._process.pid)
 
