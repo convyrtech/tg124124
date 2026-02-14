@@ -1384,6 +1384,15 @@ class TelegramAuth:
         logger.info(f"Waiting for browser authorization (timeout: {timeout}s)...")
 
         for i in range(timeout):
+            # Dead browser detection — avoid looping 120s on a crashed browser
+            try:
+                await page.evaluate("1")
+            except Exception as e:
+                err = str(e).lower()
+                if any(p in err for p in ("target closed", "connection closed", "has been closed")):
+                    logger.warning("Browser dead during auth completion wait")
+                    return (False, False)
+
             current_url = page.url
 
             # Проверяем успешную авторизацию - ищем элементы главной страницы
