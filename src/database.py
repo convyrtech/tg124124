@@ -214,8 +214,15 @@ class Database:
         proxy_id: Optional[int] = None,
         status: str = "pending"
     ) -> int:
-        """Add new account, return ID."""
+        """Add new account, return ID. Skips if name already exists."""
         async with self._db_lock:
+            # Check for existing account to prevent duplicates
+            async with self._connection.execute(
+                "SELECT id FROM accounts WHERE name = ? LIMIT 1", (name,)
+            ) as cursor:
+                existing = await cursor.fetchone()
+                if existing:
+                    return existing[0]
             async with self._connection.execute(
                 """
                 INSERT INTO accounts (name, session_path, phone, username, proxy_id, status)

@@ -569,25 +569,32 @@ class TestDatabase:
         await db.connect()
 
         try:
-            # Create 3 accounts with same name but different richness
+            # Insert 3 accounts with same name via raw SQL (bypass add_account dedup)
             # Account 1: poorest — no proxy, pending, no fragment
-            id1 = await db.add_account(
-                name="dup_test", session_path="/s1.session"
-            )
+            async with db._connection.execute(
+                "INSERT INTO accounts (name, session_path, status) VALUES (?, ?, ?)",
+                ("dup_test", "/s1.session", "pending")
+            ) as cur:
+                id1 = cur.lastrowid
             # Account 2: has proxy
-            id2 = await db.add_account(
-                name="dup_test", session_path="/s2.session"
-            )
+            async with db._connection.execute(
+                "INSERT INTO accounts (name, session_path, status) VALUES (?, ?, ?)",
+                ("dup_test", "/s2.session", "pending")
+            ) as cur:
+                id2 = cur.lastrowid
             proxy_id = await db.add_proxy(host="1.2.3.4", port=1080)
             await db.assign_proxy(id2, proxy_id)
 
             # Account 3: richest — has proxy, non-pending status, fragment
-            id3 = await db.add_account(
-                name="dup_test", session_path="/s3.session"
-            )
+            async with db._connection.execute(
+                "INSERT INTO accounts (name, session_path, status) VALUES (?, ?, ?)",
+                ("dup_test", "/s3.session", "pending")
+            ) as cur:
+                id3 = cur.lastrowid
             proxy_id2 = await db.add_proxy(host="5.6.7.8", port=1080)
             await db.assign_proxy(id3, proxy_id2)
             await db.update_account(id3, status="success", fragment_status="authorized")
+            await db._commit_with_retry()
 
             # Verify we have 3 duplicates
             all_accs = await db.list_accounts()
