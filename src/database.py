@@ -239,12 +239,25 @@ class Database:
         Returns number of removed duplicates.
         """
         async with self._db_lock:
-            # Find duplicates: keep row with lowest ID that has proxy_id or non-pending status
+            # Find duplicates: keep the "richest" row per name group
+            # Priority: has proxy_id > non-pending status > lowest id
             async with self._connection.execute("""
                 SELECT id FROM accounts
                 WHERE id NOT IN (
-                    SELECT MIN(id) FROM accounts GROUP BY name
+                    SELECT id FROM (
+                        SELECT id, name,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY name
+                                ORDER BY
+                                    CASE WHEN proxy_id IS NOT NULL THEN 0 ELSE 1 END,
+                                    CASE WHEN status != 'pending' THEN 0 ELSE 1 END,
+                                    CASE WHEN fragment_status IS NOT NULL THEN 0 ELSE 1 END,
+                                    id ASC
+                            ) as rn
+                        FROM accounts
+                    ) WHERE rn = 1
                 )
+                AND name IN (SELECT name FROM accounts GROUP BY name HAVING COUNT(*) > 1)
             """) as cursor:
                 dup_rows = await cursor.fetchall()
 
