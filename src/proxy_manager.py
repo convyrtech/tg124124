@@ -31,7 +31,7 @@ def parse_proxy_line(line: str) -> tuple[Optional[str], Optional[int], Optional[
     protocol = "socks5"
 
     # Remove protocol prefix if present
-    if line.startswith(("socks5:", "socks4:", "http:", "https://")):
+    if line.startswith(("socks5:", "socks4:", "http:", "https:", "https://")):
         if "://" in line:
             protocol, rest = line.split("://", 1)
             line = rest
@@ -348,19 +348,27 @@ class ProxyManager:
                 # Only update DB after file write succeeded
                 # Atomic transaction: all three DB updates in one lock/commit
                 async with self.db._db_lock:
-                    await self.db._connection.execute(
-                        "UPDATE proxies SET status = 'dead', assigned_account_id = NULL WHERE id = ?",
-                        (old_proxy.id,)
-                    )
-                    await self.db._connection.execute(
-                        "UPDATE proxies SET status = 'active', assigned_account_id = ? WHERE id = ?",
-                        (account_id, new_proxy.id)
-                    )
-                    await self.db._connection.execute(
-                        "UPDATE accounts SET proxy_id = ? WHERE id = ?",
-                        (new_proxy.id, account_id)
-                    )
-                    await self.db._commit_with_retry()
+                    try:
+                        await self.db._connection.execute(
+                            "UPDATE proxies SET status = 'dead', assigned_account_id = NULL WHERE id = ?",
+                            (old_proxy.id,)
+                        )
+                        await self.db._connection.execute(
+                            "UPDATE proxies SET status = 'active', assigned_account_id = ? WHERE id = ?",
+                            (account_id, new_proxy.id)
+                        )
+                        await self.db._connection.execute(
+                            "UPDATE accounts SET proxy_id = ? WHERE id = ?",
+                            (new_proxy.id, account_id)
+                        )
+                        await self.db._commit_with_retry()
+                    except Exception:
+                        # Rollback partial writes INSIDE the lock
+                        try:
+                            await self.db._connection.rollback()
+                        except Exception:
+                            pass
+                        raise
 
                 # Log operation
                 await self.db.log_operation(

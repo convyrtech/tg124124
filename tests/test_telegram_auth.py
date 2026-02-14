@@ -1091,3 +1091,44 @@ class TestBrowserWatchdog:
         )
         assert watchdog._timer.daemon is True
         watchdog.cancel()
+
+
+class TestSafeDisconnect:
+    """Tests for TelegramAuth._safe_disconnect static method."""
+
+    @pytest.mark.asyncio
+    async def test_safe_disconnect_suppresses_errors(self):
+        """_safe_disconnect doesn't raise even if client.disconnect() fails."""
+        from src.telegram_auth import TelegramAuth
+
+        mock_client = AsyncMock()
+        mock_client.disconnect.side_effect = ConnectionError("already closed")
+
+        # Should NOT raise
+        await TelegramAuth._safe_disconnect(mock_client)
+        mock_client.disconnect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_safe_disconnect_normal(self):
+        """_safe_disconnect calls disconnect on healthy client."""
+        from src.telegram_auth import TelegramAuth
+
+        mock_client = AsyncMock()
+        await TelegramAuth._safe_disconnect(mock_client)
+        mock_client.disconnect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_safe_disconnect_timeout(self):
+        """_safe_disconnect handles client that hangs on disconnect."""
+        import asyncio
+        from src.telegram_auth import TelegramAuth
+
+        mock_client = AsyncMock()
+
+        async def hang_forever():
+            await asyncio.sleep(100)
+
+        mock_client.disconnect.side_effect = hang_forever
+
+        # Should return within ~5s timeout, not hang
+        await TelegramAuth._safe_disconnect(mock_client)

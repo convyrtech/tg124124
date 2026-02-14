@@ -715,11 +715,18 @@ class BrowserManager:
         except BaseException:
             # Cleanup proxy_relay and camoufox on ANY unhandled exception in launch flow
             # BaseException catches CancelledError (Python 3.11+: not subclass of Exception)
-            if 'browser' in locals() and camoufox:
-                try:
-                    await asyncio.wait_for(camoufox.__aexit__(None, None, None), timeout=10)
-                except Exception as cleanup_err:
-                    logger.warning("Camoufox cleanup on launch failure: %s", cleanup_err)
+            if 'camoufox' in locals() and camoufox:
+                if 'browser' in locals() and browser:
+                    try:
+                        await asyncio.wait_for(camoufox.__aexit__(None, None, None), timeout=10)
+                    except Exception as cleanup_err:
+                        logger.warning("Camoufox cleanup on launch failure: %s", cleanup_err)
+                else:
+                    # __aenter__ failed or wasn't reached — kill any spawned process
+                    try:
+                        await self._kill_zombie_browser(camoufox)
+                    except Exception as kill_err:
+                        logger.warning("Zombie browser kill on launch failure: %s", kill_err)
             if proxy_relay:
                 try:
                     await proxy_relay.stop()

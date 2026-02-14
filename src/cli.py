@@ -813,7 +813,11 @@ def health(account: str):
             finally:
                 await client.disconnect()
 
-        me, error = asyncio.run(check_telethon())
+        try:
+            me, error = asyncio.run(check_telethon())
+        except KeyboardInterrupt:
+            click.echo("\nПрервано пользователем (Ctrl+C).")
+            return
 
         if error:
             click.echo(click.style(f"  ✗ Ошибка: {error}", fg="red"))
@@ -1345,7 +1349,10 @@ def preflight():
         finally:
             await db.close()
 
-    asyncio.run(_run_preflight())
+    try:
+        asyncio.run(_run_preflight())
+    except KeyboardInterrupt:
+        click.echo("\nПрервано пользователем (Ctrl+C).")
 
 
 @cli.command()
@@ -1373,7 +1380,7 @@ def init():
 
 @cli.command()
 def dedup():
-    """Удалить дубликаты аккаунтов из БД (оставляет первый по ID)"""
+    """Удалить дубликаты аккаунтов из БД (оставляет самую богатую запись: с прокси, статусом, fragment)"""
     async def _dedup():
         from .database import Database
         db = Database(DATA_DIR / "tgwebauth.db")
@@ -1388,7 +1395,10 @@ def dedup():
         finally:
             await db.close()
 
-    asyncio.run(_dedup())
+    try:
+        asyncio.run(_dedup())
+    except KeyboardInterrupt:
+        click.echo("\nПрервано пользователем (Ctrl+C).")
 
 
 if __name__ == "__main__":

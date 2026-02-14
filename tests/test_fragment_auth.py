@@ -240,6 +240,7 @@ class TestFragmentAuth:
     async def test_submit_phone_on_popup_success(self, fragment_auth):
         """Test phone submission on OAuth popup - success case."""
         popup = AsyncMock()
+        popup.is_closed = MagicMock(return_value=False)
         # evaluate is called multiple times: phone input, possibly fallback click, captcha check
         # Captcha check must return False (no captcha), other calls return None (success)
         popup.evaluate = AsyncMock(return_value=False)
@@ -261,6 +262,7 @@ class TestFragmentAuth:
     async def test_submit_phone_on_popup_already_formatted(self, fragment_auth):
         """Test phone submission when phone already has + prefix."""
         popup = AsyncMock()
+        popup.is_closed = MagicMock(return_value=False)
         popup.evaluate = AsyncMock(return_value=False)
         popup.click = AsyncMock()
         popup.wait_for_selector = AsyncMock()
@@ -320,6 +322,7 @@ class TestFragmentAuth:
     async def test_accept_existing_session_success(self, fragment_auth):
         """Test clicking ACCEPT via JS evaluate on existing session popup."""
         popup = AsyncMock()
+        popup.is_closed = MagicMock(return_value=False)
         # JS evaluate finds and clicks ACCEPT, returns 'clicked:ACCEPT'
         popup.evaluate = AsyncMock(return_value="clicked:ACCEPT")
         result = await fragment_auth._accept_existing_session(popup)
@@ -329,6 +332,7 @@ class TestFragmentAuth:
     async def test_accept_existing_session_via_get_by_text(self, fragment_auth):
         """Test fallback to get_by_text when JS evaluate returns None."""
         popup = AsyncMock()
+        popup.is_closed = MagicMock(return_value=False)
         # JS evaluate returns None (no element found via JS)
         # Then get_by_text("ACCEPT") finds it
         mock_locator = MagicMock()

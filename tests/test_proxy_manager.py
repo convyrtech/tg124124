@@ -1,7 +1,7 @@
 """Tests for ProxyManager: import, health check, replacement."""
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -62,6 +62,22 @@ class TestParseProxyLine:
         host, port, user, pwd, proto = parse_proxy_line("garbage")
         assert host is None
         assert port is None
+
+    def test_https_without_slashes(self):
+        """parse_proxy_line handles 'https:host:port:user:pass' format."""
+        host, port, user, pwd, proto = parse_proxy_line("https:1.2.3.4:1080:user:pass")
+        assert host == "1.2.3.4"
+        assert port == 1080
+        assert user == "user"
+        assert pwd == "pass"
+        assert proto == "https"
+
+    def test_https_with_slashes(self):
+        """parse_proxy_line handles 'https://host:port' format."""
+        host, port, user, pwd, proto = parse_proxy_line("https://1.2.3.4:1080")
+        assert host == "1.2.3.4"
+        assert port == 1080
+        assert proto == "https"
 
 
 # ==================== proxy_record_to_string ====================
@@ -492,3 +508,54 @@ class TestExecuteReplacements:
         # DB updated correctly
         account = await db.get_account(aid)
         assert account.proxy_id == pid_new
+
+    @pytest.mark.asyncio
+    async def test_execute_db_failure_triggers_rollback(self, db, tmp_path):
+        """If DB UPDATE fails mid-transaction, rollback() is called and error is counted."""
+        accounts_dir = tmp_path / "accounts"
+
+        pid_old = await db.add_proxy(host="dead.com", port=1080)
+        pid_new = await db.add_proxy(host="fresh.com", port=1080)
+        aid = await db.add_account(name="rollback_acc", session_path="/s1")
+        await db.assign_proxy(aid, pid_old)
+        await db.update_proxy(pid_new, status="reserved")
+
+        old_proxy = await db.get_proxy(pid_old)
+        new_proxy = await db.get_proxy(pid_new)
+
+        plan = [{
+            "account_name": "rollback_acc",
+            "account_id": aid,
+            "old_proxy": old_proxy,
+            "new_proxy": new_proxy,
+        }]
+
+        manager = ProxyManager(db, accounts_dir)
+
+        # Track rollback calls
+        original_rollback = db._connection.rollback
+        rollback_called = [False]
+
+        async def tracked_rollback():
+            rollback_called[0] = True
+            return await original_rollback()
+
+        # Patch only the inner DB block by making _commit_with_retry raise
+        # This is cleaner: the 3 UPDATEs succeed, but commit fails → rollback
+        original_commit = db._commit_with_retry
+        commit_fail_active = [True]
+
+        async def failing_commit():
+            if commit_fail_active[0]:
+                commit_fail_active[0] = False  # Only fail once
+                raise Exception("Simulated commit failure")
+            return await original_commit()
+
+        with patch.object(db, '_commit_with_retry', side_effect=failing_commit), \
+             patch.object(db._connection, 'rollback', side_effect=tracked_rollback):
+            result = await manager.execute_replacements(plan)
+
+        assert result["errors"] == 1
+        assert result["replaced"] == 0
+        assert rollback_called[0] is True, "rollback() should have been called on commit failure"
+

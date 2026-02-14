@@ -7,6 +7,7 @@ import logging
 import shutil
 
 from ..database import Database, AccountRecord, ProxyRecord
+from ..proxy_manager import parse_proxy_line
 
 logger = logging.getLogger(__name__)
 
@@ -270,52 +271,10 @@ class AppController:
         return imported
 
     def _parse_proxy_line(self, line: str) -> tuple:
-        """
-        Parse proxy line into components.
+        """Parse proxy line into components.
+
+        Delegates to proxy_manager.parse_proxy_line.
 
         Returns: (host, port, username, password, protocol)
         """
-        protocol = "socks5"  # default
-
-        # Remove protocol prefix if present
-        if line.startswith(("socks5:", "socks4:", "http:", "https://")):
-            if "://" in line:
-                protocol, rest = line.split("://", 1)
-                line = rest
-            else:
-                parts = line.split(":", 1)
-                protocol = parts[0]
-                line = parts[1] if len(parts) > 1 else ""
-
-        # Handle user:pass@host:port format
-        if "@" in line:
-            auth_part, host_part = line.rsplit("@", 1)
-            if ":" in auth_part:
-                username, password = auth_part.split(":", 1)
-            else:
-                username, password = auth_part, None
-
-            if ":" in host_part:
-                host, port_str = host_part.split(":", 1)
-                try:
-                    port = int(port_str)
-                except ValueError:
-                    return (None, None, None, None, protocol)
-            else:
-                return (None, None, None, None, protocol)
-
-            return (host, port, username, password, protocol)
-
-        # Handle host:port:user:pass format (main format)
-        parts = line.split(":")
-        if len(parts) >= 2:
-            host = parts[0]
-            try:
-                port = int(parts[1])
-            except ValueError:
-                return (None, None, None, None, protocol)
-            username = parts[2] if len(parts) > 2 and parts[2] else None
-            password = parts[3] if len(parts) > 3 and parts[3] else None
-            return (host, port, username, password, protocol)
-
-        return (None, None, None, None, protocol)
+        return parse_proxy_line(line)

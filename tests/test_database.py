@@ -558,3 +558,86 @@ class TestDatabase:
 
         finally:
             await db.close()
+
+    @pytest.mark.asyncio
+    async def test_remove_duplicate_accounts_keeps_richest(self, db_path):
+        """remove_duplicate_accounts keeps the record with proxy/status/fragment."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            # Create 3 accounts with same name but different richness
+            # Account 1: poorest — no proxy, pending, no fragment
+            id1 = await db.add_account(
+                name="dup_test", session_path="/s1.session"
+            )
+            # Account 2: has proxy
+            id2 = await db.add_account(
+                name="dup_test", session_path="/s2.session"
+            )
+            proxy_id = await db.add_proxy(host="1.2.3.4", port=1080)
+            await db.assign_proxy(id2, proxy_id)
+
+            # Account 3: richest — has proxy, non-pending status, fragment
+            id3 = await db.add_account(
+                name="dup_test", session_path="/s3.session"
+            )
+            proxy_id2 = await db.add_proxy(host="5.6.7.8", port=1080)
+            await db.assign_proxy(id3, proxy_id2)
+            await db.update_account(id3, status="success", fragment_status="authorized")
+
+            # Verify we have 3 duplicates
+            all_accs = await db.list_accounts()
+            dup_names = [a for a in all_accs if a.name == "dup_test"]
+            assert len(dup_names) == 3
+
+            # Run dedup
+            removed = await db.remove_duplicate_accounts()
+            assert removed == 2  # Should remove 2, keep 1
+
+            # Verify the richest survived
+            all_accs = await db.list_accounts()
+            dup_names = [a for a in all_accs if a.name == "dup_test"]
+            assert len(dup_names) == 1
+            survivor = dup_names[0]
+            assert survivor.id == id3  # Richest record kept
+            assert survivor.proxy_id == proxy_id2
+
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_db_lock_serializes_writes(self, db_path):
+        """Concurrent writes don't corrupt DB thanks to _db_lock."""
+        import asyncio
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            # Run 20 concurrent add_account calls
+            tasks = []
+            for i in range(20):
+                tasks.append(db.add_account(
+                    name=f"concurrent_{i}",
+                    session_path=f"/path/session_{i}.session"
+                ))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # All should succeed (no OperationalError: database is locked)
+            errors = [r for r in results if isinstance(r, Exception)]
+            assert len(errors) == 0, f"Concurrent writes failed: {errors}"
+
+            # Verify all 20 were added
+            accounts = await db.list_accounts()
+            concurrent_accs = [a for a in accounts if a.name.startswith("concurrent_")]
+            assert len(concurrent_accs) == 20
+
+        finally:
+            await db.close()
