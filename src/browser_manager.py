@@ -173,7 +173,14 @@ class ProfileLifecycleManager:
         self.profiles_dir = profiles_dir
         self.max_hot = max_hot
         self._access_order: list[str] = []
+        self._locks: dict[str, asyncio.Lock] = {}
         self._sync_access_order()
+
+    def _get_lock(self, name: str) -> asyncio.Lock:
+        """Get or create a per-profile asyncio.Lock to serialize ensure_active/hibernate."""
+        if name not in self._locks:
+            self._locks[name] = asyncio.Lock()
+        return self._locks[name]
 
     def _sync_access_order(self) -> None:
         """Rebuild LRU access order from filesystem modification times.
@@ -205,6 +212,8 @@ class ProfileLifecycleManager:
         Blocking zip I/O is offloaded to a thread executor so the asyncio
         event loop is not stalled when multiple workers decompress in parallel.
 
+        Uses per-profile lock to prevent race between concurrent ensure_active/hibernate.
+
         Args:
             name: Profile name.
             protected: Set of profile names that must NOT be evicted.
@@ -212,38 +221,48 @@ class ProfileLifecycleManager:
         Returns:
             Path to the profile directory.
         """
-        profile_path = self.profiles_dir / name
-        zip_path = self.profiles_dir / f"{name}.zip"
+        async with self._get_lock(name):
+            profile_path = self.profiles_dir / name
+            zip_path = self.profiles_dir / f"{name}.zip"
 
-        if self.is_hot(name):
-            self._touch(name)
-            return profile_path
+            if self.is_hot(name):
+                self._touch(name)
+                return profile_path
 
-        if zip_path.exists():
+            if zip_path.exists():
+                await self._evict_if_needed(protected)
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, self._extract_zip, zip_path, profile_path)
+                    logger.info("Decompressed cold profile '%s'", name)
+                except zipfile.BadZipFile:
+                    logger.error("Corrupt zip for profile '%s', creating fresh profile", name)
+                try:
+                    if zip_path.exists():
+                        zip_path.unlink()
+                except OSError as e:
+                    logger.warning("Could not delete zip for '%s': %s", name, e)
+                self._touch(name)
+                return profile_path
+
+            # New profile — dir will be created later by _build_camoufox_args
             await self._evict_if_needed(protected)
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._extract_zip, zip_path, profile_path)
-                logger.info("Decompressed cold profile '%s'", name)
-            except zipfile.BadZipFile:
-                logger.error("Corrupt zip for profile '%s', creating fresh profile", name)
-            try:
-                if zip_path.exists():
-                    zip_path.unlink()
-            except OSError as e:
-                logger.warning("Could not delete zip for '%s': %s", name, e)
             self._touch(name)
             return profile_path
-
-        # New profile — dir will be created later by _build_camoufox_args
-        await self._evict_if_needed(protected)
-        self._touch(name)
-        return profile_path
 
     @staticmethod
     def _extract_zip(zip_path: Path, dest_path: Path) -> None:
-        """Extract zip archive (runs in executor thread)."""
+        """Extract zip archive (runs in executor thread).
+
+        Validates all member paths to prevent ZIP Slip (path traversal) attacks.
+        """
         with zipfile.ZipFile(zip_path, 'r') as zf:
+            # Validate paths to prevent ZIP Slip
+            dest_str = str(dest_path.resolve())
+            for member in zf.namelist():
+                member_path = str((dest_path / member).resolve())
+                if not member_path.startswith(dest_str):
+                    raise ValueError(f"ZIP path traversal detected: {member}")
             zf.extractall(dest_path)
 
     async def hibernate(self, name: str) -> Optional[Path]:
@@ -255,36 +274,39 @@ class ProfileLifecycleManager:
         Uses atomic write (tmp file + rename) to prevent data loss if
         disk fills during compression.
 
+        Uses per-profile lock to prevent race between concurrent ensure_active/hibernate.
+
         Args:
             name: Profile name.
 
         Returns:
             Path to the created zip file, or None if profile was not hot.
         """
-        profile_path = self.profiles_dir / name
-        zip_path = self.profiles_dir / f"{name}.zip"
-        tmp_zip = self.profiles_dir / f"{name}.zip.tmp"
+        async with self._get_lock(name):
+            profile_path = self.profiles_dir / name
+            zip_path = self.profiles_dir / f"{name}.zip"
+            tmp_zip = self.profiles_dir / f"{name}.zip.tmp"
 
-        if not self.is_hot(name):
-            return None
+            if not self.is_hot(name):
+                return None
 
-        loop = asyncio.get_running_loop()
-        try:
-            # FIX: Write to tmp file first, then atomic rename
-            await loop.run_in_executor(None, self._compress_zip, profile_path, tmp_zip)
-            await loop.run_in_executor(None, tmp_zip.rename, zip_path)
-        except Exception:
-            # Clean up partial tmp file, keep original directory intact
-            if tmp_zip.exists():
-                tmp_zip.unlink(missing_ok=True)
-            raise
-        await loop.run_in_executor(None, _rmtree_force, profile_path)
+            loop = asyncio.get_running_loop()
+            try:
+                # FIX: Write to tmp file first, then atomic rename
+                await loop.run_in_executor(None, self._compress_zip, profile_path, tmp_zip)
+                await loop.run_in_executor(None, tmp_zip.rename, zip_path)
+            except Exception:
+                # Clean up partial tmp file, keep original directory intact
+                if tmp_zip.exists():
+                    tmp_zip.unlink(missing_ok=True)
+                raise
+            await loop.run_in_executor(None, _rmtree_force, profile_path)
 
-        if name in self._access_order:
-            self._access_order.remove(name)
+            if name in self._access_order:
+                self._access_order.remove(name)
 
-        logger.info("Hibernated profile '%s' -> %s", name, zip_path.name)
-        return zip_path
+            logger.info("Hibernated profile '%s' -> %s", name, zip_path.name)
+            return zip_path
 
     @staticmethod
     def _compress_zip(profile_path: Path, zip_path: Path) -> None:
@@ -316,7 +338,10 @@ class ProfileLifecycleManager:
         while self._hot_count() >= self.max_hot:
             evicted = False
             for name in list(self._access_order):
-                if name not in protected and self.is_hot(name):
+                # Skip protected profiles AND profiles with active locks
+                # (another worker may be launching on them right now)
+                lock = self._locks.get(name)
+                if name not in protected and self.is_hot(name) and (lock is None or not lock.locked()):
                     logger.info("Evicting LRU profile '%s' (capacity %d/%d)",
                                 name, self._hot_count(), self.max_hot)
                     await self.hibernate(name)
@@ -688,13 +713,18 @@ class BrowserManager:
             self._active_browsers[profile.name] = ctx
             return ctx
         except BaseException:
-            # Cleanup proxy_relay on ANY unhandled exception in launch flow
+            # Cleanup proxy_relay and camoufox on ANY unhandled exception in launch flow
             # BaseException catches CancelledError (Python 3.11+: not subclass of Exception)
+            if 'browser' in locals() and camoufox:
+                try:
+                    await asyncio.wait_for(camoufox.__aexit__(None, None, None), timeout=10)
+                except Exception as cleanup_err:
+                    logger.warning("Camoufox cleanup on launch failure: %s", cleanup_err)
             if proxy_relay:
                 try:
                     await proxy_relay.stop()
-                except Exception as e:
-                    logger.warning("Relay cleanup error on launch failure: %s", e)
+                except Exception as relay_err:
+                    logger.warning("Relay cleanup error on launch failure: %s", relay_err)
             raise
 
     async def close_all(self):

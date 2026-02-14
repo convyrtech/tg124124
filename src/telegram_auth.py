@@ -640,6 +640,14 @@ class TelegramAuth:
             except Exception:
                 pass
 
+    @staticmethod
+    async def _safe_disconnect(client: TelegramClient) -> None:
+        """Disconnect client ignoring errors (for cleanup on connect failure)."""
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=5)
+        except Exception:
+            pass
+
     async def _create_telethon_client(self) -> TelegramClient:
         """
         Создаёт Telethon client из существующей сессии с синхронизированным device.
@@ -657,9 +665,11 @@ class TelegramAuth:
         if session_path.exists():
             def _enable_wal(path: str) -> None:
                 c = sqlite3.connect(path, timeout=10)
-                c.execute('PRAGMA journal_mode=WAL')
-                c.execute('PRAGMA busy_timeout=10000')
-                c.close()
+                try:
+                    c.execute('PRAGMA journal_mode=WAL')
+                    c.execute('PRAGMA busy_timeout=10000')
+                finally:
+                    c.close()
             try:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, _enable_wal, str(session_path))
@@ -685,18 +695,37 @@ class TelegramAuth:
 
         # FIX-006: Timeout на connect() чтобы не зависать навечно
         # FIX-4.4: Catch TypeError from broken proxy libs + ConnectionError
+        # Improved diagnostics: include proxy info (host:port only, no credentials)
+        proxy_info = ""
+        if proxy and isinstance(proxy, (list, tuple)) and len(proxy) >= 3:
+            proxy_info = f" [proxy: {proxy[1]}:{proxy[2]}]"
+        elif not proxy:
+            proxy_info = " [no proxy]"
+
         try:
             await asyncio.wait_for(client.connect(), timeout=30)
         except asyncio.TimeoutError:
-            raise RuntimeError("Telethon connect timeout after 30s")
+            await self._safe_disconnect(client)
+            raise RuntimeError(f"Telethon connect timeout after 30s{proxy_info}")
         except TypeError as e:
-            raise RuntimeError(f"Telethon connection failed (proxy error): {e}")
+            await self._safe_disconnect(client)
+            raise RuntimeError(f"Telethon connection failed (proxy lib error): {e}{proxy_info}")
         except (ConnectionError, OSError) as e:
-            raise RuntimeError(f"Telethon connection failed: {e}")
+            await self._safe_disconnect(client)
+            error_msg = str(e)
+            if "0 time(s)" in error_msg:
+                # connection_retries=0 means no retries — add clarity
+                error_msg = f"Cannot connect to Telegram (check proxy/network){proxy_info}"
+            else:
+                error_msg = f"Telethon connection failed: {e}{proxy_info}"
+            raise RuntimeError(error_msg)
 
         if not await client.is_user_authorized():
             await client.disconnect()
-            raise RuntimeError("Session is not authorized. Cannot proceed with QR login.")
+            raise RuntimeError(
+                f"Session is not authorized (expired or revoked){proxy_info}. "
+                "Re-login or get a fresh .session file."
+            )
 
         # Получаем инфо о текущем пользователе (без логирования sensitive data)
         me = await client.get_me()
@@ -1135,7 +1164,12 @@ class TelegramAuth:
                     return screenshot
 
             except Exception as e:
-                # Игнорируем ошибки селектора, продолжаем попытки
+                # Detect dead browser immediately instead of waiting for timeout
+                err_str = str(e).lower()
+                if any(p in err_str for p in ("target closed", "connection closed", "has been closed", "browser has been closed")):
+                    logger.warning("Browser died during QR wait")
+                    return None
+                # Ignore selector errors, keep retrying
                 if attempt == timeout - 1:
                     logger.warning(f"QR search error: {e}")
 
@@ -1878,8 +1912,8 @@ class TelegramAuth:
             if name_element:
                 name = await name_element.inner_text()
                 return {"name": name.strip()}
-        except (TimeoutError, AttributeError) as e:
-            # UI элемент не найден или не доступен
+        except Exception as e:
+            # UI element not found, not accessible, or browser dead
             pass
         return None
 
@@ -2065,6 +2099,7 @@ class CircuitBreaker:
         self._is_open = False
         # FIX #4: Only one worker probes during HALF-OPEN state
         self._half_open_probing = False
+        self._probe_lock = asyncio.Lock()
 
     @property
     def is_open(self) -> bool:
@@ -2136,14 +2171,15 @@ class CircuitBreaker:
         Call this from the worker BEFORE doing the actual migration
         when can_proceed() returned True and circuit is open.
         Returns True if this worker is the probe, False if another worker beat us.
-        Safe in asyncio single-threaded event loop (no yield between check and set).
+        Uses asyncio.Lock to prevent race conditions across await points.
         """
-        if not self._is_open:
-            return True  # Circuit closed, no probe needed
-        if self._half_open_probing:
-            return False
-        self._half_open_probing = True
-        return True
+        async with self._probe_lock:
+            if not self._is_open:
+                return True  # Circuit closed, no probe needed
+            if self._half_open_probing:
+                return False
+            self._half_open_probing = True
+            return True
 
     def release_half_open_probe(self) -> None:
         """FIX #4: Release the half-open probe flag after probe completes."""

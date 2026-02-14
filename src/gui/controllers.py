@@ -76,28 +76,82 @@ class AppController:
         """
         Import session files from directory.
         Returns: (imported_count, skipped_count)
+
+        Supports formats:
+        - Standard: account_dir/session.session + api.json + ___config.json
+        - Lolzteam: account_dir/session.session + api.json (no config)
         """
         imported = 0
         skipped = 0
         session_files = list(source_dir.glob("**/*.session"))
         total = len(session_files)
 
+        if total == 0:
+            logger.warning("No .session files found in %s", source_dir)
+            if on_progress:
+                on_progress(0, 0, "No .session files found")
+            return 0, 0
+
+        # Pre-load all existing account names for O(1) dedup lookup
+        all_accounts = await self.db.list_accounts()
+        existing_names = {a.name for a in all_accounts}
+        # Also track base names (without config suffix) to catch renamed accounts
+        existing_base_names = set()
+        for a in all_accounts:
+            existing_base_names.add(a.name)
+            # Extract base name from "folder_name (config_name)" format
+            if " (" in a.name and a.name.endswith(")"):
+                base = a.name.rsplit(" (", 1)[0]
+                existing_base_names.add(base)
+
+        logger.info("Found %d .session files to import, %d accounts already in DB",
+                     total, len(existing_names))
+
         for i, session_path in enumerate(session_files):
             try:
                 # Find associated files
                 account_dir = session_path.parent
-                name = account_dir.name
+                base_name = account_dir.name
 
-                # Check if already exists
-                existing = await self.db.list_accounts(search=name)
-                if any(a.name == name for a in existing):
+                # Parse config first to determine final name
+                config_json = account_dir / "___config.json"
+                proxy_str = None
+                config_name = None
+                if config_json.exists():
+                    try:
+                        import json
+                        with open(config_json, 'r', encoding='utf-8') as f:
+                            config = json.load(f)
+                            proxy_str = config.get("Proxy")
+                            config_name = config.get("Name")
+                    except (json.JSONDecodeError, IOError) as e:
+                        logger.warning("Failed to parse config %s: %s", config_json, e)
+
+                # Build final name: "folder (config_name)" only if config_name differs
+                if config_name and config_name != base_name:
+                    name = f"{base_name} ({config_name})"
+                else:
+                    name = base_name
+
+                # Dedup check: by final name AND by base folder name
+                if name in existing_names or base_name in existing_base_names:
                     skipped += 1
                     if on_progress:
-                        on_progress(i + 1, total, f"skip: {name}")
+                        on_progress(i + 1, total, f"skip (exists): {name}")
+                    continue
+
+                # Validate session file size (must be non-empty SQLite)
+                if session_path.stat().st_size < 1024:
+                    skipped += 1
+                    reason = f"skip (too small {session_path.stat().st_size}B): {name}"
+                    logger.warning("Session file too small: %s (%d bytes)",
+                                   session_path, session_path.stat().st_size)
+                    if on_progress:
+                        on_progress(i + 1, total, reason)
                     continue
 
                 # Copy to sessions directory
-                dest_dir = self.sessions_dir / name
+                dest_dir = self.sessions_dir / base_name
                 dest_dir.mkdir(exist_ok=True)
 
                 dest_session = dest_dir / "session.session"
@@ -108,21 +162,9 @@ class AppController:
                 if api_json.exists():
                     shutil.copy2(api_json, dest_dir / "api.json")
 
-                # Copy ___config.json if exists and parse proxy/name
-                config_json = account_dir / "___config.json"
-                proxy_str = None
+                # Copy ___config.json if exists
                 if config_json.exists():
                     shutil.copy2(config_json, dest_dir / "___config.json")
-                    try:
-                        import json
-                        with open(config_json, 'r', encoding='utf-8') as f:
-                            config = json.load(f)
-                            proxy_str = config.get("Proxy")
-                            config_name = config.get("Name")
-                            if config_name:
-                                name = f"{name} ({config_name})"
-                    except (json.JSONDecodeError, IOError):
-                        pass
 
                 # Add to database
                 account_id = await self.db.add_account(
@@ -130,8 +172,12 @@ class AppController:
                     session_path=str(dest_session)
                 )
 
+                # Track in dedup sets for this batch
+                existing_names.add(name)
+                existing_base_names.add(base_name)
+
                 # Auto-link proxy from config if available
-                if proxy_str and account_id:
+                if proxy_str and proxy_str.strip() and account_id:
                     proxy_id = await self._find_or_create_proxy(proxy_str)
                     if proxy_id:
                         await self.db.assign_proxy(account_id, proxy_id)
@@ -143,8 +189,11 @@ class AppController:
 
             except Exception as e:
                 skipped += 1
-                logger.error("Failed to import %s: %s", session_path, e)
+                logger.error("Failed to import %s: %s", session_path, e, exc_info=True)
+                if on_progress:
+                    on_progress(i + 1, total, f"error: {account_dir.name} - {e}")
 
+        logger.info("Import complete: %d imported, %d skipped", imported, skipped)
         return imported, skipped
 
     async def _find_or_create_proxy(self, proxy_str: str) -> Optional[int]:
@@ -208,7 +257,7 @@ class AppController:
                 error_str = str(e)
                 if "UNIQUE constraint" in error_str:
                     duplicates += 1
-                    logger.debug("Proxy already exists: %s:%s", host, port)
+                    logger.debug("Proxy already exists: %s", line[:50])
                 else:
                     skipped += 1
                     logger.warning("Failed to import proxy: %s - %s", line[:50], e)
@@ -248,7 +297,10 @@ class AppController:
 
             if ":" in host_part:
                 host, port_str = host_part.split(":", 1)
-                port = int(port_str)
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    return (None, None, None, None, protocol)
             else:
                 return (None, None, None, None, protocol)
 
@@ -258,7 +310,10 @@ class AppController:
         parts = line.split(":")
         if len(parts) >= 2:
             host = parts[0]
-            port = int(parts[1])
+            try:
+                port = int(parts[1])
+            except ValueError:
+                return (None, None, None, None, protocol)
             username = parts[2] if len(parts) > 2 and parts[2] else None
             password = parts[3] if len(parts) > 3 and parts[3] else None
             return (host, port, username, password, protocol)

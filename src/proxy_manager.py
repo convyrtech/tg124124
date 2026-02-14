@@ -50,7 +50,10 @@ def parse_proxy_line(line: str) -> tuple[Optional[str], Optional[int], Optional[
 
         if ":" in host_part:
             host, port_str = host_part.split(":", 1)
-            port = int(port_str)
+            try:
+                port = int(port_str)
+            except ValueError:
+                return (None, None, None, None, protocol)
         else:
             return (None, None, None, None, protocol)
 
@@ -60,7 +63,10 @@ def parse_proxy_line(line: str) -> tuple[Optional[str], Optional[int], Optional[
     parts = line.split(":")
     if len(parts) >= 2:
         host = parts[0]
-        port = int(parts[1])
+        try:
+            port = int(parts[1])
+        except ValueError:
+            return (None, None, None, None, protocol)
         username = parts[2] if len(parts) > 2 and parts[2] else None
         password = parts[3] if len(parts) > 3 and parts[3] else None
         return (host, port, username, password, protocol)
@@ -340,9 +346,21 @@ class ProxyManager:
                     update_config_proxy(config_path, new_proxy_str)
 
                 # Only update DB after file write succeeded
-                await self.db.update_proxy(old_proxy.id, status="dead", assigned_account_id=None)
-                await self.db.update_proxy(new_proxy.id, status="active")
-                await self.db.assign_proxy(account_id, new_proxy.id)
+                # Atomic transaction: all three DB updates in one lock/commit
+                async with self.db._db_lock:
+                    await self.db._connection.execute(
+                        "UPDATE proxies SET status = 'dead', assigned_account_id = NULL WHERE id = ?",
+                        (old_proxy.id,)
+                    )
+                    await self.db._connection.execute(
+                        "UPDATE proxies SET status = 'active', assigned_account_id = ? WHERE id = ?",
+                        (account_id, new_proxy.id)
+                    )
+                    await self.db._connection.execute(
+                        "UPDATE accounts SET proxy_id = ? WHERE id = ?",
+                        (new_proxy.id, account_id)
+                    )
+                    await self.db._commit_with_retry()
 
                 # Log operation
                 await self.db.log_operation(

@@ -215,15 +215,53 @@ class Database:
         status: str = "pending"
     ) -> int:
         """Add new account, return ID."""
+        async with self._db_lock:
+            async with self._connection.execute(
+                """
+                INSERT INTO accounts (name, session_path, phone, username, proxy_id, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (name, session_path, phone, username, proxy_id, status)
+            ) as cursor:
+                await self._commit_with_retry()
+                return cursor.lastrowid
+
+    async def account_exists(self, name: str) -> bool:
+        """Check if account with exact name exists. O(1) via index."""
         async with self._connection.execute(
-            """
-            INSERT INTO accounts (name, session_path, phone, username, proxy_id, status)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (name, session_path, phone, username, proxy_id, status)
+            "SELECT 1 FROM accounts WHERE name = ? LIMIT 1", (name,)
         ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def remove_duplicate_accounts(self) -> int:
+        """Remove duplicate accounts keeping the one with most data (lowest ID with proxy/status).
+
+        Returns number of removed duplicates.
+        """
+        async with self._db_lock:
+            # Find duplicates: keep row with lowest ID that has proxy_id or non-pending status
+            async with self._connection.execute("""
+                SELECT id FROM accounts
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM accounts GROUP BY name
+                )
+            """) as cursor:
+                dup_rows = await cursor.fetchall()
+
+            if not dup_rows:
+                return 0
+
+            dup_ids = [r["id"] for r in dup_rows]
+            placeholders = ",".join("?" * len(dup_ids))
+
+            # Delete duplicates (keeping first occurrence)
+            await self._connection.execute(
+                f"DELETE FROM accounts WHERE id IN ({placeholders})",
+                dup_ids
+            )
             await self._commit_with_retry()
-            return cursor.lastrowid
+            logger.info("Removed %d duplicate accounts", len(dup_ids))
+            return len(dup_ids)
 
     async def get_account(self, account_id: int) -> Optional[AccountRecord]:
         """Get account by ID."""
@@ -343,11 +381,12 @@ class Database:
         fields = ", ".join(f"{k} = ?" for k in kwargs.keys())
         values = list(kwargs.values()) + [account_id]
 
-        await self._connection.execute(
-            f"UPDATE accounts SET {fields} WHERE id = ?",
-            values
-        )
-        await self._commit_with_retry()
+        async with self._db_lock:
+            await self._connection.execute(
+                f"UPDATE accounts SET {fields} WHERE id = ?",
+                values
+            )
+            await self._commit_with_retry()
 
     async def add_proxy(
         self,
@@ -358,15 +397,16 @@ class Database:
         protocol: str = "socks5"
     ) -> int:
         """Add new proxy, return ID."""
-        async with self._connection.execute(
-            """
-            INSERT INTO proxies (host, port, username, password, protocol)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (host, port, username, password, protocol)
-        ) as cursor:
-            await self._commit_with_retry()
-            return cursor.lastrowid
+        async with self._db_lock:
+            async with self._connection.execute(
+                """
+                INSERT INTO proxies (host, port, username, password, protocol)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (host, port, username, password, protocol)
+            ) as cursor:
+                await self._commit_with_retry()
+                return cursor.lastrowid
 
     async def get_proxy(self, proxy_id: int) -> Optional[ProxyRecord]:
         """Get proxy by ID."""
@@ -474,11 +514,12 @@ class Database:
 
     async def delete_proxy(self, proxy_id: int) -> None:
         """Delete proxy by ID."""
-        await self._connection.execute(
-            "DELETE FROM proxies WHERE id = ?",
-            (proxy_id,)
-        )
-        await self._commit_with_retry()
+        async with self._db_lock:
+            await self._connection.execute(
+                "DELETE FROM proxies WHERE id = ?",
+                (proxy_id,)
+            )
+            await self._commit_with_retry()
 
     async def update_proxy(self, proxy_id: int, **kwargs) -> None:
         """Update proxy fields with SQL injection protection."""
@@ -505,11 +546,12 @@ class Database:
 
         values.append(proxy_id)
 
-        await self._connection.execute(
-            f"UPDATE proxies SET {', '.join(fields)} WHERE id = ?",
-            values
-        )
-        await self._commit_with_retry()
+        async with self._db_lock:
+            await self._connection.execute(
+                f"UPDATE proxies SET {', '.join(fields)} WHERE id = ?",
+                values
+            )
+            await self._commit_with_retry()
 
     async def list_proxies(
         self,
@@ -714,35 +756,39 @@ class Database:
         # Find incomplete migrations
         incomplete = await self.get_incomplete_migrations()
 
-        count = 0
-        for migration in incomplete:
-            # Mark migration as failed
-            await self._connection.execute(
-                """
-                UPDATE migrations
-                SET completed_at = datetime('now'),
-                    success = 0,
-                    error_message = 'Interrupted - reset on restart'
-                WHERE id = ?
-                """,
-                (migration.id,)
-            )
+        if not incomplete:
+            return 0
 
-            # Reset account status to pending
-            await self._connection.execute(
-                """
-                UPDATE accounts
-                SET status = 'pending',
-                    error_message = 'Previous migration interrupted'
-                WHERE id = ? AND status = 'migrating'
-                """,
-                (migration.account_id,)
-            )
-            count += 1
+        async with self._db_lock:
+            count = 0
+            for migration in incomplete:
+                # Mark migration as failed
+                await self._connection.execute(
+                    """
+                    UPDATE migrations
+                    SET completed_at = datetime('now'),
+                        success = 0,
+                        error_message = 'Interrupted - reset on restart'
+                    WHERE id = ?
+                    """,
+                    (migration.id,)
+                )
 
-        if count > 0:
-            await self._commit_with_retry()
-            logger.info(f"Reset {count} interrupted migrations")
+                # Reset account status to pending
+                await self._connection.execute(
+                    """
+                    UPDATE accounts
+                    SET status = 'pending',
+                        error_message = 'Previous migration interrupted'
+                    WHERE id = ? AND status = 'migrating'
+                    """,
+                    (migration.account_id,)
+                )
+                count += 1
+
+            if count > 0:
+                await self._commit_with_retry()
+                logger.info(f"Reset {count} interrupted migrations")
 
         return count
 
@@ -1028,6 +1074,16 @@ class Database:
             "is_finished": finished_at is not None,
         }
 
+    async def get_last_batch(self) -> Optional[dict]:
+        """Get the most recent batch (including finished ones)."""
+        async with self._connection.execute(
+            "SELECT id, batch_id, total_count, started_at, finished_at FROM batches ORDER BY started_at DESC LIMIT 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {"id": row[0], "batch_id": row[1], "total_count": row[2], "started_at": row[3], "finished_at": row[4]}
+            return None
+
     async def finish_batch(self, batch_id: int) -> None:
         """
         Mark a batch as finished.
@@ -1035,11 +1091,12 @@ class Database:
         Args:
             batch_id: Internal batch row ID.
         """
-        await self._connection.execute(
-            "UPDATE batches SET finished_at = datetime('now') WHERE id = ?",
-            (batch_id,)
-        )
-        await self._commit_with_retry()
+        async with self._db_lock:
+            await self._connection.execute(
+                "UPDATE batches SET finished_at = datetime('now') WHERE id = ?",
+                (batch_id,)
+            )
+            await self._commit_with_retry()
 
     # ==================== Operation Log ====================
 
@@ -1066,28 +1123,29 @@ class Database:
             error_message: Error message on failure.
             details: Additional JSON/text details.
         """
-        await self._connection.execute(
-            """
-            INSERT INTO operation_log (account_id, operation, success, error_message, details)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (account_id, operation, 1 if success else 0, error_message, details)
-        )
-        # Auto-rotate: delete oldest entries beyond limit (every 100 inserts)
-        async with self._connection.execute(
-            "SELECT COUNT(*) as cnt FROM operation_log"
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row and row["cnt"] > self.OPERATION_LOG_MAX_ROWS + 100:
-                await self._connection.execute(
-                    """
-                    DELETE FROM operation_log WHERE id NOT IN (
-                        SELECT id FROM operation_log ORDER BY id DESC LIMIT ?
+        async with self._db_lock:
+            await self._connection.execute(
+                """
+                INSERT INTO operation_log (account_id, operation, success, error_message, details)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (account_id, operation, 1 if success else 0, error_message, details)
+            )
+            # Auto-rotate: delete oldest entries beyond limit (every 100 inserts)
+            async with self._connection.execute(
+                "SELECT COUNT(*) as cnt FROM operation_log"
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row and row["cnt"] > self.OPERATION_LOG_MAX_ROWS + 100:
+                    await self._connection.execute(
+                        """
+                        DELETE FROM operation_log WHERE id NOT IN (
+                            SELECT id FROM operation_log ORDER BY id DESC LIMIT ?
+                        )
+                        """,
+                        (self.OPERATION_LOG_MAX_ROWS,)
                     )
-                    """,
-                    (self.OPERATION_LOG_MAX_ROWS,)
-                )
-        await self._commit_with_retry()
+            await self._commit_with_retry()
 
     async def get_operation_log(
         self,

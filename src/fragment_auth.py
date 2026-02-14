@@ -96,9 +96,11 @@ class FragmentAuth:
         if session_path.exists():
             def _enable_wal(path: str) -> None:
                 c = sqlite3.connect(path, timeout=10)
-                c.execute('PRAGMA journal_mode=WAL')
-                c.execute('PRAGMA busy_timeout=10000')
-                c.close()
+                try:
+                    c.execute('PRAGMA journal_mode=WAL')
+                    c.execute('PRAGMA busy_timeout=10000')
+                finally:
+                    c.close()
             try:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, _enable_wal, str(session_path))
@@ -124,7 +126,17 @@ class FragmentAuth:
         try:
             await asyncio.wait_for(client.connect(), timeout=30)
         except asyncio.TimeoutError:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=5)
+            except Exception:
+                pass
             raise RuntimeError("Telethon connect timeout after 30s")
+        except (ConnectionError, OSError) as e:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=5)
+            except Exception:
+                pass
+            raise RuntimeError(f"Telethon connection failed: {e}")
 
         if not await client.is_user_authorized():
             await client.disconnect()
@@ -311,6 +323,10 @@ class FragmentAuth:
             True if ACCEPT was clicked successfully
         """
         try:
+            if popup.is_closed():
+                logger.error("OAuth popup closed before ACCEPT click")
+                return False
+
             # Wait for popup content to load
             await popup.wait_for_load_state("domcontentloaded", timeout=5000)
             await asyncio.sleep(1)
@@ -377,6 +393,10 @@ class FragmentAuth:
         Returns:
             True if phone was accepted and confirmation form appeared
         """
+        if popup.is_closed():
+            logger.error("OAuth popup closed before phone submission")
+            return False
+
         if not phone or not phone.strip():
             logger.error("Cannot submit empty phone number")
             return False
@@ -605,21 +625,32 @@ class FragmentAuth:
         # When auto_reconnect=False and receive_updates=True, Telethon's background reader
         # task can get IncompleteReadError if the connection drops (e.g. during long page loads).
         # Nobody awaits that task's Future, causing "Future exception was never retrieved".
+        # FIX: Use class-level ref counter to safely handle concurrent workers.
+        # Only the first worker installs the handler; only the last one restores original.
         loop = asyncio.get_running_loop()
-        original_handler = loop.get_exception_handler()
+        cls = type(self)
+        if not hasattr(cls, '_suppressor_refcount'):
+            cls._suppressor_refcount = 0
+            cls._original_exception_handler = None
 
-        def _suppress_telethon_bg_errors(loop_: asyncio.AbstractEventLoop, context: dict) -> None:
-            exc = context.get('exception')
-            if isinstance(exc, (asyncio.IncompleteReadError, ConnectionError, OSError)):
-                logger.debug("Suppressed background error: %s: %s", type(exc).__name__, exc)
-                return
-            # For all other errors, delegate to original handler or default
-            if original_handler:
-                original_handler(loop_, context)
-            else:
-                loop_.default_exception_handler(context)
+        if cls._suppressor_refcount == 0:
+            cls._original_exception_handler = loop.get_exception_handler()
 
-        loop.set_exception_handler(_suppress_telethon_bg_errors)
+            def _suppress_telethon_bg_errors(loop_: asyncio.AbstractEventLoop, context: dict) -> None:
+                exc = context.get('exception')
+                if isinstance(exc, (asyncio.IncompleteReadError, ConnectionError, OSError)):
+                    logger.debug("Suppressed background error: %s: %s", type(exc).__name__, exc)
+                    return
+                # For all other errors, delegate to original handler or default
+                orig = cls._original_exception_handler
+                if orig:
+                    orig(loop_, context)
+                else:
+                    loop_.default_exception_handler(context)
+
+            loop.set_exception_handler(_suppress_telethon_bg_errors)
+
+        cls._suppressor_refcount += 1
 
         try:
             # 1. Connect Telethon client
@@ -778,8 +809,11 @@ class FragmentAuth:
                 error=str(e)
             )
         finally:
-            # Restore original exception handler
-            loop.set_exception_handler(original_handler)
+            # Restore original exception handler only when last worker finishes
+            cls._suppressor_refcount -= 1
+            if cls._suppressor_refcount == 0:
+                loop.set_exception_handler(cls._original_exception_handler)
+                cls._original_exception_handler = None
 
             # Close browser
             if browser_ctx:

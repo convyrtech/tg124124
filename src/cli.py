@@ -261,12 +261,16 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
 
             single_proxy = asyncio.run(_get_single_proxy())
 
-        result = asyncio.run(migrate_account(
-            account_dir=account_dir,
-            password_2fa=password_2fa,
-            headless=headless,
-            proxy_override=single_proxy,
-        ))
+        try:
+            result = asyncio.run(migrate_account(
+                account_dir=account_dir,
+                password_2fa=password_2fa,
+                headless=headless,
+                proxy_override=single_proxy,
+            ))
+        except KeyboardInterrupt:
+            click.echo("\nПрервано пользователем (Ctrl+C).")
+            return
 
         if result.success:
             click.echo(click.style(f"\n✓ Успешно: {result.profile_name}", fg="green"))
@@ -309,10 +313,16 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                 elif retry_failed:
                     batch_status = await db.get_batch_status()
                     if not batch_status:
-                        click.echo("Нет упавших аккаунтов для повтора")
-                        return None, None
+                        # Fallback: get last completed batch
+                        last_batch = await db.get_last_batch()
+                        if not last_batch:
+                            click.echo("Нет упавших аккаунтов для повтора")
+                            return None, None
+                        batch_db_id = last_batch["id"]
+                    else:
+                        batch_db_id = batch_status["batch_db_id"]
 
-                    failed_entries = await db.get_batch_failed(batch_status["batch_db_id"])
+                    failed_entries = await db.get_batch_failed(batch_db_id)
                     if not failed_entries:
                         click.echo("Нет упавших аккаунтов для повтора")
                         return None, None
@@ -480,7 +490,11 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                 finally:
                     await _close_parallel_db()
 
-            results = asyncio.run(_run_parallel())
+            try:
+                results = asyncio.run(_run_parallel())
+            except KeyboardInterrupt:
+                click.echo("\nПрервано пользователем (Ctrl+C).")
+                return
         else:
             # Последовательный режим (существующий)
             click.echo(f"Режим: ПОСЛЕДОВАТЕЛЬНЫЙ")
@@ -520,7 +534,11 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                     if _seq_db:
                         await _seq_db.close()
 
-            results = asyncio.run(_run_sequential())
+            try:
+                results = asyncio.run(_run_sequential())
+            except KeyboardInterrupt:
+                click.echo("\nПрервано пользователем (Ctrl+C).")
+                return
 
         # Итог
         success = [r for r in results if r.success]
@@ -614,21 +632,31 @@ def open_profile(account: str, url: str):
             click.echo(f"Proxy: {safe_proxy}")
 
     async def run():
-        ctx = await manager.launch(profile, headless=False)
-        page = await ctx.new_page()
-        await page.goto(url)
-
-        click.echo("\nБраузер открыт. Нажмите Ctrl+C для закрытия.")
-
+        ctx = None
         try:
-            while True:
-                await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            await ctx.close()
+            ctx = await manager.launch(profile, headless=False)
+            page = await ctx.new_page()
+            await page.goto(url)
 
-    asyncio.run(run())
+            click.echo("\nБраузер открыт. Нажмите Ctrl+C для закрытия.")
+
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                pass
+        finally:
+            if ctx:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+            await manager.close_all()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        click.echo("\nПрервано пользователем (Ctrl+C).")
 
 
 @cli.command("list")
@@ -695,12 +723,16 @@ def check(proxy: str, profile: Optional[str], headless: bool, geoip: bool):
 
     click.echo("Запускаю проверку безопасности...")
 
-    result = asyncio.run(run_security_check(
-        proxy=proxy,
-        profile_path=profile_path,
-        headless=headless,
-        use_geoip=geoip
-    ))
+    try:
+        result = asyncio.run(run_security_check(
+            proxy=proxy,
+            profile_path=profile_path,
+            headless=headless,
+            use_geoip=geoip
+        ))
+    except KeyboardInterrupt:
+        click.echo("\nПрервано пользователем (Ctrl+C).")
+        return
 
     print_summary(result)
 
@@ -749,25 +781,19 @@ def health(account: str):
         click.echo(click.style("  ✗ api.json не найден", fg="red"))
         sys.exit(1)
 
+    me = None
     try:
-        with open(api_file) as f:
+        with open(api_file, encoding='utf-8') as f:
             api = json.load(f)
 
         proxy = None
         if config_file.exists():
-            with open(config_file) as f:
+            with open(config_file, encoding='utf-8') as f:
                 config = json.load(f)
             proxy_str = config.get("Proxy", "")
             if proxy_str:
-                parts = proxy_str.split(":")
-                if len(parts) >= 4:
-                    proxy = {
-                        "proxy_type": "socks5",
-                        "addr": parts[1],
-                        "port": int(parts[2]),
-                        "username": parts[3],
-                        "password": parts[4] if len(parts) > 4 else None
-                    }
+                from .telegram_auth import parse_telethon_proxy
+                proxy = parse_telethon_proxy(proxy_str)
 
         async def check_telethon():
             client = TelegramClient(
@@ -809,7 +835,7 @@ def health(account: str):
     profile_name = account_dir.name
     if config_file.exists():
         try:
-            with open(config_file) as f:
+            with open(config_file, encoding='utf-8') as f:
                 config = json.load(f)
             profile_name = config.get("Name", profile_name)
         except Exception:
@@ -1062,7 +1088,10 @@ def check_proxies(concurrency: int, timeout: float, db_path: str):
         finally:
             await db.close()
 
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        click.echo("\nПрервано пользователем (Ctrl+C).")
 
 
 @cli.command("proxy-refresh")
@@ -1168,7 +1197,7 @@ def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str):
                     f"\n   Заменено: {result['replaced']}, ошибок: {result['errors']}",
                     fg="green" if result["errors"] == 0 else "yellow",
                 ))
-            except (KeyboardInterrupt, Exception):
+            except BaseException:
                 click.echo("\nОтмена, возвращаю зарезервированные прокси в пул...")
                 await _unreserve_plan()
                 raise
@@ -1176,7 +1205,10 @@ def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str):
         finally:
             await db.close()
 
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        click.echo("\nПрервано пользователем (Ctrl+C).")
 
 
 @cli.command()
@@ -1337,6 +1369,26 @@ def init():
     click.echo("  1. --password 'your_password'")
     click.echo("  2. export TG_2FA_PASSWORD='your_password'")
     click.echo("  3. Ввод вручную в браузере")
+
+
+@cli.command()
+def dedup():
+    """Удалить дубликаты аккаунтов из БД (оставляет первый по ID)"""
+    async def _dedup():
+        from .database import Database
+        db = Database(DATA_DIR / "tgwebauth.db")
+        await db.initialize()
+        await db.connect()
+        try:
+            removed = await db.remove_duplicate_accounts()
+            if removed:
+                click.echo(f"Удалено {removed} дубликатов")
+            else:
+                click.echo("Дубликатов не найдено")
+        finally:
+            await db.close()
+
+    asyncio.run(_dedup())
 
 
 if __name__ == "__main__":

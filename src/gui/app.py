@@ -83,6 +83,8 @@ class TGWebAuthApp:
         self._shutting_down: bool = False
 
         self._active_pool = None
+        # Guard against double-click on non-batch buttons (open, import, proxy ops)
+        self._busy_ops: set = set()
         self._last_table_refresh: float = 0.0
         # Fix #10: O(1) log append with bounded deque instead of O(n) string concat
         # FIX-7.4: 500→5000 for 1000-account batches (~3-4 messages per account)
@@ -112,7 +114,21 @@ class TGWebAuthApp:
     def _run_async(self, coro) -> None:
         """Schedule coroutine on async loop."""
         if self._loop:
-            asyncio.run_coroutine_threadsafe(coro, self._loop)
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            future.add_done_callback(self._on_async_done)
+
+    def _on_async_done(self, future) -> None:
+        """Handle completion of async tasks - log errors, reset state."""
+        try:
+            future.result()
+        except Exception as e:
+            logger.error("Async task failed: %s\n%s", e, traceback.format_exc())
+            self._log(f"[Error] Background task failed: {e}")
+            # Reset pool state if stuck
+            if self._active_pool:
+                self._active_pool = None
+                self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+                self._schedule_ui(lambda: self._reset_stop_button())
 
     def _schedule_ui(self, func: Callable) -> None:
         """Schedule a function to run on the main UI thread."""
@@ -139,7 +155,7 @@ class TGWebAuthApp:
         # their current tasks gracefully (prevents mid-flight browser/Telethon interruption
         # which could corrupt session files).
         pool = getattr(self, '_active_pool', None)
-        if pool:
+        if pool and pool != "pending":
             pool.request_shutdown()
             # Wait for pool workers to finish current tasks.
             # pool.run() is running as a coroutine on the async loop — it checks
@@ -183,7 +199,11 @@ class TGWebAuthApp:
 
         # Stop the async loop
         if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except RuntimeError:
+                # P2 FIX: Loop may already be closed/stopped
+                pass
             # Wait for thread to finish
             if self._async_thread and self._async_thread.is_alive():
                 self._async_thread.join(timeout=5)
@@ -195,8 +215,9 @@ class TGWebAuthApp:
             children = current.children(recursive=True)
             for child in children:
                 try:
+                    child_name = child.name()  # Cache before kill (process may be reaped)
                     child.kill()
-                    logger.info("Killed orphan child process: PID=%d (%s)", child.pid, child.name())
+                    logger.info("Killed orphan child process: PID=%d (%s)", child.pid, child_name)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
         except Exception as e:
@@ -700,7 +721,9 @@ class TGWebAuthApp:
                 # Rebuild full text every 10 messages to avoid O(n) join on every append.
                 # Skip intermediate updates — deque handles eviction, so the widget
                 # stays in sync on the next full rebuild.
-                if len(self._log_lines) % 10 == 0 or len(self._log_lines) < 50:
+                # Rebuild full text every 10 messages or for important messages
+                if (len(self._log_lines) % 10 == 0 or len(self._log_lines) < 50
+                        or "[Error]" in message or "Done:" in message or "SUCCESS" in message):
                     dpg.set_value("log_output", "\n".join(self._log_lines))
 
         # If called from main thread, do directly; otherwise queue
@@ -715,11 +738,16 @@ class TGWebAuthApp:
     # Import dialog
     def _show_import_dialog(self, sender=None, app_data=None) -> None:
         """Show file dialog to select sessions folder."""
+        if "import_sessions" in self._busy_ops:
+            self._log("[Import] Import already in progress")
+            return
+        self._busy_ops.add("import_sessions")
         try:
             # Use tkinter dialog (more stable than dpg file dialog)
             folder_path = _select_folder_tkinter()
             if folder_path is None:
                 self._log("[Import] Cancelled")
+                self._busy_ops.discard("import_sessions")
                 return
 
             self._log(f"[Import] Scanning {folder_path}...")
@@ -744,12 +772,15 @@ class TGWebAuthApp:
                 except Exception as e:
                     logger.error("Import error: %s\n%s", e, traceback.format_exc())
                     self._log(f"[Error] Import failed: {e}")
+                finally:
+                    self._busy_ops.discard("import_sessions")
 
             self._run_async(do_import())
 
         except Exception as e:
             logger.error("Import dialog error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Import: {e}")
+            self._busy_ops.discard("import_sessions")
 
     def _update_stats_sync(self, stats: dict) -> None:
         """Update stats on main thread."""
@@ -946,6 +977,15 @@ class TGWebAuthApp:
 
     def _open_profile(self, sender, app_data, user_data) -> None:
         """Open browser profile for account."""
+        # Guard: prevent double-click launching two browsers for same profile
+        if self._active_pool:
+            self._log("[Open] Batch in progress, please wait")
+            return
+        op_key = f"open_{user_data}"
+        if op_key in self._busy_ops:
+            self._log("[Open] Already opening this profile...")
+            return
+        self._busy_ops.add(op_key)
         account_id = user_data
         self._log(f"[Open] Button clicked for account {account_id}")
 
@@ -991,22 +1031,28 @@ class TGWebAuthApp:
                     except Exception:
                         pass
 
-                # Launch browser
-                ctx = await manager.launch(profile, headless=False)
+                # Launch browser - track manager for cleanup on failure
+                ctx = None
+                try:
+                    ctx = await manager.launch(profile, headless=False)
 
-                # Track browser for cleanup on shutdown
-                self._active_browsers.append(ctx)
+                    # Track browser for cleanup on shutdown
+                    self._active_browsers.append(ctx)
 
-                page = await ctx.new_page()
-                await page.goto("https://web.telegram.org/k/")
+                    page = await ctx.new_page()
+                    await page.goto("https://web.telegram.org/k/")
 
-                self._log(f"[Open] Browser opened for {profile_name}")
-
-                # Browser runs in background - will be cleaned up on app shutdown
-
+                    self._log(f"[Open] Browser opened for {profile_name}")
+                    # Browser runs in background - will be cleaned up on app shutdown
+                except Exception:
+                    # P1 FIX: Clean up BrowserManager if launch/page fails
+                    await manager.close_all()
+                    raise
             except Exception as e:
                 logger.error("Open profile error: %s\n%s", e, traceback.format_exc())
                 self._log(f"[Error] Open: {e}")
+            finally:
+                self._busy_ops.discard(op_key)
 
         self._run_async(do_open())
 
@@ -1016,6 +1062,12 @@ class TGWebAuthApp:
         if self._active_pool:
             self._log("[Migrate] Batch in progress, please wait")
             return
+        # Guard against double-click on same account
+        op_key = f"migrate_{user_data}"
+        if op_key in self._busy_ops:
+            self._log("[Migrate] Already migrating this account")
+            return
+        self._busy_ops.add(op_key)
         account_id = user_data
         self._log(f"[Migrate] Button clicked for account {account_id}")
 
@@ -1093,6 +1145,8 @@ class TGWebAuthApp:
                 except Exception:
                     pass
                 self._schedule_ui(lambda: self._refresh_table_async())
+            finally:
+                self._busy_ops.discard(op_key)
 
         self._run_async(do_migrate())
 
@@ -1102,6 +1156,12 @@ class TGWebAuthApp:
         if self._active_pool:
             self._log("[Fragment] Batch in progress, please wait")
             return
+        # Guard against double-click on same account
+        op_key = f"fragment_{user_data}"
+        if op_key in self._busy_ops:
+            self._log("[Fragment] Already processing this account")
+            return
+        self._busy_ops.add(op_key)
         account_id = user_data
         self._log(f"[Fragment] Button clicked for account {account_id}")
 
@@ -1143,7 +1203,9 @@ class TGWebAuthApp:
                 browser_manager = BrowserManager()
                 try:
                     auth = FragmentAuth(config, browser_manager)
-                    result = await auth.connect(headless=False)
+                    result = await asyncio.wait_for(
+                        auth.connect(headless=False), timeout=300
+                    )
 
                     if result.success:
                         status = "already authorized" if result.already_authorized else "connected"
@@ -1161,6 +1223,8 @@ class TGWebAuthApp:
             except Exception as e:
                 logger.error("Fragment error: %s\n%s", e, traceback.format_exc())
                 self._log(f"[Error] Fragment: {e}")
+            finally:
+                self._busy_ops.discard(op_key)
 
         self._run_async(do_fragment())
 
@@ -1341,12 +1405,15 @@ class TGWebAuthApp:
 
             # Disable buttons immediately on main thread
             self._set_batch_buttons_enabled(False)
+            # P0 FIX: Set sentinel BEFORE _run_async to prevent double-click race
+            self._active_pool = "pending"
             self._log(f"[Migrate] Starting migration of {len(selected_ids)} selected accounts...")
 
             self._run_async(self._batch_migrate(selected_ids))
         except Exception as e:
             logger.error("Migrate selected error: %s", e)
             self._log(f"[Error] Migrate: {e}")
+            self._active_pool = None
             self._set_batch_buttons_enabled(True)
 
     def _migrate_all(self, sender=None, app_data=None) -> None:
@@ -1357,18 +1424,27 @@ class TGWebAuthApp:
             return
         # Disable buttons immediately on main thread to prevent race
         self._set_batch_buttons_enabled(False)
+        # P0 FIX: Set sentinel BEFORE _run_async to prevent double-click race
+        self._active_pool = "pending"
         self._log("[Migrate] Starting batch migration of all pending...")
 
-
         async def get_pending_ids():
-            accounts = await self._controller.db.list_accounts(status="pending")
-            if not accounts:
-                self._log("[Migrate] No pending accounts")
+            try:
+                accounts = await self._controller.db.list_accounts(status="pending")
+                if not accounts:
+                    self._log("[Migrate] No pending accounts")
+                    self._active_pool = None
+                    self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+                    return
+                ids = [a.id for a in accounts]
+                self._log(f"[Migrate] {len(ids)} accounts to migrate...")
+                await self._batch_migrate(ids)
+            except Exception as e:
+                logger.error("get_pending_ids error: %s\n%s", e, traceback.format_exc())
+                self._log(f"[Error] get_pending_ids: {e}")
+                self._active_pool = None
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
-                return
-            ids = [a.id for a in accounts]
-            self._log(f"[Migrate] {len(ids)} accounts to migrate...")
-            await self._batch_migrate(ids)
+                self._schedule_ui(lambda: self._reset_stop_button())
 
         self._run_async(get_pending_ids())
 
@@ -1393,30 +1469,42 @@ class TGWebAuthApp:
             return
         # Disable buttons immediately on main thread
         self._set_batch_buttons_enabled(False)
+        # P0 FIX: Set sentinel BEFORE _run_async to prevent double-click race
+        self._active_pool = "pending"
         self._log("[Retry] Retrying failed accounts...")
 
-
         async def get_error_ids():
-            accounts = await self._controller.db.list_accounts(status="error")
-            if not accounts:
-                self._log("[Retry] Нет аккаунтов с ошибками")
+            try:
+                accounts = await self._controller.db.list_accounts(status="error")
+                if not accounts:
+                    self._log("[Retry] Нет аккаунтов с ошибками")
+                    self._active_pool = None
+                    self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+                    return
+                # Reset status to pending for retry
+                for a in accounts:
+                    await self._controller.db.update_account(a.id, status="pending", error_message=None)
+                ids = [a.id for a in accounts]
+                self._log(f"[Retry] {len(ids)} аккаунтов на повтор...")
+                await self._batch_migrate(ids)
+            except Exception as e:
+                logger.error("get_error_ids error: %s\n%s", e, traceback.format_exc())
+                self._log(f"[Error] get_error_ids: {e}")
+                self._active_pool = None
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
-                return
-            # Reset status to pending for retry
-            for a in accounts:
-                await self._controller.db.update_account(a.id, status="pending", error_message=None)
-            ids = [a.id for a in accounts]
-            self._log(f"[Retry] {len(ids)} аккаунтов на повтор...")
-            await self._batch_migrate(ids)
+                self._schedule_ui(lambda: self._reset_stop_button())
 
         self._run_async(get_error_ids())
 
     def _stop_migration(self, sender=None, app_data=None) -> None:
         """Stop ongoing migration."""
-
-        if hasattr(self, '_active_pool') and self._active_pool:
-            self._active_pool.request_shutdown()
-            self._schedule_ui(lambda: self._disable_stop_button())
+        # P1 FIX: Check sentinel - can't call request_shutdown() on "pending" string
+        if not (hasattr(self, '_active_pool') and self._active_pool and self._active_pool != "pending"):
+            return
+        # Disable immediately on main thread (not via _schedule_ui) to prevent double-click
+        if dpg.does_item_exist("btn_stop"):
+            dpg.configure_item("btn_stop", enabled=False, label="Stopping...")
+        self._active_pool.request_shutdown()
         self._log("[Migrate] STOP requested - finishing active accounts...")
 
     def _disable_stop_button(self) -> None:
@@ -1429,10 +1517,10 @@ class TGWebAuthApp:
         if dpg.does_item_exist("btn_stop"):
             dpg.configure_item("btn_stop", enabled=True, label="STOP")
 
-    def _throttled_refresh(self, completed: int, total: int) -> None:
+    def _throttled_refresh(self, completed: int, total: int, force: bool = False) -> None:
         """Refresh accounts table at most every 3s (last update always fires)."""
         now = time.time()
-        if completed >= total or (now - self._last_table_refresh >= 3.0):
+        if force or completed >= total or (now - self._last_table_refresh >= 3.0):
             self._last_table_refresh = now
             self._schedule_ui(lambda: self._refresh_table_async())
 
@@ -1469,14 +1557,14 @@ class TGWebAuthApp:
                 f"[Migrate] Done: {result.success_count} OK, "
                 f"{result.error_count} errors, {result.total} total"
             )
-            self._active_pool = None
             self._schedule_ui(lambda: self._refresh_table_async())
 
         except BaseException as e:
             logger.error("Batch migrate error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Batch migrate: {e}")
-            self._active_pool = None
         finally:
+            # P0 FIX: Always reset pool in finally for clean state
+            self._active_pool = None
             self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
             self._schedule_ui(lambda: self._reset_stop_button())
 
@@ -1488,20 +1576,29 @@ class TGWebAuthApp:
 
         # Disable buttons immediately on main thread
         self._set_batch_buttons_enabled(False)
+        # P0 FIX: Set sentinel BEFORE _run_async to prevent double-click race
+        self._active_pool = "pending"
         self._log("[Fragment] Starting batch fragment auth for healthy accounts...")
 
-
         async def get_healthy_ids():
-            accounts = await self._controller.db.list_accounts(status="healthy")
-            # Skip already fragment-authorized accounts
-            accounts = [a for a in accounts if a.fragment_status != "authorized"]
-            if not accounts:
-                self._log("[Fragment] Нет аккаунтов для авторизации (все уже авторизованы или нет мигрированных)")
+            try:
+                accounts = await self._controller.db.list_accounts(status="healthy")
+                # Skip already fragment-authorized accounts
+                accounts = [a for a in accounts if a.fragment_status != "authorized"]
+                if not accounts:
+                    self._log("[Fragment] Нет аккаунтов для авторизации (все уже авторизованы или нет мигрированных)")
+                    self._active_pool = None
+                    self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+                    return
+                ids = [a.id for a in accounts]
+                self._log(f"[Fragment] {len(ids)} аккаунтов для авторизации на fragment.com...")
+                await self._batch_fragment(ids)
+            except Exception as e:
+                logger.error("get_healthy_ids error: %s\n%s", e, traceback.format_exc())
+                self._log(f"[Error] get_healthy_ids: {e}")
+                self._active_pool = None
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
-                return
-            ids = [a.id for a in accounts]
-            self._log(f"[Fragment] {len(ids)} аккаунтов для авторизации на fragment.com...")
-            await self._batch_fragment(ids)
+                self._schedule_ui(lambda: self._reset_stop_button())
 
         self._run_async(get_healthy_ids())
 
@@ -1539,19 +1636,23 @@ class TGWebAuthApp:
                 f"[Fragment] Done: {result.success_count} OK, "
                 f"{result.error_count} errors, {result.total} total"
             )
-            self._active_pool = None
             self._schedule_ui(lambda: self._refresh_table_async())
 
         except BaseException as e:
             logger.error("Batch fragment error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Batch fragment: {e}")
-            self._active_pool = None
         finally:
+            # P0 FIX: Always reset pool in finally for clean state
+            self._active_pool = None
             self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
             self._schedule_ui(lambda: self._reset_stop_button())
 
     def _auto_assign_proxies(self, sender=None, app_data=None) -> None:
         """Auto-assign free proxies to accounts without proxies."""
+        if "auto_assign" in self._busy_ops:
+            self._log("[Proxies] Auto-assign already in progress")
+            return
+        self._busy_ops.add("auto_assign")
         self._log("[Proxies] Auto-assigning...")
 
         async def do_assign():
@@ -1589,11 +1690,17 @@ class TGWebAuthApp:
             except Exception as e:
                 logger.error("Auto-assign error: %s", e)
                 self._log(f"[Error] Auto-assign: {e}")
+            finally:
+                self._busy_ops.discard("auto_assign")
 
         self._run_async(do_assign())
 
     def _show_proxy_import_dialog(self, sender=None, app_data=None) -> None:
         """Show proxy import - select file directly."""
+        if "import_proxies" in self._busy_ops:
+            self._log("[Import] Proxy import already in progress")
+            return
+        self._busy_ops.add("import_proxies")
         try:
             filepath = _select_file_tkinter(
                 title="Select Proxies File",
@@ -1602,6 +1709,7 @@ class TGWebAuthApp:
 
             if filepath is None:
                 self._log("[Import] Proxy import cancelled")
+                self._busy_ops.discard("import_proxies")
                 return
 
             self._log(f"[Import] Loading proxies from {filepath.name}...")
@@ -1625,15 +1733,22 @@ class TGWebAuthApp:
                 except Exception as e:
                     logger.error("Proxy import error: %s\n%s", e, traceback.format_exc())
                     self._log(f"[Error] Proxy import: {e}")
+                finally:
+                    self._busy_ops.discard("import_proxies")
 
             self._run_async(do_import())
 
         except Exception as e:
             logger.error("Show proxy import dialog error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Proxy import: {e}")
+            self._busy_ops.discard("import_proxies")
 
     def _check_all_proxies(self, sender=None, app_data=None) -> None:
         """Check all proxies status."""
+        if "check_proxies" in self._busy_ops:
+            self._log("[Proxies] Check already in progress")
+            return
+        self._busy_ops.add("check_proxies")
         self._log("[Proxies] Starting proxy check...")
 
         async def do_check():
@@ -1680,11 +1795,17 @@ class TGWebAuthApp:
             except Exception as e:
                 logger.error("Check proxies error: %s\n%s", e, traceback.format_exc())
                 self._log(f"[Error] Proxy check: {e}")
+            finally:
+                self._busy_ops.discard("check_proxies")
 
         self._run_async(do_check())
 
     def _replace_dead_proxies(self, sender=None, app_data=None) -> None:
         """Delete dead proxies from database, unlinking accounts first."""
+        if "replace_dead" in self._busy_ops:
+            self._log("[Proxies] Replace already in progress")
+            return
+        self._busy_ops.add("replace_dead")
         async def do_replace():
             try:
                 proxies = await self._controller.db.list_proxies(status="dead")
@@ -1717,6 +1838,8 @@ class TGWebAuthApp:
             except Exception as e:
                 logger.error("Replace dead proxies error: %s", e)
                 self._log(f"[Error] Replace dead: {e}")
+            finally:
+                self._busy_ops.discard("replace_dead")
 
         self._run_async(do_replace())
 
