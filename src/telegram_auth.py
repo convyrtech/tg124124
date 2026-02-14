@@ -624,10 +624,21 @@ class TelegramAuth:
     QR_MAX_RETRIES = 8  # FIX-6.1: Increased from 5 to 8 for 1000-account reliability
     QR_RETRY_DELAY = 5  # секунд между retry
 
-    def __init__(self, account: AccountConfig, browser_manager: Optional[BrowserManager] = None):
+    def __init__(self, account: AccountConfig, browser_manager: Optional[BrowserManager] = None,
+                 on_status: Optional[Callable[[str], None]] = None):
         self.account = account
         self.browser_manager = browser_manager or BrowserManager()
         self._client: Optional[TelegramClient] = None
+        self._on_status = on_status
+
+    def _status(self, msg: str) -> None:
+        """Report progress to callback (GUI) and logger."""
+        logger.info(msg)
+        if self._on_status:
+            try:
+                self._on_status(msg)
+            except Exception:
+                pass
 
     async def _create_telethon_client(self) -> TelegramClient:
         """
@@ -1587,12 +1598,12 @@ class TelegramAuth:
 
         try:
             # 1. Подключаем Telethon client
-            logger.info("[1/6] Connecting Telethon client...")
+            self._status("[1/6] Connecting Telethon...")
             client = await self._create_telethon_client()
             self._client = client
 
             # 2. Запускаем браузер с синхронизированной ОС
-            logger.info("[2/6] Launching browser...")
+            self._status("[2/6] Launching browser...")
             # FIX #3: Передаём os_list для консистентности
             browser_extra_args = {
                 "os": self.account.device.browser_os_list,
@@ -1624,7 +1635,7 @@ class TelegramAuth:
             await page.set_viewport_size({"width": 1280, "height": 800})
 
             # 3. Открываем Telegram Web
-            logger.info("[3/6] Opening Telegram Web...")
+            self._status("[3/6] Opening Telegram Web...")
             try:
                 await page.goto(self.TELEGRAM_WEB_URL, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
@@ -1737,7 +1748,7 @@ class TelegramAuth:
                 )
 
             # 4. Ждём и декодируем QR (FIX #4: с retry)
-            logger.info("[4/6] Extracting QR token...")
+            self._status("[4/6] Extracting QR token...")
             token = await self._extract_qr_token_with_retry(page)
 
             if not token:
@@ -1766,7 +1777,7 @@ class TelegramAuth:
                 )
 
             # 5. Подтверждаем токен через Telethon
-            logger.info("[5/6] Accepting token via Telethon...")
+            self._status("[5/6] Accepting login token...")
             accepted = await self._accept_token(client, token)
 
             if not accepted:
@@ -1803,7 +1814,7 @@ class TelegramAuth:
                     success, _ = await self._wait_for_auth_complete(page)
 
             # FIX #2: Проверяем что Telethon сессия жива после авторизации браузера
-            logger.info("[6/6] Verifying Telethon session...")
+            self._status("[6/6] Verifying session...")
             telethon_alive = await self._verify_telethon_session(client)
 
             if success:
@@ -1915,6 +1926,7 @@ async def migrate_account(
     headless: bool = False,
     proxy_override: Optional[str] = None,
     browser_manager: Optional[BrowserManager] = None,
+    on_status: Optional[Callable[[str], None]] = None,
 ) -> AuthResult:
     """
     Мигрирует один аккаунт из session в browser profile.
@@ -1925,6 +1937,7 @@ async def migrate_account(
         headless: Headless режим
         proxy_override: Прокси строка из БД (перезаписывает ___config.json)
         browser_manager: Shared BrowserManager instance (creates new if None).
+        on_status: Optional callback for progress updates (e.g. GUI log).
 
     Returns:
         AuthResult
@@ -1935,7 +1948,7 @@ async def migrate_account(
         account.proxy = None
     elif proxy_override is not None:
         account.proxy = proxy_override
-    auth = TelegramAuth(account, browser_manager=browser_manager)
+    auth = TelegramAuth(account, browser_manager=browser_manager, on_status=on_status)
     return await auth.authorize(password_2fa=password_2fa, headless=headless)
 
 

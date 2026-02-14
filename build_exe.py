@@ -93,39 +93,35 @@ def create_dirs_and_readme() -> None:
 TG Web Auth v0.1.0
 ==================
 
-Автоматическая миграция Telegram-аккаунтов в браузерные профили.
+Автоматическая миграция Telegram-аккаунтов в браузерные профили
+для web.telegram.org и fragment.com.
+
+Подробная инструкция — см. ИНСТРУКЦИЯ.txt
 
 Быстрый старт:
-1. Положите папки с session-файлами в папку accounts/
-   (или импортируйте через GUI: Import Sessions)
+1. Распакуйте архив в любую папку (желательно без русских букв в пути)
 2. Запустите TGWebAuth.exe
-3. Импортируйте прокси (Import Proxies) — файл .txt, по одному на строку:
-   host:port:user:pass
-4. Нажмите Auto-Assign Proxies
-5. Нажмите Migrate All
-6. После миграции — Fragment All для авторизации на fragment.com
-7. Open — открыть браузер с профилем аккаунта
-
-Формат аккаунтов:
-    accounts/
-    └── account_name/
-        ├── session.session    (обязательно)
-        ├── api.json           (опционально)
-        └── ___config.json     (опционально, прокси/имя)
-
-Формат прокси (один на строку):
-    host:port:user:pass
-    socks5:host:port:user:pass
-    user:pass@host:port
+3. Нажмите "Import Sessions" → выберите папку с аккаунтами
+4. (Опционально) Вкладка Proxies → "Import Proxies" → выберите .txt файл
+5. (Опционально) Нажмите "Auto-Assign Proxies"
+6. Нажмите "Migrate All" — создаст браузерные профили (web.telegram.org)
+7. Нажмите "Fragment All" — авторизует на fragment.com
+8. Готово! Кнопка "Open" откроет браузер с профилем аккаунта.
 
 Если что-то не работает:
     1. Откройте вкладку Logs
-    2. Нажмите Collect Logs
+    2. Нажмите "Collect Logs"
     3. Отправьте созданный ZIP-файл разработчику
 """
 
     (APP_DIR / "README.txt").write_text(readme_text, encoding='utf-8')
     print("  Created README.txt")
+
+    # Copy detailed user instructions
+    instructions_src = ROOT / "ИНСТРУКЦИЯ.txt"
+    if instructions_src.exists():
+        shutil.copy2(instructions_src, APP_DIR / "ИНСТРУКЦИЯ.txt")
+        print("  Copied ИНСТРУКЦИЯ.txt")
 
 
 def create_zip() -> None:

@@ -20,7 +20,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
@@ -802,6 +802,7 @@ async def fragment_account(
     headless: bool = True,
     proxy_override: Optional[str] = None,
     browser_manager: Optional[BrowserManager] = None,
+    on_status: Optional[Callable[[str], None]] = None,
 ) -> AuthResult:
     """Authorize one account on fragment.com. Pool-compatible wrapper.
 
@@ -811,6 +812,7 @@ async def fragment_account(
         headless: Run browser headless.
         proxy_override: Proxy string from DB.
         browser_manager: Shared BrowserManager instance.
+        on_status: Optional callback for progress updates.
 
     Returns:
         AuthResult for compatibility with MigrationWorkerPool.
@@ -819,6 +821,8 @@ async def fragment_account(
     if proxy_override is not None:
         account.proxy = proxy_override
     auth = FragmentAuth(account, browser_manager or BrowserManager())
+    if on_status:
+        on_status("Connecting...")
     result = await auth.connect(headless=headless)
 
     return AuthResult(

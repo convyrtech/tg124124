@@ -505,6 +505,10 @@ class MigrationWorkerPool:
 
         # Run migration/fragment with timeout
         migrate_fn = fragment_account if self._mode == "fragment" else migrate_account
+
+        def status_cb(msg: str) -> None:
+            self._log(f"[W{worker_id}] {name} — {msg}")
+
         try:
             auth_result: AuthResult = await asyncio.wait_for(
                 migrate_fn(
@@ -513,6 +517,7 @@ class MigrationWorkerPool:
                     headless=self._headless,
                     proxy_override=proxy_str,
                     browser_manager=self._browser_manager,
+                    on_status=status_cb,
                 ),
                 timeout=self._task_timeout,
             )

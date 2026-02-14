@@ -13,7 +13,7 @@ binaries = []
 hiddenimports = []
 
 # Camoufox: playwright-based, needs its driver
-for pkg in ('playwright', 'camoufox', 'browserforge'):
+for pkg in ('playwright', 'camoufox', 'browserforge', 'language_tags', 'pyzbar'):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
