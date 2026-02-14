@@ -81,10 +81,18 @@ class AppController:
         Supports formats:
         - Standard: account_dir/session.session + api.json + ___config.json
         - Lolzteam: account_dir/session.session + api.json (no config)
+
+        FIX #11: Heavy file I/O (glob, stat, copy2, json.load) is offloaded
+        to a thread executor so the asyncio event loop is not blocked.
         """
-        imported = 0
-        skipped = 0
-        session_files = list(source_dir.glob("**/*.session"))
+        import json as json_mod
+
+        loop = asyncio.get_running_loop()
+
+        # Offload glob to executor (can be slow on network drives / large dirs)
+        session_files = await loop.run_in_executor(
+            None, lambda: list(source_dir.glob("**/*.session"))
+        )
         total = len(session_files)
 
         if total == 0:
@@ -108,6 +116,9 @@ class AppController:
         logger.info("Found %d .session files to import, %d accounts already in DB",
                      total, len(existing_names))
 
+        imported = 0
+        skipped = 0
+
         for i, session_path in enumerate(session_files):
             try:
                 # Find associated files
@@ -120,12 +131,14 @@ class AppController:
                 config_name = None
                 if config_json.exists():
                     try:
-                        import json
-                        with open(config_json, 'r', encoding='utf-8') as f:
-                            config = json.load(f)
-                            proxy_str = config.get("Proxy")
-                            config_name = config.get("Name")
-                    except (json.JSONDecodeError, IOError) as e:
+                        def _read_config(p: Path) -> dict:
+                            with open(p, 'r', encoding='utf-8') as f:
+                                return json_mod.load(f)
+
+                        config = await loop.run_in_executor(None, _read_config, config_json)
+                        proxy_str = config.get("Proxy")
+                        config_name = config.get("Name")
+                    except (json_mod.JSONDecodeError, IOError) as e:
                         logger.warning("Failed to parse config %s: %s", config_json, e)
 
                 # Build final name: "folder (config_name)" only if config_name differs
@@ -142,30 +155,35 @@ class AppController:
                     continue
 
                 # Validate session file size (must be non-empty SQLite)
-                if session_path.stat().st_size < 1024:
+                file_size = await loop.run_in_executor(
+                    None, lambda p=session_path: p.stat().st_size
+                )
+                if file_size < 1024:
                     skipped += 1
-                    reason = f"skip (too small {session_path.stat().st_size}B): {name}"
+                    reason = f"skip (too small {file_size}B): {name}"
                     logger.warning("Session file too small: %s (%d bytes)",
-                                   session_path, session_path.stat().st_size)
+                                   session_path, file_size)
                     if on_progress:
                         on_progress(i + 1, total, reason)
                     continue
 
-                # Copy to sessions directory
+                # Copy to sessions directory (offloaded to executor)
                 dest_dir = self.sessions_dir / base_name
-                dest_dir.mkdir(exist_ok=True)
-
                 dest_session = dest_dir / "session.session"
-                shutil.copy2(session_path, dest_session)
 
-                # Copy api.json if exists
-                api_json = account_dir / "api.json"
-                if api_json.exists():
-                    shutil.copy2(api_json, dest_dir / "api.json")
+                def _copy_files(src_session, src_dir, dst_dir, dst_session):
+                    dst_dir.mkdir(exist_ok=True)
+                    shutil.copy2(src_session, dst_session)
+                    api_json = src_dir / "api.json"
+                    if api_json.exists():
+                        shutil.copy2(api_json, dst_dir / "api.json")
+                    cfg_json = src_dir / "___config.json"
+                    if cfg_json.exists():
+                        shutil.copy2(cfg_json, dst_dir / "___config.json")
 
-                # Copy ___config.json if exists
-                if config_json.exists():
-                    shutil.copy2(config_json, dest_dir / "___config.json")
+                await loop.run_in_executor(
+                    None, _copy_files, session_path, account_dir, dest_dir, dest_session
+                )
 
                 # Add to database
                 account_id = await self.db.add_account(

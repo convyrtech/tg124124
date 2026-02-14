@@ -269,6 +269,16 @@ class TestParseTelethonProxy:
         assert parse_telethon_proxy("invalid") is None
         assert parse_telethon_proxy("too:many:parts:here:a:b") is None
 
+    def test_password_with_colons(self):
+        """FIX #15: Password containing colons should be preserved."""
+        result = parse_telethon_proxy("socks5:proxy.com:1080:user:pa:ss:word")
+        assert result is not None
+        assert len(result) == 6
+        assert result[1] == "proxy.com"
+        assert result[2] == 1080
+        assert result[4] == "user"
+        assert result[5] == "pa:ss:word"
+
 
 class TestTelegramAuthIntegration:
     """Integration-style tests for TelegramAuth (without actual network)."""

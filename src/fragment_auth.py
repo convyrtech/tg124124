@@ -711,6 +711,8 @@ class FragmentAuth:
 
             if state == "authorized":
                 logger.info("Already authorized on fragment.com!")
+                if browser_ctx:
+                    browser_ctx.save_state_on_close = True
                 return FragmentResult(
                     success=True,
                     account_name=self.account.name,
@@ -759,16 +761,28 @@ class FragmentAuth:
                         )
 
                     # 7. Wait for Telethon confirmation (handler already registered)
+                    # FIX #10: Also check if popup closed early — no point waiting
+                    # CONFIRM_TIMEOUT if the popup is already gone (crash/redirect).
                     logger.info("[6/6] Waiting for Telethon confirmation...")
-                    try:
-                        await asyncio.wait_for(confirmed.wait(), timeout=CONFIRM_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        logger.warning("Confirmation timeout after %ds", CONFIRM_TIMEOUT)
-                        return FragmentResult(
-                            success=False,
-                            account_name=self.account.name,
-                            error="Confirmation timeout — no message from Telegram"
-                        )
+                    for _wait_i in range(CONFIRM_TIMEOUT):
+                        if confirmed.is_set():
+                            break
+                        if popup.is_closed():
+                            logger.warning("OAuth popup closed early — stopping wait")
+                            break
+                        await asyncio.sleep(1)
+
+                    if not confirmed.is_set():
+                        # Check if fragment is already authorized despite no Telethon msg
+                        frag_state = await self._check_fragment_state(page)
+                        if frag_state != "authorized":
+                            logger.warning("Confirmation timeout after %ds", CONFIRM_TIMEOUT)
+                            return FragmentResult(
+                                success=False,
+                                account_name=self.account.name,
+                                error="Confirmation timeout — no message from Telegram"
+                            )
+                        logger.info("Fragment authorized despite no Telethon confirmation")
                 finally:
                     client.remove_event_handler(handler)
 
@@ -788,6 +802,8 @@ class FragmentAuth:
                     error="Fragment auth did not complete after confirmation"
                 )
 
+            if browser_ctx:
+                browser_ctx.save_state_on_close = True
             return FragmentResult(
                 success=True,
                 account_name=self.account.name,
@@ -819,14 +835,15 @@ class FragmentAuth:
             if browser_ctx:
                 try:
                     await browser_ctx.close()
-                except Exception as e:
+                except BaseException as e:
+                    # BaseException catches CancelledError (Python 3.11+)
                     logger.warning("Error closing browser: %s", e)
 
             # Disconnect Telethon
             if client:
                 try:
                     await client.disconnect()
-                except Exception as e:
+                except BaseException as e:
                     logger.debug("Error disconnecting Telethon: %s", e)
 
 

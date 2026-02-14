@@ -118,17 +118,20 @@ class TGWebAuthApp:
             future.add_done_callback(self._on_async_done)
 
     def _on_async_done(self, future) -> None:
-        """Handle completion of async tasks - log errors, reset state."""
+        """Handle completion of async tasks - log errors only.
+
+        IMPORTANT: Do NOT reset _active_pool here! This callback fires for
+        ALL async tasks (search, import, delete, etc.), not just batch ops.
+        Resetting pool state on an unrelated failure (e.g. search error)
+        would re-enable batch buttons while a batch is still running,
+        allowing a second concurrent batch → AUTH_KEY_DUPLICATED.
+        Batch methods manage their own pool cleanup in finally blocks.
+        """
         try:
             future.result()
         except Exception as e:
             logger.error("Async task failed: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Background task failed: {e}")
-            # Reset pool state if stuck
-            if self._active_pool:
-                self._active_pool = None
-                self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
-                self._schedule_ui(lambda: self._reset_stop_button())
 
     def _schedule_ui(self, func: Callable) -> None:
         """Schedule a function to run on the main UI thread."""
@@ -487,6 +490,10 @@ class TGWebAuthApp:
 
     def _collect_diagnostics(self, sender=None, app_data=None) -> None:
         """Collect logs + system info into a ZIP for support (runs async to avoid GUI freeze)."""
+        if "collect_diagnostics" in self._busy_ops:
+            self._log("[Diagnostics] Already collecting...")
+            return
+        self._busy_ops.add("collect_diagnostics")
         self._schedule_ui(lambda: dpg.set_value("diagnostics_status", "Collecting..."))
         self._run_async(self._collect_diagnostics_async())
 
@@ -634,6 +641,8 @@ class TGWebAuthApp:
             logger.error("Collect diagnostics error: %s\n%s", e, traceback.format_exc())
             self._log(f"[Error] Diagnostics: {e}")
             self._schedule_ui(lambda: dpg.set_value("diagnostics_status", "Error!"))
+        finally:
+            self._busy_ops.discard("collect_diagnostics")
 
     def _show_2fa_dialog(self) -> None:
         """Show 2FA password input dialog on startup."""

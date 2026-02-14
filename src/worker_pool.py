@@ -208,6 +208,7 @@ class MigrationWorkerPool:
 
         # FIX-C: Wrap worker execution in try/finally to ensure BrowserManager
         # cleanup on any exception (prevents zombie browsers on pool crash/cancel).
+        workers = []
         try:
             # Create producer and worker tasks
             producer = asyncio.create_task(self._producer(account_ids))
@@ -220,8 +221,11 @@ class MigrationWorkerPool:
             await producer
 
             # FIX #12: queue.join() with timeout to prevent hanging if a worker crashes.
-            # Timeout = (task_timeout * num_workers) + 60s buffer.
-            join_timeout = self._task_timeout * self._num_workers + 60
+            # Formula accounts for total items, not just workers:
+            # (items_per_worker) * (task_timeout + max_cooldown) + buffer
+            max_cooldown = max(self._cooldown_range)
+            items_per_worker = (total + self._num_workers - 1) // self._num_workers
+            join_timeout = items_per_worker * (self._task_timeout + max_cooldown) + 120
             try:
                 await asyncio.wait_for(self._queue.join(), timeout=join_timeout)
             except asyncio.TimeoutError:
@@ -251,6 +255,13 @@ class MigrationWorkerPool:
 
             return result
         finally:
+            # Cancel orphan worker tasks to prevent resource leaks.
+            # Without this, if run() exits early (exception in producer,
+            # queue.join timeout, etc.), workers continue running indefinitely.
+            for w in workers:
+                if not w.done():
+                    w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
             try:
                 await self._browser_manager.close_all()
             except Exception as e:
@@ -562,10 +573,9 @@ class MigrationWorkerPool:
                     account_id, name, "authorized"
                 )
             else:
-                username = (
-                    auth_result.user_info.get("username")
-                    if auth_result.user_info else None
-                )
+                username = None
+                if isinstance(auth_result.user_info, dict):
+                    username = auth_result.user_info.get("username")
                 profile_path = (
                     str(PROFILES_DIR / auth_result.profile_name)
                     if auth_result.profile_name else None
@@ -774,9 +784,12 @@ class MigrationWorkerPool:
             )
             # Clear event — all workers will block at top of their loop
             self._batch_pause_event.clear()
-            await self._interruptible_sleep(pause)
-            # Set event — release all workers
-            self._batch_pause_event.set()
+            try:
+                await self._interruptible_sleep(pause)
+            finally:
+                # MUST re-set even if worker is cancelled/crashes,
+                # otherwise all workers deadlock for up to 26 min.
+                self._batch_pause_event.set()
             return  # Batch pause replaces regular cooldown
 
         # Regular per-worker cooldown

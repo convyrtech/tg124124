@@ -236,7 +236,14 @@ class ProfileLifecycleManager:
                     await loop.run_in_executor(None, self._extract_zip, zip_path, profile_path)
                     logger.info("Decompressed cold profile '%s'", name)
                 except zipfile.BadZipFile:
-                    logger.error("Corrupt zip for profile '%s', creating fresh profile", name)
+                    # FIX #7/#8: Corrupt zip — log, remove zip, and create empty
+                    # profile dir so downstream code has a valid path.
+                    # The session data is lost but browser will create a fresh profile.
+                    logger.error(
+                        "Corrupt zip for profile '%s' — removing and creating fresh profile. "
+                        "Previous browser state is lost.", name
+                    )
+                    profile_path.mkdir(parents=True, exist_ok=True)
                 try:
                     if zip_path.exists():
                         zip_path.unlink()
@@ -796,6 +803,10 @@ class BrowserContext:
         self._closed = False
         self._browser_pid: Optional[int] = None
         self._driver_pid: Optional[int] = None
+        # FIX #6: Only save storage_state on close when auth succeeded.
+        # Callers set this to True after confirmed successful authorization.
+        # Default False prevents overwriting valid profiles with failed auth data.
+        self.save_state_on_close: bool = False
 
     async def new_page(self):
         """
@@ -869,12 +880,17 @@ class BrowserContext:
             return
         self._closed = True
 
-        try:
-            await asyncio.wait_for(self.save_storage_state(), timeout=5)
-        except asyncio.TimeoutError:
-            logger.warning("Storage state save timed out for '%s'", self.profile.name)
-        except Exception as e:
-            logger.warning("Couldn't save state: %s", e)
+        # FIX #6: Only save storage_state if auth was successful.
+        # Prevents overwriting valid profiles with failed/partial auth data.
+        if self.save_state_on_close:
+            try:
+                await asyncio.wait_for(self.save_storage_state(), timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning("Storage state save timed out for '%s'", self.profile.name)
+            except Exception as e:
+                logger.warning("Couldn't save state: %s", e)
+        else:
+            logger.debug("Skipping storage state save for '%s' (save_state_on_close=False)", self.profile.name)
 
         try:
             await asyncio.wait_for(

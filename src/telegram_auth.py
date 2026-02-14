@@ -593,7 +593,7 @@ def extract_token_from_tg_url(url_str: str) -> Optional[bytes]:
 def parse_telethon_proxy(proxy_str: str) -> Optional[tuple]:
     """
     Конвертирует прокси в формат Telethon.
-    Input: socks5:host:port:user:pass
+    Input: socks5:host:port:user:pass (password may contain colons)
     Output: (socks.SOCKS5, host, port, True, user, pass)
     """
     if not proxy_str:
@@ -601,15 +601,19 @@ def parse_telethon_proxy(proxy_str: str) -> Optional[tuple]:
 
     import socks
 
-    parts = proxy_str.split(":")
-    if len(parts) == 5:
-        proto, host, port, user, pwd = parts
-        proxy_type = socks.SOCKS5 if 'socks5' in proto.lower() else socks.HTTP
-        return (proxy_type, host, int(port), True, user, pwd)
-    elif len(parts) == 3:
-        proto, host, port = parts
-        proxy_type = socks.SOCKS5 if 'socks5' in proto.lower() else socks.HTTP
-        return (proxy_type, host, int(port))
+    # Split with maxsplit=4 to handle passwords containing colons
+    parts = proxy_str.split(":", 4)
+    try:
+        if len(parts) == 5:
+            proto, host, port, user, pwd = parts
+            proxy_type = socks.SOCKS5 if 'socks5' in proto.lower() else socks.HTTP
+            return (proxy_type, host, int(port), True, user, pwd)
+        elif len(parts) == 3:
+            proto, host, port = parts
+            proxy_type = socks.SOCKS5 if 'socks5' in proto.lower() else socks.HTTP
+            return (proxy_type, host, int(port))
+    except (ValueError, AttributeError):
+        return None
 
     return None
 
@@ -1322,7 +1326,9 @@ class TelegramAuth:
         Отправляет acceptLoginToken для авторизации браузера с FloodWaitError handling.
 
         Реализует:
-        - FloodWaitError handling с ожиданием указанного времени
+        - FloodWaitError handling: returns False so outer loop fetches fresh QR
+          (QR tokens expire in ~30s, so retrying with stale token after flood wait is useless)
+        - Non-retryable error detection (EXPIRED, INVALID, ALREADY_ACCEPTED)
         - Exponential backoff для других ошибок
         - Максимум 3 попытки
         """
@@ -1339,19 +1345,14 @@ class TelegramAuth:
             except FloodWaitError as e:
                 wait_time = e.seconds
                 logger.warning(
-                    f"FloodWaitError: must wait {wait_time}s "
-                    f"(attempt {attempt + 1}/{max_retries})"
+                    "FloodWaitError: must wait %ds — token is now stale, "
+                    "need fresh QR (attempt %d/%d)",
+                    wait_time, attempt + 1, max_retries,
                 )
-
-                # Если слишком долго ждать - прерываем
-                if wait_time > 3600:  # 1 час максимум
-                    logger.error(f"Flood wait {wait_time}s too long (>1h), aborting")
-                    return False
-
-                # Ждём указанное время + небольшой jitter
-                jitter = random.uniform(1, 5)
-                logger.info(f"Waiting {wait_time + jitter:.1f}s before retry...")
-                await asyncio.sleep(wait_time + jitter)
+                # QR tokens expire in ~30s. After any FloodWait, the token is
+                # definitely stale. Return False so the outer retry loop
+                # (_extract_qr_token_with_retry) fetches a fresh QR code.
+                return False
 
             except Exception as e:
                 error_str = str(e).upper()
@@ -1734,6 +1735,8 @@ class TelegramAuth:
             if current_state == "authorized":
                 logger.info("Already authorized! Skipping QR login.")
                 await self._set_authorization_ttl(client)
+                if browser_ctx:
+                    browser_ctx.save_state_on_close = True
                 return AuthResult(
                     success=True,
                     profile_name=profile.name,
@@ -1749,6 +1752,8 @@ class TelegramAuth:
                         success, _ = await self._wait_for_auth_complete(page, timeout=30)
                         if success:
                             await self._set_authorization_ttl(client)
+                            if browser_ctx:
+                                browser_ctx.save_state_on_close = True
                             return AuthResult(
                                 success=True,
                                 profile_name=profile.name,
@@ -1775,6 +1780,8 @@ class TelegramAuth:
                     success, _ = await self._wait_for_auth_complete(page)
                     if success:
                         await self._set_authorization_ttl(client)
+                        if browser_ctx:
+                            browser_ctx.save_state_on_close = True
                     return AuthResult(
                         success=success,
                         profile_name=profile.name,
@@ -1802,6 +1809,8 @@ class TelegramAuth:
                 if final_state == "authorized":
                     logger.info("Browser authorized during QR extraction cycle")
                     await self._set_authorization_ttl(client)
+                    if browser_ctx:
+                        browser_ctx.save_state_on_close = True
                     return AuthResult(
                         success=True,
                         profile_name=profile.name,
@@ -1866,6 +1875,10 @@ class TelegramAuth:
 
                 # Получаем инфо о пользователе из браузера
                 user_info = await self._get_browser_user_info(page)
+
+                # FIX #6: Mark browser context for storage_state save on close
+                if browser_ctx:
+                    browser_ctx.save_state_on_close = True
 
                 return AuthResult(
                     success=True,
@@ -2492,12 +2505,19 @@ async def migrate_accounts_parallel(
                     headless=headless,
                     browser_manager=shared_browser_manager,
                 )
-            except Exception as e:
+            except BaseException as e:
+                # BaseException catches CancelledError (Python 3.11+)
                 result = AuthResult(
                     success=False,
                     profile_name=account_dir.name,
                     error=sanitize_error(str(e))
                 )
+                # Re-raise CancelledError after recording result
+                if isinstance(e, asyncio.CancelledError):
+                    async with lock:
+                        results[index] = result
+                        completed += 1
+                    raise
 
             async with lock:
                 results[index] = result
@@ -2531,7 +2551,7 @@ async def migrate_accounts_parallel(
             logger.warning("BrowserManager cleanup error in migrate_accounts_parallel: %s", e)
 
     # Return results in original order
-    return [results[i] for i in range(len(account_dirs))]
+    return [results.get(i, AuthResult(success=False, profile_name=str(account_dirs[i].name), error="Task cancelled")) for i in range(len(account_dirs))]
 
 
 async def main():

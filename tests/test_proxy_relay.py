@@ -2,7 +2,8 @@
 Tests for proxy_relay module
 """
 import pytest
-from src.proxy_relay import ProxyConfig, ProxyRelay, needs_relay, find_free_port
+from unittest.mock import AsyncMock, patch, MagicMock
+from src.proxy_relay import ProxyConfig, ProxyRelay, ProxyRelayManager, needs_relay, find_free_port
 
 
 class TestProxyConfig:
@@ -150,3 +151,31 @@ class TestProxyRelay:
         relay.local_port = 8888
 
         assert relay.local_url == "http://0.0.0.0:8888"
+
+
+class TestProxyRelayManager:
+    """Tests for ProxyRelayManager cache behavior"""
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_caches_relay(self):
+        """FIX #12: get_or_create should return cached relay if still running."""
+        manager = ProxyRelayManager()
+        mock_relay = MagicMock(spec=ProxyRelay)
+        mock_relay._started = True
+        manager._relays["socks5:host:1080:user:pass"] = mock_relay
+
+        result = await manager.get_or_create("socks5:host:1080:user:pass")
+        assert result is mock_relay
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_replaces_stopped_relay(self):
+        """FIX #12: get_or_create should replace stopped relay with fresh one."""
+        manager = ProxyRelayManager()
+        stopped_relay = MagicMock(spec=ProxyRelay)
+        stopped_relay._started = False
+        manager._relays["socks5:host:1080:user:pass"] = stopped_relay
+
+        with patch.object(ProxyRelay, 'start', new_callable=AsyncMock) as mock_start:
+            result = await manager.get_or_create("socks5:host:1080:user:pass")
+            assert result is not stopped_relay  # Got a new relay
+            mock_start.assert_called_once()  # start() was called on new relay

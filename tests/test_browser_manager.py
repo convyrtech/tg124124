@@ -226,6 +226,21 @@ class TestBrowserContext:
         assert mock_context._closed is True
 
     @pytest.mark.asyncio
+    async def test_close_skips_storage_save_by_default(self, mock_context):
+        """FIX #6: close() should NOT save storage_state when save_state_on_close=False."""
+        mock_context.save_storage_state = AsyncMock()
+        await mock_context.close()
+        mock_context.save_storage_state.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_saves_storage_when_flagged(self, mock_context):
+        """FIX #6: close() should save storage_state when save_state_on_close=True."""
+        mock_context.save_state_on_close = True
+        mock_context.save_storage_state = AsyncMock()
+        await mock_context.close()
+        mock_context.save_storage_state.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_context_manager(self, mock_context):
         """Test async context manager protocol."""
         async with mock_context as ctx:
