@@ -613,6 +613,12 @@ class BrowserManager:
                 await asyncio.wait_for(old_ctx.close(), timeout=20)
             except Exception as e:
                 logger.warning("Force-closing stale browser for '%s': %s", profile.name, e)
+                # FIX: Stop zombie relay if browser close failed
+                if old_ctx._proxy_relay:
+                    try:
+                        await old_ctx._proxy_relay.stop()
+                    except Exception:
+                        pass
                 self._active_browsers.pop(profile.name, None)
 
         # Hot/cold lifecycle: decompress if needed, evict LRU if at capacity
@@ -913,8 +919,8 @@ class BrowserContext:
             except Exception as e:
                 logger.warning("Error stopping proxy relay: %s", e)
 
-        if self._manager and self.profile.name in self._manager._active_browsers:
-            del self._manager._active_browsers[self.profile.name]
+        if self._manager:
+            self._manager._active_browsers.pop(self.profile.name, None)
 
         logger.info("Browser closed for '%s'", self.profile.name)
 

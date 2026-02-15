@@ -59,6 +59,9 @@ class ResourceMonitor:
             max_cpu_percent=max_cpu_percent,
             min_memory_available_gb=min_memory_available_gb
         )
+        # Warm up psutil CPU cache — first cpu_percent(interval=0) always
+        # returns 0.0 because there's no previous snapshot to compare against.
+        psutil.cpu_percent(interval=0)
 
     def _get_resources(self) -> Dict[str, float]:
         """

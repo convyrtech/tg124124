@@ -97,6 +97,11 @@ def mask_proxy_credentials(proxy_str: str) -> str:
     if not proxy_str:
         return ""
 
+    # Handle user:pass@host:port format
+    if '@' in proxy_str:
+        at_idx = proxy_str.index('@')
+        return '***:***@' + proxy_str[at_idx + 1:]
+
     parts = proxy_str.split(":")
     if len(parts) == 5:
         proto, host, port, _, _ = parts

@@ -418,6 +418,8 @@ class MigrationWorkerPool:
 
         # FIX #4: In half-open state, only one worker probes.
         # acquire_half_open_probe() returns False if another worker is already probing.
+        # FIX: Track probe acquisition to release on ALL exit paths (not just success/fail).
+        probe_acquired = False
         if self._circuit_breaker.is_open:
             if not await self._circuit_breaker.acquire_half_open_probe():
                 # Another worker is probing — wait for probe result
@@ -435,6 +437,8 @@ class MigrationWorkerPool:
                         success=False,
                         error="RETRY: Circuit breaker still open after probe",
                     )
+            else:
+                probe_acquired = True
 
         # Check resource availability
         if not self._resource_monitor.can_launch_more():
@@ -444,6 +448,8 @@ class MigrationWorkerPool:
             )
             await self._interruptible_sleep(30.0)
             if not self._resource_monitor.can_launch_more():
+                if probe_acquired:
+                    self._circuit_breaker.release_half_open_probe()
                 return AccountResult(
                     account_id=account_id,
                     account_name=name,
@@ -466,6 +472,8 @@ class MigrationWorkerPool:
                 )
             except Exception as exc:
                 logger.warning("DB update failed for %s: %s", name, exc)
+            if probe_acquired:
+                self._circuit_breaker.release_half_open_probe()
             return AccountResult(
                 account_id=account_id,
                 account_name=name,
@@ -485,6 +493,8 @@ class MigrationWorkerPool:
                 )
             except Exception as exc:
                 logger.warning("DB update failed for %s: %s", name, exc)
+            if probe_acquired:
+                self._circuit_breaker.release_half_open_probe()
             return AccountResult(
                 account_id=account_id,
                 account_name=name,
@@ -502,6 +512,8 @@ class MigrationWorkerPool:
                 migration_id = await self._db.start_migration(account_id)
             except Exception as exc:
                 logger.warning("DB start_migration failed for %s: %s", name, exc)
+                if probe_acquired:
+                    self._circuit_breaker.release_half_open_probe()
                 return AccountResult(
                     account_id=account_id,
                     account_name=name,
