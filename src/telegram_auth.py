@@ -683,20 +683,23 @@ class TelegramAuth:
                 logger.warning("Could not set WAL mode for session: %s", e)
 
         # FIX #3: DEVICE SYNC - передаём device параметры
-        client = TelegramClient(
-            str(self.account.session_path.with_suffix('')),  # Без .session
-            self.account.api_id,
-            self.account.api_hash,
-            proxy=proxy,
-            device_model=device.device_model,
-            system_version=device.system_version,
-            app_version=device.app_version,
-            lang_code=device.lang_code,
-            system_lang_code=device.system_lang_code,
-            auto_reconnect=False,
-            connection_retries=0,
-            receive_updates=False,
-        )
+        try:
+            client = TelegramClient(
+                str(self.account.session_path.with_suffix('')),  # Без .session
+                self.account.api_id,
+                self.account.api_hash,
+                proxy=proxy,
+                device_model=device.device_model,
+                system_version=device.system_version,
+                app_version=device.app_version,
+                lang_code=device.lang_code,
+                system_lang_code=device.system_lang_code,
+                auto_reconnect=False,
+                connection_retries=0,
+                receive_updates=False,
+            )
+        except sqlite3.DatabaseError as e:
+            raise RuntimeError(f"Session file corrupted: {e}") from e
 
         # FIX-006: Timeout на connect() чтобы не зависать навечно
         # FIX-4.4: Catch TypeError from broken proxy libs + ConnectionError
@@ -709,6 +712,9 @@ class TelegramAuth:
 
         try:
             await asyncio.wait_for(client.connect(), timeout=30)
+        except sqlite3.DatabaseError as e:
+            await self._safe_disconnect(client)
+            raise RuntimeError(f"Session file corrupted: {e}") from e
         except asyncio.TimeoutError:
             await self._safe_disconnect(client)
             raise RuntimeError(f"Telethon connect timeout after 30s{proxy_info}")

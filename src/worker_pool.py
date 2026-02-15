@@ -45,6 +45,7 @@ _ERROR_MAP = {
     "Session not authorized": "Сессия истекла — нужна повторная авторизация в Telethon",
     "Browser launch timeout": "Браузер не запустился — попробуйте снова",
     "Proxy relay not responding": "Прокси-релей не отвечает — проверьте прокси",
+    "Session file corrupted": "Файл сессии повреждён — нужен новый .session файл",
 }
 
 

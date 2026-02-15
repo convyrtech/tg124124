@@ -822,6 +822,15 @@ class TGWebAuthApp:
             self._status_cells.clear()
             self._fragment_cells.clear()
 
+            # Empty state: show placeholder when no accounts loaded
+            if not accounts:
+                with dpg.table_row(parent="accounts_table"):
+                    dpg.add_text("")  # checkbox column
+                    dpg.add_text("Нет аккаунтов. Нажмите 'Import Sessions'")
+                    for _ in range(5):  # remaining 5 columns
+                        dpg.add_text("")
+                return
+
             # Determine if batch buttons should be disabled (batch is running)
             batch_running = self._active_pool is not None
 

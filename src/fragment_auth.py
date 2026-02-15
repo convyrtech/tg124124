@@ -107,24 +107,33 @@ class FragmentAuth:
             except sqlite3.Error as e:
                 logger.warning("Could not set WAL mode for session: %s", e)
 
-        client = TelegramClient(
-            str(self.account.session_path.with_suffix('')),
-            self.account.api_id,
-            self.account.api_hash,
-            proxy=proxy,
-            device_model=device.device_model,
-            system_version=device.system_version,
-            app_version=device.app_version,
-            lang_code=device.lang_code,
-            system_lang_code=device.system_lang_code,
-            auto_reconnect=False,
-            connection_retries=0,
-            # FIX-3.1: MUST be True — event handler for 777000 codes needs update dispatch
-            receive_updates=True,
-        )
+        try:
+            client = TelegramClient(
+                str(self.account.session_path.with_suffix('')),
+                self.account.api_id,
+                self.account.api_hash,
+                proxy=proxy,
+                device_model=device.device_model,
+                system_version=device.system_version,
+                app_version=device.app_version,
+                lang_code=device.lang_code,
+                system_lang_code=device.system_lang_code,
+                auto_reconnect=False,
+                connection_retries=0,
+                # FIX-3.1: MUST be True — event handler for 777000 codes needs update dispatch
+                receive_updates=True,
+            )
+        except sqlite3.DatabaseError as e:
+            raise RuntimeError(f"Session file corrupted: {e}") from e
 
         try:
             await asyncio.wait_for(client.connect(), timeout=30)
+        except sqlite3.DatabaseError as e:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=5)
+            except Exception:
+                pass
+            raise RuntimeError(f"Session file corrupted: {e}") from e
         except asyncio.TimeoutError:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=5)
