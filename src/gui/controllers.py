@@ -186,9 +186,10 @@ class AppController:
                 )
 
                 # Add to database
+                from ..paths import to_relative_path
                 account_id = await self.db.add_account(
                     name=name,
-                    session_path=str(dest_session)
+                    session_path=to_relative_path(dest_session)
                 )
 
                 # Track in dedup sets for this batch

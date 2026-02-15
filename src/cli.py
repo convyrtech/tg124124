@@ -354,9 +354,10 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                     # Ensure all accounts exist in DB
                     for d in found:
                         try:
+                            from .paths import to_relative_path
                             await db.add_account(
                                 name=d.name,
-                                session_path=str(d / "session.session"),
+                                session_path=to_relative_path(d / "session.session"),
                             )
                         except sqlite3.IntegrityError:
                             pass  # Account already exists (unique session_path)

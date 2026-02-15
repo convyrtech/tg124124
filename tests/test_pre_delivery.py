@@ -174,6 +174,97 @@ class TestErrorHumanization:
         assert "пароль" in humanize_error("SessionPasswordNeeded").lower()
 
 
+class TestPathPortability:
+    """Verify session_path stored as relative, resolved to absolute."""
+
+    def test_to_relative_path(self, tmp_path):
+        """to_relative_path converts absolute to relative from APP_ROOT."""
+        from src.paths import APP_ROOT, to_relative_path
+
+        abs_path = APP_ROOT / "accounts" / "test" / "session.session"
+        rel = to_relative_path(abs_path)
+        assert not Path(rel).is_absolute(), f"Expected relative, got: {rel}"
+        assert "accounts" in rel
+        assert "session.session" in rel
+
+    def test_resolve_path_relative(self):
+        """resolve_path converts relative back to absolute."""
+        from src.paths import APP_ROOT, resolve_path
+
+        resolved = resolve_path("accounts/test/session.session")
+        assert resolved.is_absolute()
+        assert resolved == APP_ROOT / "accounts" / "test" / "session.session"
+
+    def test_resolve_path_absolute_backward_compat(self, tmp_path):
+        """resolve_path leaves absolute paths as-is (old DB compat)."""
+        from src.paths import resolve_path
+
+        abs_str = str(tmp_path / "old" / "session.session")
+        resolved = resolve_path(abs_str)
+        assert resolved == Path(abs_str)
+
+    def test_roundtrip(self):
+        """to_relative_path → resolve_path gives back the original path."""
+        from src.paths import APP_ROOT, to_relative_path, resolve_path
+
+        original = APP_ROOT / "accounts" / "Камила" / "session.session"
+        rel = to_relative_path(original)
+        resolved = resolve_path(rel)
+        assert resolved == original
+
+
+class TestPreCheckAuthAge:
+    """Verify pre-check rejects expired auth in storage_state.json."""
+
+    def _make_auth(self, tmp_path, profile_name, user_auth_date):
+        """Create a fake profile with storage_state.json."""
+        import json, time
+        profile_dir = tmp_path / profile_name
+        profile_dir.mkdir(parents=True)
+
+        state = {
+            "origins": [{
+                "origin": "https://web.telegram.org",
+                "localStorage": [{
+                    "name": "user_auth",
+                    "value": json.dumps({
+                        "id": 12345,
+                        "date": str(int(user_auth_date)),
+                    }),
+                }],
+            }],
+        }
+        with open(profile_dir / "storage_state.json", "w") as f:
+            json.dump(state, f)
+        return profile_dir
+
+    def test_fresh_auth_passes(self, tmp_path):
+        """Auth from yesterday should pass pre-check."""
+        import time
+        profile_dir = self._make_auth(tmp_path, "fresh", time.time() - 86400)
+
+        from src.telegram_auth import TelegramAuth
+        auth = TelegramAuth.__new__(TelegramAuth)
+        auth.AUTH_TTL_DAYS = 365
+
+        profile = MagicMock()
+        profile.path = profile_dir
+        assert auth._is_profile_already_authorized(profile) is True
+
+    def test_expired_auth_rejected(self, tmp_path):
+        """Auth from 400 days ago should fail pre-check (TTL=365)."""
+        import time
+        profile_dir = self._make_auth(tmp_path, "expired", time.time() - 400 * 86400)
+
+        from src.telegram_auth import TelegramAuth
+        auth = TelegramAuth.__new__(TelegramAuth)
+        auth.AUTH_TTL_DAYS = 365
+
+        profile = MagicMock()
+        profile.path = profile_dir
+        assert auth._is_profile_already_authorized(profile) is False
+
+
 class TestEXEDistStructure:
     """Programmatic check that dist/TGWebAuth/ has required files (if built)."""
 

@@ -800,10 +800,23 @@ class TelegramAuth:
                     if item.get("name") == "user_auth":
                         user_auth = json.loads(item["value"])
                         if user_auth.get("id"):
+                            # Validate auth age — reject if older than TTL
+                            import time as _time
+                            auth_date = user_auth.get("date")
+                            if auth_date:
+                                try:
+                                    age_days = (_time.time() - int(auth_date)) / 86400
+                                    if age_days > self.AUTH_TTL_DAYS:
+                                        logger.info(
+                                            "Pre-check: auth expired (%.0f days old, TTL=%d)",
+                                            age_days, self.AUTH_TTL_DAYS,
+                                        )
+                                        return False
+                                except (ValueError, TypeError):
+                                    pass  # Can't parse date, treat as valid
                             logger.info(
                                 "Pre-check: storage_state.json has user_auth "
-                                "(userId=%s, date=%s)",
-                                user_auth.get("id"),
+                                "(date=%s)",
                                 user_auth.get("date"),
                             )
                             return True

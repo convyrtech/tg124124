@@ -21,6 +21,26 @@ DATA_DIR = APP_ROOT / "data"
 LOGS_DIR = APP_ROOT / "logs"
 
 
+def to_relative_path(abs_path: Path) -> str:
+    """Convert absolute path to relative from APP_ROOT for portable DB storage."""
+    try:
+        return str(abs_path.relative_to(APP_ROOT))
+    except ValueError:
+        return str(abs_path)  # Already relative or different root
+
+
+def resolve_path(db_path: str) -> Path:
+    """Resolve a DB-stored path (possibly relative) to absolute.
+
+    Handles backward compatibility: old DBs store absolute paths,
+    new DBs store relative paths from APP_ROOT.
+    """
+    p = Path(db_path)
+    if p.is_absolute():
+        return p  # Backward compat with old DBs
+    return APP_ROOT / p
+
+
 def _check_ascii_path():
     """Warn if APP_ROOT contains non-ASCII characters that may cause issues."""
     try:

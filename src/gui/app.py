@@ -619,8 +619,9 @@ class TGWebAuthApp:
                             finally:
                                 _conn.close()
                             if rows:
+                                from ..utils import sanitize_error
                                 errors_text = "\n".join(
-                                    f"{r[0]} | {r[1]} | {r[2]}" for r in rows
+                                    f"{r[0]} | {r[1]} | {sanitize_error(str(r[2]))}" for r in rows
                                 )
                                 zf.writestr("recent_errors.txt", errors_text)
                         except Exception as e:
@@ -1027,7 +1028,8 @@ class TGWebAuthApp:
                 # Resolve profile name via AccountConfig (same logic as migration).
                 # DB stores composite name "573189007843 (Kamila)" but profile
                 # directory is created using AccountConfig.name ("Kamila").
-                session_path = Path(account.session_path)
+                from ..paths import resolve_path
+                session_path = resolve_path(account.session_path)
                 account_dir = session_path.parent
                 try:
                     acfg = AccountConfig.load(account_dir)
@@ -1113,7 +1115,8 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._refresh_table_async())
 
                 # Get session directory from database path
-                session_path = Path(account.session_path)
+                from ..paths import resolve_path
+                session_path = resolve_path(account.session_path)
                 session_dir = session_path.parent
 
                 if not session_dir.exists():
@@ -1154,12 +1157,13 @@ class TGWebAuthApp:
                         self._log(f"[Migrate] {account.name} - FAILED: {result.error}")
 
                 except Exception as e:
+                    from ..utils import sanitize_error as _sanitize
                     await self._controller.db.update_account(
                         account_id,
                         status="error",
-                        error_message=str(e)
+                        error_message=_sanitize(str(e))
                     )
-                    self._log(f"[Migrate] {account.name} - ERROR: {e}")
+                    self._log(f"[Migrate] {account.name} - ERROR: {_sanitize(str(e))}")
 
                 self._schedule_ui(lambda: self._refresh_table_async())
 
@@ -1198,7 +1202,8 @@ class TGWebAuthApp:
                     self._log(f"[Fragment] Account {account_id} not found")
                     return
 
-                session_path = Path(account.session_path) if account.session_path else None
+                from ..paths import resolve_path as _resolve_path
+                session_path = _resolve_path(account.session_path) if account.session_path else None
                 if not session_path:
                     self._log(f"[Fragment] Session not found for {account.name}")
                     return

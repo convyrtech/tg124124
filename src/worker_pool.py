@@ -483,7 +483,8 @@ class MigrationWorkerPool:
             )
 
         # Validate session dir exists
-        session_path = Path(account.session_path)
+        from .paths import resolve_path
+        session_path = resolve_path(account.session_path)
         session_dir = session_path.parent
         if not session_dir.exists():
             self._log(f"[W{worker_id}] {name} - SKIP (session dir not found)")
@@ -585,12 +586,22 @@ class MigrationWorkerPool:
                 await self._update_fragment_status_safe(
                     account_id, name, "authorized"
                 )
+                # Update last verified timestamp for fragment
+                try:
+                    from datetime import datetime
+                    await self._db.update_account(
+                        account_id,
+                        web_last_verified=datetime.now().isoformat(),
+                    )
+                except Exception as exc:
+                    logger.warning("DB update verified for %s: %s", name, exc)
             else:
                 username = None
                 if isinstance(auth_result.user_info, dict):
                     username = auth_result.user_info.get("username")
+                from .paths import to_relative_path
                 profile_path = (
-                    str(PROFILES_DIR / auth_result.profile_name)
+                    to_relative_path(PROFILES_DIR / auth_result.profile_name)
                     if auth_result.profile_name else None
                 )
                 await self._complete_migration_safe(
@@ -603,6 +614,16 @@ class MigrationWorkerPool:
                         )
                     except Exception as exc:
                         logger.warning("DB update username for %s: %s", name, exc)
+                # Record web_last_verified + auth_ttl_days on successful web migration
+                try:
+                    from datetime import datetime
+                    await self._db.update_account(
+                        account_id,
+                        web_last_verified=datetime.now().isoformat(),
+                        auth_ttl_days=365,
+                    )
+                except Exception as exc:
+                    logger.warning("DB update verified/ttl for %s: %s", name, exc)
             self._circuit_breaker.record_success()
             self._circuit_breaker.release_half_open_probe()  # FIX #4
             self._log(f"[W{worker_id}] {name} - OK")

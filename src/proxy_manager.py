@@ -134,7 +134,8 @@ class ProxyManager:
                     pass
 
             # Add account if missing
-            session_path_str = str(session_file)
+            from .paths import to_relative_path
+            session_path_str = to_relative_path(session_file)
             try:
                 account_id = await self.db.add_account(
                     name=name,
