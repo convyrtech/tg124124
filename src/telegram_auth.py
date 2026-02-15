@@ -1790,13 +1790,76 @@ class TelegramAuth:
                         telethon_alive=await self._verify_telethon_session(client)
                     )
 
-            # FIX-2.3: Guard against "unknown"/"loading" state fallthrough
+            # FIX-2.3: Recovery reload for "unknown"/"loading" state
             if current_state in ("unknown", "loading"):
                 logger.warning(
                     f"Page state is '{current_state}' after 10s checks — "
-                    "may be CloudFlare, blank page, or slow load. "
-                    "Proceeding with QR extraction but with reduced confidence."
+                    "attempting fresh navigation before QR extraction."
                 )
+                try:
+                    await page.goto(
+                        self.TELEGRAM_WEB_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    await asyncio.sleep(3)
+                    current_state = await self._check_page_state(page)
+                    logger.info("Page state after recovery reload: %s", current_state)
+                    if current_state == "dead":
+                        return AuthResult(
+                            success=False,
+                            profile_name=profile.name,
+                            error="Browser crashed during recovery reload"
+                        )
+                    if current_state == "authorized":
+                        logger.info("Already authorized after recovery reload!")
+                        await self._set_authorization_ttl(client)
+                        if browser_ctx:
+                            browser_ctx.save_state_on_close = True
+                        return AuthResult(
+                            success=True,
+                            profile_name=profile.name,
+                            required_2fa=False,
+                            telethon_alive=await self._verify_telethon_session(client)
+                        )
+                    # FIX: Check 2FA state after recovery reload
+                    if current_state == "2fa_required":
+                        logger.info("2FA required after recovery reload")
+                        if password_2fa:
+                            success = await self._handle_2fa(page, password_2fa)
+                            if success:
+                                auth_ok, _ = await self._wait_for_auth_complete(page, timeout=30)
+                                if auth_ok:
+                                    await self._set_authorization_ttl(client)
+                                    if browser_ctx:
+                                        browser_ctx.save_state_on_close = True
+                                    return AuthResult(
+                                        success=True,
+                                        profile_name=profile.name,
+                                        required_2fa=True,
+                                        telethon_alive=await self._verify_telethon_session(client)
+                                    )
+                        return AuthResult(
+                            success=False,
+                            profile_name=profile.name,
+                            required_2fa=True,
+                            error="2FA password required"
+                        )
+                except Exception as e:
+                    error_str = str(e).lower()
+                    # Unified with primary goto fatal_patterns (line 1689)
+                    fatal_patterns = (
+                        'err_proxy', 'err_tunnel', 'ns_error_proxy',
+                        'err_name_not_resolved', 'connection_refused',
+                        'target closed', 'net::err_name', 'net::err_connection',
+                    )
+                    if any(p in error_str for p in fatal_patterns):
+                        return AuthResult(
+                            success=False,
+                            profile_name=profile.name,
+                            error=f"Recovery reload failed (non-recoverable): {e}"
+                        )
+                    logger.warning("Recovery reload failed (will proceed to QR): %s", e)
 
             # 4. Ждём и декодируем QR (FIX #4: с retry)
             self._status("[4/6] Extracting QR token...")

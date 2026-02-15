@@ -80,7 +80,7 @@ class TGWebAuthApp:
         self._ui_queue: queue.Queue = queue.Queue()
         # Track active browser contexts for cleanup
         self._active_browsers: List = []
-        self._shutting_down: bool = False
+        self._shutting_down = threading.Event()  # Thread-safe shutdown flag
 
         self._active_pool = None
         # Guard against double-click on non-batch buttons (open, import, proxy ops)
@@ -113,9 +113,10 @@ class TGWebAuthApp:
 
     def _run_async(self, coro) -> None:
         """Schedule coroutine on async loop."""
-        if self._loop:
-            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-            future.add_done_callback(self._on_async_done)
+        if self._shutting_down.is_set() or not self._loop or self._loop.is_closed():
+            return
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        future.add_done_callback(self._on_async_done)
 
     def _on_async_done(self, future) -> None:
         """Handle completion of async tasks - log errors only.
@@ -135,6 +136,8 @@ class TGWebAuthApp:
 
     def _schedule_ui(self, func: Callable) -> None:
         """Schedule a function to run on the main UI thread."""
+        if self._shutting_down.is_set():
+            return
         self._ui_queue.put(func)
 
     def _process_ui_queue(self) -> None:
@@ -149,9 +152,9 @@ class TGWebAuthApp:
 
     def _shutdown(self) -> None:
         """Clean shutdown - close all browsers and stop async loop."""
-        if self._shutting_down:
+        if self._shutting_down.is_set():
             return
-        self._shutting_down = True
+        self._shutting_down.set()
         logger.info("Shutting down application...")
 
         # Stop active worker pool — request shutdown and give workers time to finish
@@ -176,7 +179,7 @@ class TGWebAuthApp:
         # Close all tracked browser contexts
         if self._loop and self._active_browsers:
             async def close_browsers():
-                for ctx in self._active_browsers:
+                for ctx in list(self._active_browsers):  # Defensive copy for thread safety
                     try:
                         await ctx.close()
                         logger.info("Closed browser context")
@@ -318,6 +321,7 @@ class TGWebAuthApp:
         # Custom render loop to process UI queue
         while dpg.is_dearpygui_running():
             self._process_ui_queue()
+            self._maybe_periodic_refresh()
             dpg.render_dearpygui_frame()
 
         # Clean shutdown before destroying context
@@ -1048,8 +1052,9 @@ class TGWebAuthApp:
                 try:
                     ctx = await manager.launch(profile, headless=False)
 
-                    # Track browser for cleanup on shutdown
-                    self._active_browsers.append(ctx)
+                    # Track browser for cleanup on shutdown (schedule on main thread for thread safety)
+                    _ctx = ctx
+                    self._schedule_ui(lambda: self._active_browsers.append(_ctx))
 
                     page = await ctx.new_page()
                     await page.goto("https://web.telegram.org/k/")
@@ -1293,12 +1298,37 @@ class TGWebAuthApp:
             if self._active_pool and self._status_cells:
                 # Incremental update during batch — no full rebuild
                 self._schedule_ui(lambda: self._update_status_cells(accounts))
+                # Ensure per-row buttons stay disabled during batch
+                self._schedule_ui(lambda: self._enforce_batch_button_state())
             else:
                 # Full rebuild when no batch is running
                 proxies = await self._controller.db.list_proxies()
                 proxies_map = {p.id: p for p in proxies}
                 self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
         self._run_async(do_refresh())
+
+    def _enforce_batch_button_state(self) -> None:
+        """Re-disable per-row action buttons during active batch operations."""
+        if self._active_pool:
+            toggled = 0
+            for btn_tag in self._row_action_buttons:
+                if dpg.does_item_exist(btn_tag):
+                    dpg.configure_item(btn_tag, enabled=False)
+                    toggled += 1
+            logger.debug("_enforce_batch_button_state: %d buttons disabled", toggled)
+
+    def _maybe_periodic_refresh(self) -> None:
+        """Periodic table refresh during batch ops (every 10s).
+
+        Ensures GUI shows 'migrating' status between on_progress callbacks,
+        which only fire when accounts complete (can take 5+ minutes).
+        """
+        if not self._active_pool or self._active_pool == "pending":
+            return
+        now = time.time()
+        if now - self._last_table_refresh >= 10.0:
+            self._last_table_refresh = now
+            self._refresh_table_async()
 
     def _show_assign_proxy_dialog(self, sender, app_data, user_data) -> None:
         """Show dialog to assign proxy to account."""
@@ -1368,7 +1398,8 @@ class TGWebAuthApp:
             dpg.add_spacer(height=10)
             dpg.add_button(
                 label="Cancel",
-                callback=lambda: dpg.delete_item(dialog_tag),
+                callback=lambda s, a, dt: dpg.delete_item(dt) if dpg.does_item_exist(dt) else None,
+                user_data=dialog_tag,
                 width=100
             )
 
@@ -1402,6 +1433,9 @@ class TGWebAuthApp:
         if self._active_pool:
             self._log("[Migrate] Migration already in progress")
             return
+        # P0 FIX: Set sentinel BEFORE checkbox parsing to prevent double-click race
+        self._active_pool = "pending"
+        self._set_batch_buttons_enabled(False)
         try:
             # Get selected checkboxes
             selected_ids = []
@@ -1412,16 +1446,16 @@ class TGWebAuthApp:
                     if dpg.get_value(checkbox):
                         tag = dpg.get_item_alias(checkbox)
                         if tag and tag.startswith("sel_"):
-                            selected_ids.append(int(tag[4:]))
+                            try:
+                                selected_ids.append(int(tag[4:]))
+                            except (ValueError, TypeError):
+                                logger.warning("Skipping malformed checkbox tag: %s", tag)
 
             if not selected_ids:
                 self._log("[Warning] No accounts selected")
+                self._active_pool = None
+                self._set_batch_buttons_enabled(True)
                 return
-
-            # Disable buttons immediately on main thread
-            self._set_batch_buttons_enabled(False)
-            # P0 FIX: Set sentinel BEFORE _run_async to prevent double-click race
-            self._active_pool = "pending"
             self._log(f"[Migrate] Starting migration of {len(selected_ids)} selected accounts...")
 
             self._run_async(self._batch_migrate(selected_ids))
@@ -1473,9 +1507,12 @@ class TGWebAuthApp:
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, enabled=enabled)
         # Fix #9: Toggle per-row action buttons
+        toggled = 0
         for btn_tag in self._row_action_buttons:
             if dpg.does_item_exist(btn_tag):
                 dpg.configure_item(btn_tag, enabled=enabled)
+                toggled += 1
+        logger.debug("_set_batch_buttons_enabled(%s): %d per-row buttons toggled", enabled, toggled)
 
     def _retry_failed(self, sender=None, app_data=None) -> None:
         """Retry all accounts with status='error'."""
@@ -1513,8 +1550,8 @@ class TGWebAuthApp:
 
     def _stop_migration(self, sender=None, app_data=None) -> None:
         """Stop ongoing migration."""
-        # P1 FIX: Check sentinel - can't call request_shutdown() on "pending" string
-        if not (hasattr(self, '_active_pool') and self._active_pool and self._active_pool != "pending"):
+        # Ensure _active_pool is a real pool object (not "pending" sentinel or None)
+        if not (self._active_pool and hasattr(self._active_pool, 'request_shutdown')):
             return
         # Disable immediately on main thread (not via _schedule_ui) to prevent double-click
         if dpg.does_item_exist("btn_stop"):
