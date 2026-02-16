@@ -22,7 +22,7 @@
 
 Масштаб: **1000 аккаунтов**, переносимость между ПК.
 
-## Current Status (2026-02-12)
+## Current Status (2026-02-16)
 
 ### Что работает
 - Programmatic QR Login (без ручного сканирования)
@@ -55,7 +55,13 @@
 - Proxy credentials stripped from profile_config.json and error messages
 - assign_proxy() checks for already-assigned proxy
 - PyInstaller EXE packaging (one-folder dist, frozen exe support)
-- 326 тестов проходят
+- Portable DB paths (session_path, profile_path stored relative, resolved on read)
+- Pre-check auth age validation (rejects profiles older than AUTH_TTL_DAYS)
+- web_last_verified + auth_ttl_days written on successful migration
+- Empty state UX in GUI table ("Нет аккаунтов. Нажмите Import Sessions")
+- Corrupt session handling (sqlite3.DatabaseError → readable Russian message)
+- Error sanitization in diagnostics ZIP and GUI error messages
+- 354 тестов проходят
 
 ### Pre-production Audit (2026-02-12, commit ee5957b)
 6 критических багов найдены и исправлены:
@@ -77,6 +83,24 @@
 - **P1: IncompleteReadError** — suppress Telethon background reader errors via loop exception handler
 - **P2: Batch pause race** — asyncio.Lock on _completed_count
 - **P2: Debug screenshots** — cleanup keeps last 10 (prevents 240MB accumulation)
+
+### Pre-Delivery Hardening Phase 1 (2026-02-16, commit 04a297f)
+- Empty state UX in GUI table (placeholder when no accounts)
+- Corrupt session sqlite3.DatabaseError handling in telegram_auth + fragment_auth
+- Error humanization in worker_pool._ERROR_MAP (Russian messages)
+- ИНСТРУКЦИЯ.txt updated (system requirements, parallel migration, fragment docs)
+- 9 new targeted tests
+
+### Pre-Delivery Hardening Phase 2 (2026-02-16, commit c8bc945)
+P1 portability + data integrity fixes:
+- **P1: session_path absolute** — to_relative_path() on 3 write points (cli, controllers, proxy_manager), resolve_path() on 4 read points (worker_pool, gui/app ×3)
+- **P1: Pre-check auth age** — validates auth date vs AUTH_TTL_DAYS, rejects stale profiles
+- **P1: web_last_verified NULL** — now written on successful web + fragment migration
+- **P1: auth_ttl_days NULL** — now written = 365 on successful web migration
+- **P2: profile_path absolute** — to_relative_path() in worker_pool
+- **P2: Error leak in diagnostics** — sanitize_error() in ZIP export + GUI single migrate
+- **SyntaxError fix** — elif inside else block in worker_pool.py
+- 15 new tests (path portability, auth age, corrupt session, probe lifecycle, error humanization)
 
 ### Что НЕ работает / НЕ доделано
 - **FIX-005** - 2FA selector hardcoded (P2)
@@ -133,7 +157,7 @@ Camoufox → fragment.com → Click "Log in"
 Browser ──HTTP──> pproxy (localhost:random) ──SOCKS5+auth──> Remote Proxy
 ```
 
-## File Structure (11156 строк src/, 326 тестов)
+## File Structure (12488 строк src/, 354 тестов)
 ```
 tg-web-auth/
 ├── accounts/                # Исходные session файлы (.gitignore)
@@ -145,27 +169,27 @@ tg-web-auth/
 ├── data/                    # SQLite database (.gitignore)
 │   └── tgwebauth.db
 ├── src/                     # 11156 строк
-│   ├── telegram_auth.py     # QR auth + AcceptLoginToken (2454 строк)
-│   ├── fragment_auth.py     # Fragment.com OAuth popup + fragment_account() (742 строк)
-│   ├── browser_manager.py   # Camoufox + ProfileLifecycleManager + PID kill (849 строк)
-│   ├── worker_pool.py       # Asyncio queue pool, mode web/fragment (746 строк)
-│   ├── cli.py               # CLI 9 команд (1291 строк)
-│   ├── database.py          # SQLite: accounts, proxies, migrations, WAL (1073 строк)
-│   ├── proxy_manager.py     # Import, health check, auto-replace (438 строк)
+│   ├── telegram_auth.py     # QR auth + AcceptLoginToken (2678 строк)
+│   ├── fragment_auth.py     # Fragment.com OAuth popup + fragment_account() (893 строк)
+│   ├── browser_manager.py   # Camoufox + ProfileLifecycleManager + PID kill (950 строк)
+│   ├── worker_pool.py       # Asyncio queue pool, mode web/fragment (859 строк)
+│   ├── cli.py               # CLI 9 команд (1406 строк)
+│   ├── database.py          # SQLite: accounts, proxies, migrations, WAL (1213 строк)
+│   ├── proxy_manager.py     # Import, health check, auto-replace (474 строк)
 │   ├── proxy_relay.py       # SOCKS5→HTTP relay via pproxy (329 строк)
 │   ├── proxy_health.py      # Batch TCP check (244 строк)
 │   ├── resource_monitor.py  # CPU/RAM monitoring (162 строк)
 │   ├── security_check.py    # Fingerprint/WebRTC check (380 строк)
-│   ├── paths.py             # Centralized path resolution (dev + frozen exe)
+│   ├── paths.py             # Centralized path resolution + portable DB helpers (59 строк)
 │   ├── exception_handler.py # Global crash hook (sys.excepthook + asyncio)
 │   ├── utils.py             # Proxy parsing helpers (103 строк)
 │   ├── logger.py            # Logging setup + RotatingFileHandler (115 строк)
 │   ├── pproxy_wrapper.py    # pproxy process (dev mode only, 23 строк)
 │   └── gui/
-│       ├── app.py           # DearPyGui main window + diagnostics (1720 строк)
-│       ├── controllers.py   # GUI business logic (266 строк)
+│       ├── app.py           # DearPyGui main window + diagnostics (1999 строк)
+│       ├── controllers.py   # GUI business logic (299 строк)
 │       └── theme.py         # Hacker dark green theme (99 строк)
-├── tests/                   # 326 тестов
+├── tests/                   # 354 тестов
 │   ├── test_telegram_auth.py
 │   ├── test_fragment_auth.py
 │   ├── test_browser_manager.py
@@ -254,7 +278,7 @@ python -m src.gui.app                                  # Запуск GUI
 
 ### Тесты
 ```bash
-pytest                    # Все 326 тестов
+pytest                    # Все 354 тестов
 pytest -v                 # Verbose
 pytest tests/test_proxy_manager.py -v  # Конкретный файл
 ```
@@ -311,7 +335,7 @@ operation_log (id, account_id, operation, success, error_message,
 ## Quality Gates
 
 ### Перед завершением любой задачи
-1. [ ] `pytest` проходит без ошибок (326 тестов)
+1. [ ] `pytest` проходит без ошибок (354 тестов)
 2. [ ] Self-review на типичные ошибки
 3. [ ] Нет секретов в логах
 4. [ ] Все ресурсы закрываются (async with, try/finally)
