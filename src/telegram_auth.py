@@ -2463,7 +2463,9 @@ class ParallelMigrationController:
                     if on_progress:
                         try:
                             cb_result = on_progress(self._completed, self._total, result)
-                            if asyncio.iscoroutine(cb_result):
+                            if cb_result is not None and (
+                                asyncio.iscoroutine(cb_result) or asyncio.isfuture(cb_result)
+                            ):
                                 await cb_result
                         except Exception as e:
                             logger.warning(f"Progress callback error: {e}")

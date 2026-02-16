@@ -831,7 +831,7 @@ class FragmentAuth:
             # Disconnect Telethon
             if client:
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), timeout=5)
                 except BaseException as e:
                     logger.debug("Error disconnecting Telethon: %s", e)
 

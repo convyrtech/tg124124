@@ -50,8 +50,8 @@ def _kill_orphan_children() -> None:
                 logger.debug("Killed orphan process: PID=%d (%s)", child.pid, child.name())
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-    except Exception:
-        pass  # Best-effort cleanup on exit
+    except Exception as e:
+        logger.debug("Orphan cleanup error: %s", e)
 
 
 atexit.register(_kill_orphan_children)
@@ -73,6 +73,8 @@ try:
 except ImportError as e:
     raise ImportError("click not installed. Run: pip install click") from e
 
+
+from datetime import UTC
 
 from .paths import ACCOUNTS_DIR, DATA_DIR, PROFILES_DIR
 
@@ -295,6 +297,30 @@ def migrate(
         if result.success:
             click.echo(click.style(f"\n✓ Успешно: {result.profile_name}", fg="green"))
             click.echo(f"  Telethon session alive: {result.telethon_alive}")
+
+            # Update DB with migration result (timestamps, status)
+            async def _update_db_after_success():
+                from datetime import datetime
+
+                db = await _connect_db()
+                try:
+                    accounts = await db.list_accounts(search=account_dir.name)
+                    for acc in accounts:
+                        if acc.name == account_dir.name:
+                            await db.update_account(
+                                acc.id,
+                                status="healthy",
+                                web_last_verified=datetime.now(UTC).isoformat(),
+                                auth_ttl_days=365,
+                            )
+                            break
+                finally:
+                    await db.close()
+
+            try:
+                asyncio.run(_update_db_after_success())
+            except Exception as e:
+                logger.warning("DB update after CLI migrate: %s", e)
         else:
             click.echo(click.style(f"\n✗ Ошибка: {result.error}", fg="red"))
             sys.exit(1)
@@ -463,7 +489,7 @@ def migrate(
             )
 
             # Signal handler для graceful shutdown
-            def handle_signal(signum, frame):
+            def handle_signal(signum, _frame):
                 click.echo("\nПолучен сигнал прерывания...")
                 controller.request_shutdown()
 
@@ -838,7 +864,10 @@ def health(account: str):
             except Exception as e:
                 return None, str(e)
             finally:
-                await client.disconnect()
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=5)
+                except Exception:
+                    pass
 
         try:
             me, error = asyncio.run(check_telethon())
@@ -870,8 +899,8 @@ def health(account: str):
             with open(config_file, encoding="utf-8") as f:
                 config = json.load(f)
             profile_name = config.get("Name", profile_name)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Config read failed for %s, using dir name: %s", config_file, e)
 
     profile = manager.get_profile(profile_name)
 
@@ -1359,7 +1388,10 @@ def preflight():
                         else:
                             dead_count += 1
                     finally:
-                        await client.disconnect()
+                        try:
+                            await asyncio.wait_for(client.disconnect(), timeout=5)
+                        except Exception:
+                            pass
                 except Exception as e:
                     dead_count += 1
                     logger.debug(f"Preflight session check failed for {acct_dir.name}: {e}")

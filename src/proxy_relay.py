@@ -196,10 +196,15 @@ class ProxyRelay:
         """Start pproxy relay as subprocess (dev mode)."""
         wrapper_path = os.path.join(os.path.dirname(__file__), "pproxy_wrapper.py")
 
-        cmd = [sys.executable, wrapper_path, "-l", listen_uri, "-r", remote_uri, "-v"]
+        cmd = [sys.executable, wrapper_path, "-l", listen_uri, "-v"]
+
+        # Pass remote URI via environment variable to avoid exposing
+        # proxy credentials in process command line (visible in Task Manager)
+        env = os.environ.copy()
+        env["PPROXY_REMOTE"] = remote_uri
 
         self._process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env
         )
 
         await asyncio.sleep(0.5)
@@ -341,9 +346,9 @@ async def test_relay():
 
     proxy = sys.argv[1]
     # Mask credentials in log output
-    masked = proxy.split(":")
-    if len(masked) == 5:
-        masked = f"{masked[0]}:{masked[1]}:{masked[2]}:***:***"
+    proxy_parts = proxy.split(":")
+    if len(proxy_parts) == 5:
+        masked = f"{proxy_parts[0]}:{proxy_parts[1]}:{proxy_parts[2]}:***:***"
     else:
         masked = proxy
     logger.info("Testing proxy: %s", masked)

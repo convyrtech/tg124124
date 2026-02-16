@@ -8,7 +8,7 @@ import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,9 @@ class AccountRecord:
     last_check: datetime | None
     error_message: str | None
     created_at: datetime
-    fragment_status: str | None = None  # None, "authorized"
+    fragment_status: str | None = None
+    web_last_verified: str | None = None
+    auth_ttl_days: int | None = None  # None, "authorized"
 
 
 @dataclass
@@ -314,6 +316,8 @@ class Database:
                     error_message=row["error_message"],
                     created_at=row["created_at"],
                     fragment_status=row["fragment_status"],
+                    web_last_verified=row["web_last_verified"],
+                    auth_ttl_days=row["auth_ttl_days"],
                 )
             return None
 
@@ -348,6 +352,8 @@ class Database:
                     error_message=row["error_message"],
                     created_at=row["created_at"],
                     fragment_status=row["fragment_status"],
+                    web_last_verified=row["web_last_verified"],
+                    auth_ttl_days=row["auth_ttl_days"],
                 )
                 for row in rows
             ]
@@ -646,7 +652,7 @@ class Database:
                 INSERT INTO migrations (account_id, started_at)
                 VALUES (?, ?)
                 """,
-                (account_id, datetime.now(timezone.utc).isoformat()),
+                (account_id, datetime.now(UTC).isoformat()),
             ) as cursor:
                 migration_id = cursor.lastrowid
             await self._commit_with_retry()
@@ -719,6 +725,8 @@ class Database:
                     error_message=row["error_message"],
                     created_at=row["created_at"],
                     fragment_status=row["fragment_status"],
+                    web_last_verified=row["web_last_verified"],
+                    auth_ttl_days=row["auth_ttl_days"],
                 )
                 for row in rows
             ]
@@ -829,10 +837,10 @@ class Database:
         async with self._db_lock:
             # FIX D3: Auto-close orphaned batches from previous crashes
             await self._connection.execute(
-                "UPDATE batches SET finished_at = ? WHERE finished_at IS NULL", (datetime.now(timezone.utc).isoformat(),)
+                "UPDATE batches SET finished_at = ? WHERE finished_at IS NULL", (datetime.now(UTC).isoformat(),)
             )
 
-            batch_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+            batch_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
 
             async with self._connection.execute(
                 """

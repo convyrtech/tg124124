@@ -18,6 +18,7 @@ import logging
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC
 
 from .browser_manager import BrowserManager
 from .database import AccountRecord, Database
@@ -184,6 +185,14 @@ class MigrationWorkerPool:
         if not account_ids:
             return PoolResult()
 
+        # C7: Reset accounts stuck in "migrating" from a previous crash/shutdown
+        try:
+            reset_count = await self._db.reset_interrupted_migrations()
+            if reset_count:
+                self._log(f"[Pool] Reset {reset_count} stuck 'migrating' accounts from previous run")
+        except Exception as e:
+            logger.warning("Failed to reset stale migrating accounts: %s", e)
+
         # FIX #6: Deduplicate to prevent two workers opening same .session
         # (AUTH_KEY_DUPLICATED = session death). Preserves order.
         account_ids = list(dict.fromkeys(account_ids))
@@ -297,7 +306,9 @@ class MigrationWorkerPool:
             try:
                 try:
                     account_result = await self._process_account(worker_id, total, account_id)
-                except Exception as exc:
+                except BaseException as exc:
+                    # BaseException catches CancelledError (Python 3.11+)
+                    # so accounts don't stay stuck in "migrating" on shutdown
                     logger.exception(
                         "[W%d] Unhandled error processing account %d: %s",
                         worker_id,
@@ -309,8 +320,11 @@ class MigrationWorkerPool:
                         await self._db.update_account(
                             account_id, status="error", error_message=f"Internal error: {exc}"
                         )
-                    except Exception:
-                        pass  # DB update is best-effort
+                    except Exception as db_err:
+                        logger.warning("Failed to mark account %d as error: %s", account_id, db_err)
+                    # Re-raise CancelledError after cleanup
+                    if isinstance(exc, asyncio.CancelledError | KeyboardInterrupt):
+                        raise
                     account_result = AccountResult(
                         account_id=account_id,
                         account_name=f"id={account_id}",
@@ -546,11 +560,11 @@ class MigrationWorkerPool:
                 await self._update_fragment_status_safe(account_id, name, "authorized")
                 # Update last verified timestamp for fragment
                 try:
-                    from datetime import datetime, timezone
+                    from datetime import datetime
 
                     await self._db.update_account(
                         account_id,
-                        web_last_verified=datetime.now(timezone.utc).isoformat(),
+                        web_last_verified=datetime.now(UTC).isoformat(),
                     )
                 except Exception as exc:
                     logger.warning("DB update verified for %s: %s", name, exc)
@@ -571,11 +585,11 @@ class MigrationWorkerPool:
                         logger.warning("DB update username for %s: %s", name, exc)
                 # Record web_last_verified + auth_ttl_days on successful web migration
                 try:
-                    from datetime import datetime, timezone
+                    from datetime import datetime
 
                     await self._db.update_account(
                         account_id,
-                        web_last_verified=datetime.now(timezone.utc).isoformat(),
+                        web_last_verified=datetime.now(UTC).isoformat(),
                         auth_ttl_days=365,
                     )
                 except Exception as exc:
@@ -658,7 +672,7 @@ class MigrationWorkerPool:
         "2fa password",
         "unique constraint",
         "auth_key_duplicated",
-        "auth_restart",  # AuthRestartError — stale token, retry won't help
+        "authrestart",  # AuthRestartError — stale token, retry won't help
         "session file corrupted",  # Corrupt .session file
     )
 

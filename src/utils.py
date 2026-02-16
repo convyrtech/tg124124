@@ -109,7 +109,7 @@ def mask_proxy_credentials(proxy_str: str) -> str:
 
 # Regex patterns for credential-like data in error messages
 _PROXY_PATTERN = re.compile(
-    r"(socks[45]?|https?|http)([:/]+)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)(:\S+:\S+)", re.IGNORECASE
+    r"(socks[45]?|https?|http)([:/]+)([a-zA-Z0-9._-]+:\d+)(:\S+:\S+)", re.IGNORECASE
 )
 _CREDENTIAL_URI_PATTERN = re.compile(
     r"://([^:@]+):([^@]+)@",

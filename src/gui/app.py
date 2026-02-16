@@ -9,12 +9,14 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from datetime import UTC
 from pathlib import Path
 
 import dearpygui.dearpygui as dpg
 
 from .. import __version__
 from ..database import AccountRecord
+from ..utils import sanitize_error as _se
 from .controllers import AppController
 from .theme import create_hacker_theme, create_status_themes
 
@@ -136,7 +138,7 @@ class TGWebAuthApp:
             future.result()
         except Exception as e:
             logger.exception("Async task failed: %s\n%s", e, traceback.format_exc())
-            self._log(f"[Error] Background task failed: {e}")
+            self._log(f"[Error] Background task failed: {_se(str(e))}")
 
     def _schedule_ui(self, func: Callable) -> None:
         """Schedule a function to run on the main UI thread."""
@@ -152,7 +154,7 @@ class TGWebAuthApp:
                 func()
             except Exception as e:
                 logger.exception("UI queue error: %s", e)
-                self._log(f"[Error] UI update failed: {e}")
+                self._log(f"[Error] UI update failed: {_se(str(e))}")
 
     def _shutdown(self) -> None:
         """Clean shutdown - close all browsers and stop async loop."""
@@ -606,7 +608,7 @@ class TGWebAuthApp:
 
         except Exception as e:
             logger.exception("Collect diagnostics error: %s\n%s", e, traceback.format_exc())
-            self._log(f"[Error] Diagnostics: {e}")
+            self._log(f"[Error] Diagnostics: {_se(str(e))}")
             self._schedule_ui(lambda: dpg.set_value("diagnostics_status", "Error!"))
         finally:
             self._busy_ops.discard("collect_diagnostics")
@@ -647,7 +649,7 @@ class TGWebAuthApp:
             self._initial_load()
         except Exception as e:
             logger.exception("2FA submit error: %s\n%s", e, traceback.format_exc())
-            self._log(f"[Error] 2FA: {e}")
+            self._log(f"[Error] 2FA: {_se(str(e))}")
 
     def _on_2fa_skip(self, sender=None, app_data=None) -> None:
         """Skip 2FA password."""
@@ -679,7 +681,7 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._update_proxies_table_sync(proxies, accounts_map))
             except Exception as e:
                 logger.exception("Initial load error: %s", e)
-                self._log(f"[Error] Initial load: {e}")
+                self._log(f"[Error] Initial load: {_se(str(e))}")
 
         self._run_async(do_load())
 
@@ -750,7 +752,7 @@ class TGWebAuthApp:
 
                 except Exception as e:
                     logger.exception("Import error: %s\n%s", e, traceback.format_exc())
-                    self._log(f"[Error] Import failed: {e}")
+                    self._log(f"[Error] Import failed: {_se(str(e))}")
                 finally:
                     self._busy_ops.discard("import_sessions")
 
@@ -758,7 +760,7 @@ class TGWebAuthApp:
 
         except Exception as e:
             logger.exception("Import dialog error: %s\n%s", e, traceback.format_exc())
-            self._log(f"[Error] Import: {e}")
+            self._log(f"[Error] Import: {_se(str(e))}")
             self._busy_ops.discard("import_sessions")
 
     def _update_stats_sync(self, stats: dict) -> None:
@@ -859,7 +861,7 @@ class TGWebAuthApp:
 
         except Exception as e:
             logger.exception("Update accounts table error: %s\n%s", e, traceback.format_exc())
-            self._log(f"[Error] Table update: {e}")
+            self._log(f"[Error] Table update: {_se(str(e))}")
 
     def _update_proxies_table_sync(self, proxies: list, accounts_map: dict = None) -> None:
         """Update proxies table on main thread."""
@@ -899,7 +901,7 @@ class TGWebAuthApp:
             self._log(f"[UI] Loaded {len(proxies)} proxies")
         except Exception as e:
             logger.exception("Update proxies table error: %s\n%s", e, traceback.format_exc())
-            self._log(f"[Error] Proxies table: {e}")
+            self._log(f"[Error] Proxies table: {_se(str(e))}")
 
     def _delete_proxy(self, sender, app_data, user_data) -> None:
         """Delete a proxy."""
@@ -920,7 +922,7 @@ class TGWebAuthApp:
 
             except Exception as e:
                 logger.exception("Delete proxy error: %s", e)
-                self._log(f"[Error] Delete proxy: {e}")
+                self._log(f"[Error] Delete proxy: {_se(str(e))}")
 
         self._run_async(do_delete())
 
@@ -936,7 +938,7 @@ class TGWebAuthApp:
                     self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
                 except Exception as e:
                     logger.exception("Search error: %s", e)
-                    self._log(f"[Error] Search: {e}")
+                    self._log(f"[Error] Search: {_se(str(e))}")
 
             self._run_async(do_search())
         except Exception as e:
@@ -1003,8 +1005,8 @@ class TGWebAuthApp:
                         with open(profile.config_path, encoding="utf-8") as f:
                             config = json.load(f)
                             profile.proxy = config.get("proxy")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Proxy config read failed for %s: %s", profile.config_path, e)
 
                 # Launch browser - track manager for cleanup on failure
                 ctx = None
@@ -1026,7 +1028,7 @@ class TGWebAuthApp:
                     raise
             except Exception as e:
                 logger.exception("Open profile error: %s\n%s", e, traceback.format_exc())
-                self._log(f"[Error] Open: {e}")
+                self._log(f"[Error] Open: {_se(str(e))}")
             finally:
                 self._busy_ops.discard(op_key)
 
@@ -1089,11 +1091,15 @@ class TGWebAuthApp:
                     )
 
                     if result.success:
+                        from datetime import datetime
+
                         await self._controller.db.update_account(
                             account_id,
                             status="healthy",
                             username=result.user_info.get("username") if result.user_info else None,
                             error_message=None,
+                            web_last_verified=datetime.now(UTC).isoformat(),
+                            auth_ttl_days=365,
                         )
                         self._log(f"[Migrate] {account.name} - SUCCESS")
                         if result.user_info:
@@ -1114,11 +1120,11 @@ class TGWebAuthApp:
 
             except Exception as e:
                 logger.exception("Migrate error: %s\n%s", e, traceback.format_exc())
-                self._log(f"[Error] Migrate: {e}")
+                self._log(f"[Error] Migrate: {_se(str(e))}")
                 try:
                     await self._controller.db.update_account(account_id, status="error")
-                except Exception:
-                    pass
+                except Exception as db_err:
+                    logger.warning("Failed to mark account %d as error in DB: %s", account_id, db_err)
                 self._schedule_ui(lambda: self._refresh_table_async())
             finally:
                 self._busy_ops.discard(op_key)
@@ -1168,7 +1174,7 @@ class TGWebAuthApp:
                 try:
                     config = AccountConfig.load(session_dir)
                 except Exception as e:
-                    self._log(f"[Fragment] Config load error: {e}")
+                    self._log(f"[Fragment] Config load error: {_se(str(e))}")
                     return
 
                 # Apply proxy from DB
@@ -1183,9 +1189,15 @@ class TGWebAuthApp:
                     result = await asyncio.wait_for(auth.connect(headless=False), timeout=300)
 
                     if result.success:
+                        from datetime import datetime
+
                         status = "already authorized" if result.already_authorized else "connected"
                         self._log(f"[Fragment] {account.name} - {status}")
-                        await self._controller.db.update_account(account_id, fragment_status="authorized")
+                        await self._controller.db.update_account(
+                            account_id,
+                            fragment_status="authorized",
+                            web_last_verified=datetime.now(UTC).isoformat(),
+                        )
                     else:
                         self._log(f"[Fragment] {account.name} - FAILED: {result.error}")
                 finally:
@@ -1195,7 +1207,7 @@ class TGWebAuthApp:
 
             except Exception as e:
                 logger.exception("Fragment error: %s\n%s", e, traceback.format_exc())
-                self._log(f"[Error] Fragment: {e}")
+                self._log(f"[Error] Fragment: {_se(str(e))}")
             finally:
                 self._busy_ops.discard(op_key)
 
@@ -1303,7 +1315,7 @@ class TGWebAuthApp:
 
             except Exception as e:
                 logger.exception("Show assign proxy dialog error: %s", e)
-                self._log(f"[Error] Proxy dialog: {e}")
+                self._log(f"[Error] Proxy dialog: {_se(str(e))}")
 
         self._run_async(show_dialog())
 
@@ -1373,7 +1385,7 @@ class TGWebAuthApp:
 
             except Exception as e:
                 logger.exception("Assign proxy error: %s", e)
-                self._log(f"[Error] Assign: {e}")
+                self._log(f"[Error] Assign: {_se(str(e))}")
 
         self._run_async(do_assign())
 
@@ -1410,7 +1422,7 @@ class TGWebAuthApp:
             self._run_async(self._batch_migrate(selected_ids))
         except Exception as e:
             logger.exception("Migrate selected error: %s", e)
-            self._log(f"[Error] Migrate: {e}")
+            self._log(f"[Error] Migrate: {_se(str(e))}")
             self._active_pool = None
             self._set_batch_buttons_enabled(True)
 
@@ -1439,7 +1451,7 @@ class TGWebAuthApp:
                 await self._batch_migrate(ids)
             except Exception as e:
                 logger.exception("get_pending_ids error: %s\n%s", e, traceback.format_exc())
-                self._log(f"[Error] get_pending_ids: {e}")
+                self._log(f"[Error] get_pending_ids: {_se(str(e))}")
                 self._active_pool = None
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
                 self._schedule_ui(lambda: self._reset_stop_button())
@@ -1490,7 +1502,7 @@ class TGWebAuthApp:
                 await self._batch_migrate(ids)
             except Exception as e:
                 logger.exception("get_error_ids error: %s\n%s", e, traceback.format_exc())
-                self._log(f"[Error] get_error_ids: {e}")
+                self._log(f"[Error] get_error_ids: {_se(str(e))}")
                 self._active_pool = None
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
                 self._schedule_ui(lambda: self._reset_stop_button())
@@ -1558,7 +1570,7 @@ class TGWebAuthApp:
 
         except BaseException as e:
             logger.exception("Batch migrate error: %s\n%s", e, traceback.format_exc())
-            self._log(f"[Error] Batch migrate: {e}")
+            self._log(f"[Error] Batch migrate: {_se(str(e))}")
         finally:
             # P0 FIX: Always reset pool in finally for clean state
             self._active_pool = None
@@ -1592,7 +1604,7 @@ class TGWebAuthApp:
                 await self._batch_fragment(ids)
             except Exception as e:
                 logger.exception("get_healthy_ids error: %s\n%s", e, traceback.format_exc())
-                self._log(f"[Error] get_healthy_ids: {e}")
+                self._log(f"[Error] get_healthy_ids: {_se(str(e))}")
                 self._active_pool = None
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
                 self._schedule_ui(lambda: self._reset_stop_button())
@@ -1633,7 +1645,7 @@ class TGWebAuthApp:
 
         except BaseException as e:
             logger.exception("Batch fragment error: %s\n%s", e, traceback.format_exc())
-            self._log(f"[Error] Batch fragment: {e}")
+            self._log(f"[Error] Batch fragment: {_se(str(e))}")
         finally:
             # P0 FIX: Always reset pool in finally for clean state
             self._active_pool = None
@@ -1682,7 +1694,7 @@ class TGWebAuthApp:
 
             except Exception as e:
                 logger.exception("Auto-assign error: %s", e)
-                self._log(f"[Error] Auto-assign: {e}")
+                self._log(f"[Error] Auto-assign: {_se(str(e))}")
             finally:
                 self._busy_ops.discard("auto_assign")
 
@@ -1724,7 +1736,7 @@ class TGWebAuthApp:
                     self._schedule_ui(lambda: self._update_proxies_table_sync(proxies, accounts_map))
                 except Exception as e:
                     logger.exception("Proxy import error: %s\n%s", e, traceback.format_exc())
-                    self._log(f"[Error] Proxy import: {e}")
+                    self._log(f"[Error] Proxy import: {_se(str(e))}")
                 finally:
                     self._busy_ops.discard("import_proxies")
 
@@ -1732,7 +1744,7 @@ class TGWebAuthApp:
 
         except Exception as e:
             logger.exception("Show proxy import dialog error: %s\n%s", e, traceback.format_exc())
-            self._log(f"[Error] Proxy import: {e}")
+            self._log(f"[Error] Proxy import: {_se(str(e))}")
             self._busy_ops.discard("import_proxies")
 
     def _check_all_proxies(self, sender=None, app_data=None) -> None:
@@ -1760,7 +1772,7 @@ class TGWebAuthApp:
                 results = await asyncio.gather(*(check_one(p) for p in proxies), return_exceptions=True)
 
                 for result in results:
-                    if isinstance(result, Exception):
+                    if isinstance(result, BaseException):
                         dead += 1
                         continue
                     proxy, is_alive = result
@@ -1783,7 +1795,7 @@ class TGWebAuthApp:
 
             except Exception as e:
                 logger.exception("Check proxies error: %s\n%s", e, traceback.format_exc())
-                self._log(f"[Error] Proxy check: {e}")
+                self._log(f"[Error] Proxy check: {_se(str(e))}")
             finally:
                 self._busy_ops.discard("check_proxies")
 
@@ -1827,7 +1839,7 @@ class TGWebAuthApp:
 
             except Exception as e:
                 logger.exception("Replace dead proxies error: %s", e)
-                self._log(f"[Error] Replace dead: {e}")
+                self._log(f"[Error] Replace dead: {_se(str(e))}")
             finally:
                 self._busy_ops.discard("replace_dead")
 
@@ -1867,8 +1879,8 @@ def _startup_health_check() -> None:
                 + "Extract to Desktop or C:\\TGWebAuth\\ instead.",
             )
             root.destroy()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to show tkinter error dialog: %s", e)
         raise SystemExit(1) from None
 
     # Check Camoufox binary
@@ -1914,8 +1926,8 @@ def _startup_health_check() -> None:
                 )
             messagebox.showerror("TG Web Auth — Error", msg)
             root.destroy()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to show tkinter warning dialog: %s", e)
         logger.warning("Camoufox binary not found — migration will fail")
 
 
