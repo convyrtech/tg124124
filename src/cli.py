@@ -8,18 +8,19 @@ TG Web Auth CLI
     list     - Список профилей и аккаунтов
     check    - Проверить безопасность (fingerprint, proxy leaks)
 """
+
 import asyncio
 import atexit
 import logging
+import os
 import random
 import sys
-import os
 from pathlib import Path
 from typing import Optional
 
 import psutil
 
-from .logger import setup_logging, get_logger
+from .logger import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
@@ -37,9 +38,9 @@ def _kill_orphan_children() -> None:
         for c in children:
             try:
                 name = c.name().lower()
-                if any(n in name for n in ('camoufox', 'firefox')):
+                if any(n in name for n in ("camoufox", "firefox")):
                     targets.append(c)
-                elif 'pproxy' in ' '.join(c.cmdline()).lower():
+                elif "pproxy" in " ".join(c.cmdline()).lower():
                     targets.append(c)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
@@ -60,12 +61,12 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 # FIX #7: WINDOWS ENCODING
-if sys.platform == 'win32':
+if sys.platform == "win32":
     # Устанавливаем UTF-8 для консоли Windows
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     # Также устанавливаем переменную окружения для Python
-    os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 try:
     import click
@@ -93,7 +94,7 @@ def find_account_dirs() -> list[Path]:
     return list(set(account_dirs))
 
 
-def get_account_dir(name: str) -> Optional[Path]:
+def get_account_dir(name: str) -> Path | None:
     """Находит директорию аккаунта по имени"""
     # Точное совпадение
     exact = ACCOUNTS_DIR / name
@@ -108,7 +109,7 @@ def get_account_dir(name: str) -> Optional[Path]:
     return None
 
 
-def get_2fa_password(account_name: str, provided_password: Optional[str]) -> Optional[str]:
+def get_2fa_password(account_name: str, provided_password: str | None) -> str | None:
     """
     FIX #8: Безопасное получение 2FA пароля.
 
@@ -121,9 +122,9 @@ def get_2fa_password(account_name: str, provided_password: Optional[str]) -> Opt
         return provided_password
 
     # Проверяем env
-    env_password = os.environ.get('TG_2FA_PASSWORD')
+    env_password = os.environ.get("TG_2FA_PASSWORD")
     if env_password:
-        click.echo(f"[2FA] Using password from TG_2FA_PASSWORD env var")
+        click.echo("[2FA] Using password from TG_2FA_PASSWORD env var")
         return env_password
 
     # Не спрашиваем интерактивно - возвращаем None
@@ -142,35 +143,48 @@ def cli():
 @click.option("--all", "migrate_all", is_flag=True, help="Мигрировать все аккаунты")
 @click.option("--password", "-p", help="2FA пароль (или используйте env TG_2FA_PASSWORD)")
 @click.option("--headless", is_flag=True, help="Запуск без GUI")
-@click.option("--cooldown", "-c", default=DEFAULT_COOLDOWN, type=int,
-              help=f"Секунды между аккаунтами при --all (default: {DEFAULT_COOLDOWN})")
-@click.option("--parallel", "-j", type=int, default=0,
-              help="Параллельные браузеры (0=последовательно, 10=рекомендуется)")
-@click.option("--auto-scale", is_flag=True,
-              help="Автоматически подбирать параллельность по ресурсам")
-@click.option("--resume", is_flag=True,
-              help="Продолжить прерванную миграцию (только pending аккаунты)")
-@click.option("--retry-failed", is_flag=True,
-              help="Повторить только упавшие аккаунты")
-@click.option("--fresh", is_flag=True,
-              help="Удалить browser_data перед retry (сбросить кэш 2FA)")
-@click.option("--password-file", type=click.Path(exists=True),
-              help="JSON файл с паролями 2FA: {\"account_name\": \"password\"}")
-@click.option("--status", "show_status", is_flag=True,
-              help="Показать статус текущего batch и выйти")
-@click.option("--no-proxy", is_flag=True,
-              help="Игнорировать все прокси (для тестирования без VPN/proxy)")
-def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
-            headless: bool, cooldown: int, parallel: int, auto_scale: bool,
-            resume: bool, retry_failed: bool, fresh: bool,
-            password_file: Optional[str], show_status: bool, no_proxy: bool):
+@click.option(
+    "--cooldown",
+    "-c",
+    default=DEFAULT_COOLDOWN,
+    type=int,
+    help=f"Секунды между аккаунтами при --all (default: {DEFAULT_COOLDOWN})",
+)
+@click.option(
+    "--parallel", "-j", type=int, default=0, help="Параллельные браузеры (0=последовательно, 10=рекомендуется)"
+)
+@click.option("--auto-scale", is_flag=True, help="Автоматически подбирать параллельность по ресурсам")
+@click.option("--resume", is_flag=True, help="Продолжить прерванную миграцию (только pending аккаунты)")
+@click.option("--retry-failed", is_flag=True, help="Повторить только упавшие аккаунты")
+@click.option("--fresh", is_flag=True, help="Удалить browser_data перед retry (сбросить кэш 2FA)")
+@click.option(
+    "--password-file", type=click.Path(exists=True), help='JSON файл с паролями 2FA: {"account_name": "password"}'
+)
+@click.option("--status", "show_status", is_flag=True, help="Показать статус текущего batch и выйти")
+@click.option("--no-proxy", is_flag=True, help="Игнорировать все прокси (для тестирования без VPN/proxy)")
+def migrate(
+    account: str | None,
+    migrate_all: bool,
+    password: str | None,
+    headless: bool,
+    cooldown: int,
+    parallel: int,
+    auto_scale: bool,
+    resume: bool,
+    retry_failed: bool,
+    fresh: bool,
+    password_file: str | None,
+    show_status: bool,
+    no_proxy: bool,
+):
     """Мигрировать аккаунт(ы) из session в browser profile"""
     import json
     import shutil
     import signal
     import sqlite3
-    from .telegram_auth import migrate_account, migrate_accounts_batch, ParallelMigrationController
+
     from .database import Database
+    from .telegram_auth import ParallelMigrationController, migrate_account, migrate_accounts_batch
 
     DB_PATH = Path("data/tgwebauth.db")
 
@@ -178,7 +192,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
     passwords_map: dict = {}
     if password_file:
         try:
-            with open(password_file, 'r', encoding='utf-8') as f:
+            with open(password_file, encoding="utf-8") as f:
                 passwords_map = json.load(f)
             click.echo(f"Loaded {len(passwords_map)} passwords from {password_file}")
         except Exception as e:
@@ -198,6 +212,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
 
     # Handle --status flag
     if show_status:
+
         async def _show_status():
             db = await _connect_db()
             try:
@@ -218,9 +233,11 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                     else:
                         click.echo("Status: IN PROGRESS")
 
-                click.echo(f"\nDB Stats: {stats['total']} accounts, "
-                           f"{stats['healthy']} healthy, {stats['error']} error, "
-                           f"{stats['pending']} pending")
+                click.echo(
+                    f"\nDB Stats: {stats['total']} accounts, "
+                    f"{stats['healthy']} healthy, {stats['error']} error, "
+                    f"{stats['pending']} pending"
+                )
             finally:
                 await db.close()
 
@@ -235,7 +252,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
         account_dir = get_account_dir(account)
         if not account_dir:
             click.echo(f"Error: Аккаунт '{account}' не найден")
-            click.echo(f"Доступные аккаунты:")
+            click.echo("Доступные аккаунты:")
             for d in find_account_dirs():
                 click.echo(f"  - {d.name}")
             sys.exit(1)
@@ -251,6 +268,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             single_proxy = "NONE"  # Special value: strip all proxies
             click.echo("No-proxy mode: все прокси отключены")
         else:
+
             async def _get_single_proxy():
                 db = await _connect_db()
                 try:
@@ -262,12 +280,14 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             single_proxy = asyncio.run(_get_single_proxy())
 
         try:
-            result = asyncio.run(migrate_account(
-                account_dir=account_dir,
-                password_2fa=password_2fa,
-                headless=headless,
-                proxy_override=single_proxy,
-            ))
+            result = asyncio.run(
+                migrate_account(
+                    account_dir=account_dir,
+                    password_2fa=password_2fa,
+                    headless=headless,
+                    proxy_override=single_proxy,
+                )
+            )
         except KeyboardInterrupt:
             click.echo("\nПрервано пользователем (Ctrl+C).")
             return
@@ -355,6 +375,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                     for d in found:
                         try:
                             from .paths import to_relative_path
+
                             await db.add_account(
                                 name=d.name,
                                 session_path=to_relative_path(d / "session.session"),
@@ -384,9 +405,11 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             deleted = 0
             if profiles_dir.exists():
                 for profile_dir in profiles_dir.iterdir():
-                    if (profile_dir.is_dir()
-                            and profile_dir.name in failed_names
-                            and (profile_dir / "browser_data").exists()):
+                    if (
+                        profile_dir.is_dir()
+                        and profile_dir.name in failed_names
+                        and (profile_dir / "browser_data").exists()
+                    ):
                         try:
                             shutil.rmtree(profile_dir / "browser_data")
                             deleted += 1
@@ -405,6 +428,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             proxy_map = {d.name: "NONE" for d in accounts}
             click.echo(f"No-proxy mode: все прокси отключены для {len(accounts)} аккаунтов")
         else:
+
             async def _load_proxy_map():
                 db = await _connect_db()
                 try:
@@ -435,9 +459,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
             click.echo(f"Cooldown между запусками: {cooldown}s")
 
             controller = ParallelMigrationController(
-                max_concurrent=parallel,
-                cooldown=cooldown,
-                resource_monitor=monitor if auto_scale else None
+                max_concurrent=parallel, cooldown=cooldown, resource_monitor=monitor if auto_scale else None
             )
 
             # Signal handler для graceful shutdown
@@ -446,7 +468,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                 controller.request_shutdown()
 
             signal.signal(signal.SIGINT, handle_signal)
-            if hasattr(signal, 'SIGTERM'):
+            if hasattr(signal, "SIGTERM"):
                 signal.signal(signal.SIGTERM, handle_signal)
 
             # FIX-4.2 + FIX-C5: DB update per-account via progress callback (crash-safe)
@@ -465,7 +487,9 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
 
             async def _on_progress_async(completed, total, result):
                 """Update DB immediately for each completed account."""
-                status_str = click.style("OK", fg="green") if result and result.success else click.style("FAIL", fg="red")
+                status_str = (
+                    click.style("OK", fg="green") if result and result.success else click.style("FAIL", fg="red")
+                )
                 name = result.profile_name if result else "?"
                 click.echo(f"  [{completed}/{total}] {status_str} {name}")
                 if batch_db_id and result and _parallel_db:
@@ -473,7 +497,9 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                         if result.success:
                             await _parallel_db.mark_batch_account_completed(batch_db_id, result.profile_name)
                         else:
-                            await _parallel_db.mark_batch_account_failed(batch_db_id, result.profile_name, result.error or "Unknown error")
+                            await _parallel_db.mark_batch_account_failed(
+                                batch_db_id, result.profile_name, result.error or "Unknown error"
+                            )
                     except Exception as e:
                         logger.warning(f"DB update error: {e}")
 
@@ -498,7 +524,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                 return
         else:
             # Последовательный режим (существующий)
-            click.echo(f"Режим: ПОСЛЕДОВАТЕЛЬНЫЙ")
+            click.echo("Режим: ПОСЛЕДОВАТЕЛЬНЫЙ")
             click.echo(f"Cooldown между аккаунтами: {cooldown}s")
 
             # FIX-4.2: Per-account crash-safe DB update callback
@@ -509,6 +535,7 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                 nonlocal _seq_db
                 _seq_db = await _connect_db()
                 try:
+
                     async def _on_result_sequential(result):
                         status_str = click.style("OK", fg="green") if result.success else click.style("FAIL", fg="red")
                         click.echo(f"  {status_str} {result.profile_name}")
@@ -517,7 +544,9 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
                                 if result.success:
                                     await _seq_db.mark_batch_account_completed(batch_db_id, result.profile_name)
                                 else:
-                                    await _seq_db.mark_batch_account_failed(batch_db_id, result.profile_name, result.error or "Unknown error")
+                                    await _seq_db.mark_batch_account_failed(
+                                        batch_db_id, result.profile_name, result.error or "Unknown error"
+                                    )
                             except Exception as e:
                                 logger.warning(f"DB update error: {e}")
 
@@ -545,11 +574,13 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
         success = [r for r in results if r.success]
         failed = [r for r in results if not r.success]
 
-        click.echo(f"\n{'='*50}")
+        click.echo(f"\n{'=' * 50}")
         click.echo("BATCH COMPLETE")
-        click.echo(f"{'='*50}")
+        click.echo(f"{'=' * 50}")
         click.echo(f"Total:      {len(results)}")
-        click.echo(click.style(f"Success:    {len(success)} ({len(success)*100//max(len(results),1)}%)", fg="green"))
+        click.echo(
+            click.style(f"Success:    {len(success)} ({len(success) * 100 // max(len(results), 1)}%)", fg="green")
+        )
         click.echo(click.style(f"Failed:     {len(failed)}", fg="red" if failed else "green"))
 
         # FIX-4.3: Error breakdown by category (uses auto-classified error_category from AuthResult)
@@ -603,9 +634,10 @@ def migrate(account: Optional[str], migrate_all: bool, password: Optional[str],
 @click.option("--url", default="https://web.telegram.org/k/", help="URL для открытия")
 def open_profile(account: str, url: str):
     """Открыть существующий browser profile"""
-    from .browser_manager import BrowserManager
-    import json
     import builtins
+    import json
+
+    from .browser_manager import BrowserManager
 
     manager = BrowserManager()
     profile = manager.get_profile(account)
@@ -619,9 +651,9 @@ def open_profile(account: str, url: str):
 
     # Загружаем прокси из конфига
     if profile.config_path.exists():
-        with builtins.open(profile.config_path, encoding='utf-8') as f:
+        with builtins.open(profile.config_path, encoding="utf-8") as f:
             config = json.load(f)
-            profile.proxy = config.get('proxy')
+            profile.proxy = config.get("proxy")
 
     click.echo(f"Открываю профиль: {profile.name}")
     click.echo(f"URL: {url}")
@@ -687,7 +719,7 @@ def list_cmd():
     else:
         click.echo("  (нет аккаунтов)")
 
-    click.echo(f"\nПРОФИЛИ (browser profiles):")
+    click.echo("\nПРОФИЛИ (browser profiles):")
     click.echo("-" * 40)
 
     manager = BrowserManager()
@@ -714,9 +746,9 @@ def list_cmd():
 @click.option("--profile", help="Имя профиля для сохранения результатов")
 @click.option("--headless", is_flag=True, help="Запуск без GUI")
 @click.option("--geoip", is_flag=True, help="Использовать автодетект timezone по IP")
-def check(proxy: str, profile: Optional[str], headless: bool, geoip: bool):
+def check(proxy: str, profile: str | None, headless: bool, geoip: bool):
     """Проверить безопасность браузера (fingerprint, WebRTC leaks)"""
-    from .security_check import run_security_check, print_summary
+    from .security_check import print_summary, run_security_check
 
     profile_path = None
     if profile:
@@ -725,12 +757,9 @@ def check(proxy: str, profile: Optional[str], headless: bool, geoip: bool):
     click.echo("Запускаю проверку безопасности...")
 
     try:
-        result = asyncio.run(run_security_check(
-            proxy=proxy,
-            profile_path=profile_path,
-            headless=headless,
-            use_geoip=geoip
-        ))
+        result = asyncio.run(
+            run_security_check(proxy=proxy, profile_path=profile_path, headless=headless, use_geoip=geoip)
+        )
     except KeyboardInterrupt:
         click.echo("\nПрервано пользователем (Ctrl+C).")
         return
@@ -756,6 +785,7 @@ def health(account: str):
     - Нет ограничений на аккаунте
     """
     import json
+
     from telethon import TelegramClient
 
     # Найти аккаунт
@@ -784,25 +814,21 @@ def health(account: str):
 
     me = None
     try:
-        with open(api_file, encoding='utf-8') as f:
+        with open(api_file, encoding="utf-8") as f:
             api = json.load(f)
 
         proxy = None
         if config_file.exists():
-            with open(config_file, encoding='utf-8') as f:
+            with open(config_file, encoding="utf-8") as f:
                 config = json.load(f)
             proxy_str = config.get("Proxy", "")
             if proxy_str:
                 from .telegram_auth import parse_telethon_proxy
+
                 proxy = parse_telethon_proxy(proxy_str)
 
         async def check_telethon():
-            client = TelegramClient(
-                str(session_file.with_suffix("")),
-                api["api_id"],
-                api["api_hash"],
-                proxy=proxy
-            )
+            client = TelegramClient(str(session_file.with_suffix("")), api["api_id"], api["api_hash"], proxy=proxy)
             try:
                 await client.connect()
                 if not await client.is_user_authorized():
@@ -834,13 +860,14 @@ def health(account: str):
     click.echo("\n[2/3] Web профиль...")
 
     from .browser_manager import BrowserManager
+
     manager = BrowserManager(profiles_dir=PROFILES_DIR)
 
     # Ищем профиль по имени из config или имени папки
     profile_name = account_dir.name
     if config_file.exists():
         try:
-            with open(config_file, encoding='utf-8') as f:
+            with open(config_file, encoding="utf-8") as f:
                 config = json.load(f)
             profile_name = config.get("Name", profile_name)
         except Exception:
@@ -870,7 +897,7 @@ def health(account: str):
     elif me and not profile.exists:
         click.echo(click.style("⚠ Требуется миграция", fg="yellow"))
         click.echo("  Telethon работает, но Web профиль не создан.")
-        click.echo(f"  Запустите: python -m src.cli migrate --account \"{account}\"")
+        click.echo(f'  Запустите: python -m src.cli migrate --account "{account}"')
     else:
         click.echo(click.style("✗ Проблемы с аккаунтом", fg="red"))
         click.echo("  Проверьте сессию и прокси.")
@@ -879,18 +906,26 @@ def health(account: str):
 @cli.command()
 @click.option("--account", "-a", help="Имя аккаунта для авторизации на Fragment")
 @click.option("--all", "fragment_all", is_flag=True, help="Авторизовать все аккаунты")
-@click.option("--retry-failed", "retry_failed", is_flag=True,
-              help="Повторить упавшие fragment авторизации (fragment_status='error')")
+@click.option(
+    "--retry-failed",
+    "retry_failed",
+    is_flag=True,
+    help="Повторить упавшие fragment авторизации (fragment_status='error')",
+)
 @click.option("--headed", is_flag=True, help="Запуск с GUI (по умолчанию headless)")
-@click.option("--cooldown", "-c", default=DEFAULT_COOLDOWN, type=int,
-              help=f"Секунды между аккаунтами при --all (default: {DEFAULT_COOLDOWN})")
-def fragment(account: Optional[str], fragment_all: bool, retry_failed: bool,
-             headed: bool, cooldown: int):
+@click.option(
+    "--cooldown",
+    "-c",
+    default=DEFAULT_COOLDOWN,
+    type=int,
+    help=f"Секунды между аккаунтами при --all (default: {DEFAULT_COOLDOWN})",
+)
+def fragment(account: str | None, fragment_all: bool, retry_failed: bool, headed: bool, cooldown: int):
     """Авторизация на fragment.com через Telegram Login Widget"""
-    from .telegram_auth import AccountConfig
-    from .fragment_auth import FragmentAuth
     from .browser_manager import BrowserManager
     from .database import Database
+    from .fragment_auth import FragmentAuth, FragmentResult
+    from .telegram_auth import AccountConfig
 
     setup_logging(level=logging.INFO)
 
@@ -920,7 +955,7 @@ def fragment(account: Optional[str], fragment_all: bool, retry_failed: bool,
             click.echo(click.style(f"  FAIL {config.name}: {result.error}", fg="red"))
         return result
 
-    async def _get_filtered_account_dirs() -> Optional[list[Path]]:
+    async def _get_filtered_account_dirs() -> list[Path] | None:
         """FIX-B1/B2: Filter account dirs using DB fragment_status."""
         all_dirs = find_account_dirs()
         if not all_dirs:
@@ -953,10 +988,7 @@ def fragment(account: Optional[str], fragment_all: bool, retry_failed: bool,
             already_auth = [d.name for d in all_dirs if status_map.get(d.name) == "authorized"]
             filtered = [d for d in all_dirs if status_map.get(d.name) != "authorized"]
             if already_auth:
-                click.echo(click.style(
-                    f"Пропущено {len(already_auth)} уже авторизованных аккаунтов",
-                    fg="cyan"
-                ))
+                click.echo(click.style(f"Пропущено {len(already_auth)} уже авторизованных аккаунтов", fg="cyan"))
             if not filtered:
                 click.echo("Все аккаунты уже авторизованы на fragment.com!")
                 return None
@@ -970,7 +1002,7 @@ def fragment(account: Optional[str], fragment_all: bool, retry_failed: bool,
         results = []
 
         for i, account_dir in enumerate(account_dirs):
-            click.echo(f"\n[{i+1}/{len(account_dirs)}] {account_dir.name}")
+            click.echo(f"\n[{i + 1}/{len(account_dirs)}] {account_dir.name}")
             result = await _run_single(account_dir, browser_manager)
             results.append((account_dir.name, result))
 
@@ -1030,7 +1062,7 @@ def fragment(account: Optional[str], fragment_all: bool, retry_failed: bool,
         if skipped:
             click.echo(click.style(f"  SKIP: {len(skipped)}", fg="yellow"))
         if total_fail > 0:
-            click.echo(f"\nИспользуйте --retry-failed для повтора упавших")
+            click.echo("\nИспользуйте --retry-failed для повтора упавших")
 
     async def _run():
         # Fix #21: Shared BrowserManager with global LRU eviction
@@ -1083,13 +1115,12 @@ def check_proxies(concurrency: int, timeout: float, db_path: str):
                     click.echo(f"  [{completed}/{total}] checked...")
 
             summary = await check_proxy_batch(
-                db, concurrency=concurrency, timeout=timeout,
+                db,
+                concurrency=concurrency,
+                timeout=timeout,
                 progress_callback=on_progress,
             )
-            click.echo(
-                f"Results: {summary['alive']} alive, {summary['dead']} dead, "
-                f"{summary['changed']} changed"
-            )
+            click.echo(f"Results: {summary['alive']} alive, {summary['dead']} dead, {summary['changed']} changed")
         finally:
             await db.close()
 
@@ -1100,15 +1131,21 @@ def check_proxies(concurrency: int, timeout: float, db_path: str):
 
 
 @cli.command("proxy-refresh")
-@click.option("--file", "-f", "proxy_file", required=True, type=click.Path(exists=True),
-              help="Файл со свежими прокси (по одному на строку)")
+@click.option(
+    "--file",
+    "-f",
+    "proxy_file",
+    required=True,
+    type=click.Path(exists=True),
+    help="Файл со свежими прокси (по одному на строку)",
+)
 @click.option("--auto", is_flag=True, help="Без подтверждения (для автоматизации)")
 @click.option("--check-only", is_flag=True, help="Только проверить, не заменять")
 @click.option("--db-path", default="data/tgwebauth.db", help="Путь к базе данных")
 def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str):
     """Проверить прокси аккаунтов и заменить мёртвые из файла."""
     from .database import Database
-    from .proxy_manager import ProxyManager, proxy_record_to_string
+    from .proxy_manager import ProxyManager
 
     async def _run() -> None:
         db = Database(Path(db_path))
@@ -1120,14 +1157,14 @@ def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str):
             # Step 1: Sync accounts to DB
             click.echo("1. Синхронизация аккаунтов с БД...")
             sync = await manager.sync_accounts_to_db()
-            click.echo(f"   Найдено: {sync['synced']}, новых: {sync['created']}, "
-                       f"привязано прокси: {sync['proxy_linked']}")
+            click.echo(
+                f"   Найдено: {sync['synced']}, новых: {sync['created']}, привязано прокси: {sync['proxy_linked']}"
+            )
 
             # Step 2: Import fresh proxies
             click.echo(f"\n2. Импорт свежих прокси из {proxy_file}...")
             imp = await manager.import_from_file(Path(proxy_file))
-            click.echo(f"   Импортировано: {imp['imported']}, дубликатов: {imp['duplicates']}, "
-                       f"ошибок: {imp['errors']}")
+            click.echo(f"   Импортировано: {imp['imported']}, дубликатов: {imp['duplicates']}, ошибок: {imp['errors']}")
 
             # Step 3: Health check assigned proxies
             click.echo("\n3. Проверка прокси аккаунтов...")
@@ -1142,22 +1179,21 @@ def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str):
             if dead_count > 0:
                 click.echo(click.style(f"   Мёртвых: {dead_count}", fg="red"))
             else:
-                click.echo(f"   Мёртвых: 0")
+                click.echo("   Мёртвых: 0")
 
             # Count free proxies in pool
             free_proxies = await db.list_proxies(status="active", unassigned_only=True)
             click.echo(f"   Свежих в пуле: {len(free_proxies)}")
 
             if no_proxy_count > 0:
-                click.echo(click.style(f"   Аккаунты без прокси: {no_proxy_count} (пропускаются)",
-                                       fg="yellow"))
+                click.echo(click.style(f"   Аккаунты без прокси: {no_proxy_count} (пропускаются)", fg="yellow"))
 
             if dead_count == 0:
                 click.echo(click.style("\nВсе прокси живы!", fg="green"))
                 return
 
             # Step 4: Generate replacement plan
-            click.echo(f"\n4. План замены:")
+            click.echo("\n4. План замены:")
             plan = await manager.generate_replacement_plan(check["dead"])
 
             if not plan:
@@ -1175,13 +1211,11 @@ def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str):
                 for entry in plan:
                     old_p = entry["old_proxy"]
                     new_p = entry["new_proxy"]
-                    click.echo(f"   {entry['account_name']}: "
-                               f"{old_p.host}:{old_p.port} -> {new_p.host}:{new_p.port}")
+                    click.echo(f"   {entry['account_name']}: {old_p.host}:{old_p.port} -> {new_p.host}:{new_p.port}")
 
                 not_replaced = dead_count - len(plan)
                 if not_replaced > 0:
-                    click.echo(click.style(
-                        f"\n   Не хватает прокси для {not_replaced} аккаунтов", fg="yellow"))
+                    click.echo(click.style(f"\n   Не хватает прокси для {not_replaced} аккаунтов", fg="yellow"))
 
                 if check_only:
                     click.echo("\n--check-only: замена не выполнена")
@@ -1196,12 +1230,14 @@ def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str):
                         return
 
                 # Step 6: Execute
-                click.echo(f"\n5. Замена...")
+                click.echo("\n5. Замена...")
                 result = await manager.execute_replacements(plan)
-                click.echo(click.style(
-                    f"\n   Заменено: {result['replaced']}, ошибок: {result['errors']}",
-                    fg="green" if result["errors"] == 0 else "yellow",
-                ))
+                click.echo(
+                    click.style(
+                        f"\n   Заменено: {result['replaced']}, ошибок: {result['errors']}",
+                        fg="green" if result["errors"] == 0 else "yellow",
+                    )
+                )
             except BaseException:
                 click.echo("\nОтмена, возвращаю зарезервированные прокси в пул...")
                 await _unreserve_plan()
@@ -1232,7 +1268,7 @@ def preflight():
 
         # 1. Disk space
         usage = shutil.disk_usage(Path(".").resolve())
-        free_gb = usage.free / (1024 ** 3)
+        free_gb = usage.free / (1024**3)
         disk_ok = free_gb > 50  # Need ~100MB/profile, 50GB minimum
         status = click.style("OK", fg="green") if disk_ok else click.style("LOW", fg="red")
         click.echo(f"\nDisk space:        {free_gb:.1f} GB free  {status}")
@@ -1269,7 +1305,7 @@ def preflight():
             active_proxies = [p for p in all_proxies if p.status == "active"]
             assigned_proxies = [p for p in all_proxies if p.assigned_account_id]
 
-            click.echo(f"\nProxies:")
+            click.echo("\nProxies:")
             click.echo(f"  Total:           {len(all_proxies)}")
             click.echo(f"  Active:          {len(active_proxies)}")
             click.echo(f"  Assigned:        {len(assigned_proxies)}")
@@ -1277,18 +1313,18 @@ def preflight():
             # 4. Quick proxy TCP check via DB batch
             if active_proxies:
                 from .proxy_health import check_proxy_connection
-                click.echo(f"\n  TCP check (sample up to 20)...")
+
+                click.echo("\n  TCP check (sample up to 20)...")
                 sample = active_proxies[:20]
                 tasks = [check_proxy_connection(p.host, p.port, timeout=10) for p in sample]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 alive = sum(1 for r in results if r is True)
                 click.echo(f"  Alive:           {alive}/{len(sample)}")
                 if alive < len(sample):
-                    click.echo(click.style(
-                        f"  Dead:            {len(sample) - alive}", fg="red"))
+                    click.echo(click.style(f"  Dead:            {len(sample) - alive}", fg="red"))
 
             # 5. Session alive check (sample up to 5)
-            click.echo(f"\nSession alive check (sample 5)...")
+            click.echo("\nSession alive check (sample 5)...")
             alive_count = 0
             dead_count = 0
             twofa_count = 0
@@ -1296,11 +1332,13 @@ def preflight():
             for acct_dir in sample_accounts:
                 try:
                     from .telegram_auth import AccountConfig, parse_telethon_proxy
+
                     account = AccountConfig.load(acct_dir)
                     from telethon import TelegramClient
+
                     proxy = parse_telethon_proxy(account.proxy)
                     client = TelegramClient(
-                        str(account.session_path.with_suffix('')),
+                        str(account.session_path.with_suffix("")),
                         account.api_id,
                         account.api_hash,
                         proxy=proxy,
@@ -1312,6 +1350,7 @@ def preflight():
                             # Check 2FA
                             try:
                                 from telethon.tl.functions.account import GetPasswordRequest
+
                                 pwd = await client(GetPasswordRequest())
                                 if pwd.has_password:
                                     twofa_count += 1
@@ -1333,16 +1372,17 @@ def preflight():
 
             # 6. Resources
             import psutil
-            ram_gb = psutil.virtual_memory().total / (1024 ** 3)
-            ram_avail_gb = psutil.virtual_memory().available / (1024 ** 3)
-            click.echo(f"\nResources:")
+
+            ram_gb = psutil.virtual_memory().total / (1024**3)
+            ram_avail_gb = psutil.virtual_memory().available / (1024**3)
+            click.echo("\nResources:")
             click.echo(f"  RAM total:       {ram_gb:.1f} GB")
             click.echo(f"  RAM available:   {ram_avail_gb:.1f} GB")
 
             # Estimate
             recommended_parallel = min(10, max(1, int(ram_avail_gb / 0.5)))
             est_time_hours = (total_accounts * 60) / (recommended_parallel * 3600)
-            click.echo(f"\nEstimate:")
+            click.echo("\nEstimate:")
             click.echo(f"  Ready accounts:  {sessions_ok}")
             click.echo(f"  Recommended -j:  {recommended_parallel}")
             click.echo(f"  Est. time:       ~{est_time_hours:.1f} hours")
@@ -1382,8 +1422,10 @@ def init():
 @cli.command()
 def dedup():
     """Удалить дубликаты аккаунтов из БД (оставляет самую богатую запись: с прокси, статусом, fragment)"""
+
     async def _dedup():
         from .database import Database
+
         db = Database(DATA_DIR / "tgwebauth.db")
         await db.initialize()
         await db.connect()

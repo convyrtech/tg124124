@@ -1,19 +1,19 @@
 """Proxy pool management: import, health check, replacement."""
+
 import json
 import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Optional
 
 from .database import Database, ProxyRecord
-from .proxy_health import check_proxy_connection, check_proxy_telegram
+from .proxy_health import check_proxy_telegram
 from .utils import mask_proxy_credentials
 
 logger = logging.getLogger(__name__)
 
 
-def parse_proxy_line(line: str) -> tuple[Optional[str], Optional[int], Optional[str], Optional[str], str]:
+def parse_proxy_line(line: str) -> tuple[str | None, int | None, str | None, str | None, str]:
     """Parse proxy line into components.
 
     Supported formats:
@@ -97,7 +97,7 @@ class ProxyManager:
     def __init__(self, db: Database, accounts_dir: Path = Path("accounts")):
         self.db = db
         self.accounts_dir = accounts_dir
-        self._config_path_cache: Optional[dict[str, Path]] = None
+        self._config_path_cache: dict[str, Path] | None = None
 
     async def sync_accounts_to_db(self) -> dict[str, int]:
         """Ensure all accounts from accounts/ are in DB with correct proxy_id.
@@ -124,17 +124,18 @@ class ProxyManager:
             proxy_str = None
             if config_path.exists():
                 try:
-                    with open(config_path, "r", encoding="utf-8") as f:
+                    with open(config_path, encoding="utf-8") as f:
                         config = json.load(f)
                     proxy_str = config.get("Proxy")
                     config_name = config.get("Name")
                     if config_name:
                         name = config_name
-                except (json.JSONDecodeError, IOError):
+                except (OSError, json.JSONDecodeError):
                     pass
 
             # Add account if missing
             from .paths import to_relative_path
+
             session_path_str = to_relative_path(session_file)
             try:
                 account_id = await self.db.add_account(
@@ -166,7 +167,7 @@ class ProxyManager:
 
         return counters
 
-    async def _find_or_create_proxy(self, proxy_str: str) -> Optional[int]:
+    async def _find_or_create_proxy(self, proxy_str: str) -> int | None:
         """Find existing proxy or create new one. Returns proxy ID."""
         import sqlite3
 
@@ -181,8 +182,10 @@ class ProxyManager:
 
         try:
             return await self.db.add_proxy(
-                host=host, port=port,
-                username=username, password=password,
+                host=host,
+                port=port,
+                username=username,
+                password=password,
                 protocol=protocol,
             )
         except sqlite3.IntegrityError:
@@ -205,7 +208,7 @@ class ProxyManager:
 
         counters = {"imported": 0, "duplicates": 0, "errors": 0}
 
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(file_path, encoding="utf-8") as f:
             lines = f.readlines()
 
         for line in lines:
@@ -221,8 +224,10 @@ class ProxyManager:
                     continue
 
                 await self.db.add_proxy(
-                    host=host, port=port,
-                    username=username, password=password,
+                    host=host,
+                    port=port,
+                    username=username,
+                    password=password,
                     protocol=protocol,
                 )
                 counters["imported"] += 1
@@ -234,9 +239,7 @@ class ProxyManager:
 
         return counters
 
-    async def check_assigned_proxies(
-        self, concurrency: int = 50, timeout: float = 10.0
-    ) -> dict[str, list]:
+    async def check_assigned_proxies(self, concurrency: int = 50, timeout: float = 10.0) -> dict[str, list]:
         """Health check only proxies assigned to accounts.
 
         Uses deep SOCKS5+Telegram check (not just TCP) to detect
@@ -276,7 +279,8 @@ class ProxyManager:
             async with sem:
                 # FIX: Use deep SOCKS5+Telegram check instead of TCP-only
                 alive, _error = await check_proxy_telegram(
-                    proxy.host, proxy.port,
+                    proxy.host,
+                    proxy.port,
                     username=proxy.username,
                     password=proxy.password,
                     timeout=timeout,
@@ -310,12 +314,14 @@ class ProxyManager:
                 logger.warning("No free proxies left for %s", account.name)
                 break
 
-            plan.append({
-                "account_name": account.name,
-                "account_id": account.id,
-                "old_proxy": old_proxy,
-                "new_proxy": new_proxy,
-            })
+            plan.append(
+                {
+                    "account_name": account.name,
+                    "account_id": account.id,
+                    "old_proxy": old_proxy,
+                    "new_proxy": new_proxy,
+                }
+            )
 
             # Reserve this proxy so it won't be picked again
             await self.db.update_proxy(new_proxy.id, status="reserved")
@@ -352,15 +358,14 @@ class ProxyManager:
                     try:
                         await self.db._connection.execute(
                             "UPDATE proxies SET status = 'dead', assigned_account_id = NULL WHERE id = ?",
-                            (old_proxy.id,)
+                            (old_proxy.id,),
                         )
                         await self.db._connection.execute(
                             "UPDATE proxies SET status = 'active', assigned_account_id = ? WHERE id = ?",
-                            (account_id, new_proxy.id)
+                            (account_id, new_proxy.id),
                         )
                         await self.db._connection.execute(
-                            "UPDATE accounts SET proxy_id = ? WHERE id = ?",
-                            (new_proxy.id, account_id)
+                            "UPDATE accounts SET proxy_id = ? WHERE id = ?", (new_proxy.id, account_id)
                         )
                         await self.db._commit_with_retry()
                     except Exception:
@@ -383,13 +388,15 @@ class ProxyManager:
                 logger.info(
                     "Replaced proxy for %s: %s:%d -> %s:%d",
                     account_name,
-                    old_proxy.host, old_proxy.port,
-                    new_proxy.host, new_proxy.port,
+                    old_proxy.host,
+                    old_proxy.port,
+                    new_proxy.host,
+                    new_proxy.port,
                 )
 
             except Exception as e:
                 counters["errors"] += 1
-                logger.error("Failed to replace proxy for %s: %s", account_name, e)
+                logger.exception("Failed to replace proxy for %s: %s", account_name, e)
                 await self.db.log_operation(
                     account_id=account_id,
                     operation="proxy_replace",
@@ -415,17 +422,17 @@ class ProxyManager:
 
             # Also index by Name field from config
             try:
-                with open(config_path, "r", encoding="utf-8") as f:
+                with open(config_path, encoding="utf-8") as f:
                     config = json.load(f)
                 name = config.get("Name")
                 if name and name != folder_name:
                     cache[name] = config_path
-            except (json.JSONDecodeError, IOError):
+            except (OSError, json.JSONDecodeError):
                 continue
 
         return cache
 
-    def _find_config_path(self, account_name: str) -> Optional[Path]:
+    def _find_config_path(self, account_name: str) -> Path | None:
         """Find ___config.json for account by name.
 
         Uses cached mapping built on first call. O(1) per lookup.
@@ -448,7 +455,7 @@ def update_config_proxy(config_path: Path, new_proxy_str: str) -> None:
         new_proxy_str: New proxy string (e.g. "socks5:host:port:user:pass").
     """
     if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             config = json.load(f)
     else:
         config = {}

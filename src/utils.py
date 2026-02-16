@@ -3,11 +3,12 @@ Utility functions for TG Web Auth.
 
 Общие функции используемые в разных модулях.
 """
+
 import re
-from typing import Dict, Any, Optional, Tuple
+from typing import Any
 
 
-def parse_proxy_for_camoufox(proxy_str: str) -> Dict[str, Any]:
+def parse_proxy_for_camoufox(proxy_str: str) -> dict[str, Any]:
     """
     Парсит прокси в формат Camoufox/Playwright.
 
@@ -39,13 +40,10 @@ def parse_proxy_for_camoufox(proxy_str: str) -> Dict[str, Any]:
         proto, host, port = parts
         return {"server": f"{proto}://{host}:{port}"}
 
-    raise ValueError(
-        f"Invalid proxy format (expected 'protocol:host:port[:user:pass]', "
-        f"got {len(parts)} parts)"
-    )
+    raise ValueError(f"Invalid proxy format (expected 'protocol:host:port[:user:pass]', got {len(parts)} parts)")
 
 
-def parse_proxy_for_telethon(proxy_str: str) -> Optional[Tuple]:
+def parse_proxy_for_telethon(proxy_str: str) -> tuple | None:
     """
     Конвертирует прокси в формат Telethon.
 
@@ -64,17 +62,17 @@ def parse_proxy_for_telethon(proxy_str: str) -> Optional[Tuple]:
 
     try:
         import socks
-    except ImportError:
-        raise ImportError("PySocks not installed. Run: pip install PySocks")
+    except ImportError as e:
+        raise ImportError("PySocks not installed. Run: pip install PySocks") from e
 
     parts = proxy_str.split(":")
     if len(parts) == 5:
         proto, host, port, user, pwd = parts
-        proxy_type = socks.SOCKS5 if 'socks5' in proto.lower() else socks.HTTP
+        proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
         return (proxy_type, host, int(port), True, user, pwd)
     elif len(parts) == 3:
         proto, host, port = parts
-        proxy_type = socks.SOCKS5 if 'socks5' in proto.lower() else socks.HTTP
+        proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
         return (proxy_type, host, int(port))
 
     return None
@@ -98,9 +96,9 @@ def mask_proxy_credentials(proxy_str: str) -> str:
         return ""
 
     # Handle user:pass@host:port format
-    if '@' in proxy_str:
-        at_idx = proxy_str.index('@')
-        return '***:***@' + proxy_str[at_idx + 1:]
+    if "@" in proxy_str:
+        at_idx = proxy_str.index("@")
+        return "***:***@" + proxy_str[at_idx + 1 :]
 
     parts = proxy_str.split(":")
     if len(parts) == 5:
@@ -111,15 +109,12 @@ def mask_proxy_credentials(proxy_str: str) -> str:
 
 # Regex patterns for credential-like data in error messages
 _PROXY_PATTERN = re.compile(
-    r'(socks[45]?|https?|http)([:/]+)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)(:\S+:\S+)',
-    re.IGNORECASE
+    r"(socks[45]?|https?|http)([:/]+)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)(:\S+:\S+)", re.IGNORECASE
 )
 _CREDENTIAL_URI_PATTERN = re.compile(
-    r'://([^:@]+):([^@]+)@',
+    r"://([^:@]+):([^@]+)@",
 )
-_PHONE_PATTERN = re.compile(
-    r'\b(\+?\d{10,15})\b'
-)
+_PHONE_PATTERN = re.compile(r"\b(\+?\d{10,15})\b")
 
 
 def sanitize_error(error_text: str) -> str:
@@ -139,9 +134,9 @@ def sanitize_error(error_text: str) -> str:
 
     text = str(error_text)
     # Mask proxy credentials in protocol:host:port:user:pass format
-    text = _PROXY_PATTERN.sub(r'\1\2\3:***:***', text)
+    text = _PROXY_PATTERN.sub(r"\1\2\3:***:***", text)
     # Mask credentials in URI format (user:pass@host)
-    text = _CREDENTIAL_URI_PATTERN.sub(r'://***:***@', text)
+    text = _CREDENTIAL_URI_PATTERN.sub(r"://***:***@", text)
     # Mask phone numbers
-    text = _PHONE_PATTERN.sub(r'[phone]', text)
+    text = _PHONE_PATTERN.sub(r"[phone]", text)
     return text

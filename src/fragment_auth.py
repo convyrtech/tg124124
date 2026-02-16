@@ -13,19 +13,21 @@ Flow:
 
 ВАЖНО: НЕ логировать auth_key, api_hash, phone numbers полностью!
 """
+
 import asyncio
 import logging
 import random
 import re
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 
-from .browser_manager import BrowserManager, BrowserContext
+from .browser_manager import BrowserManager
 from .telegram_auth import AccountConfig, AuthResult, parse_telethon_proxy
 
 logger = logging.getLogger(__name__)
@@ -51,10 +53,11 @@ def _mask_phone(phone: str) -> str:
 @dataclass
 class FragmentResult:
     """Результат авторизации на Fragment"""
+
     success: bool
     account_name: str
     already_authorized: bool = False
-    error: Optional[str] = None
+    error: str | None = None
     telegram_connected: bool = False
 
 
@@ -71,11 +74,11 @@ class FragmentAuth:
     def __init__(
         self,
         account: AccountConfig,
-        browser_manager: Optional[BrowserManager] = None,
+        browser_manager: BrowserManager | None = None,
     ):
         self.account = account
         self.browser_manager = browser_manager or BrowserManager()
-        self._client: Optional[TelegramClient] = None
+        self._client: TelegramClient | None = None
 
     async def _create_telethon_client(self) -> TelegramClient:
         """
@@ -94,13 +97,15 @@ class FragmentAuth:
         # Offloaded to executor: sqlite3.connect(timeout=10) can block up to 10s
         session_path = self.account.session_path
         if session_path.exists():
+
             def _enable_wal(path: str) -> None:
                 c = sqlite3.connect(path, timeout=10)
                 try:
-                    c.execute('PRAGMA journal_mode=WAL')
-                    c.execute('PRAGMA busy_timeout=10000')
+                    c.execute("PRAGMA journal_mode=WAL")
+                    c.execute("PRAGMA busy_timeout=10000")
                 finally:
                     c.close()
+
             try:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, _enable_wal, str(session_path))
@@ -109,7 +114,7 @@ class FragmentAuth:
 
         try:
             client = TelegramClient(
-                str(self.account.session_path.with_suffix('')),
+                str(self.account.session_path.with_suffix("")),
                 self.account.api_id,
                 self.account.api_hash,
                 proxy=proxy,
@@ -134,18 +139,18 @@ class FragmentAuth:
             except Exception:
                 pass
             raise RuntimeError(f"Session file corrupted: {e}") from e
-        except asyncio.TimeoutError:
+        except TimeoutError:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=5)
             except Exception:
                 pass
-            raise RuntimeError("Telethon connect timeout after 30s")
+            raise RuntimeError("Telethon connect timeout after 30s") from None
         except (ConnectionError, OSError) as e:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=5)
             except Exception:
                 pass
-            raise RuntimeError(f"Telethon connection failed: {e}")
+            raise RuntimeError(f"Telethon connection failed: {e}") from e
 
         if not await client.is_user_authorized():
             await client.disconnect()
@@ -156,7 +161,7 @@ class FragmentAuth:
 
         return client
 
-    def _extract_code_from_message(self, text: str) -> Optional[str]:
+    def _extract_code_from_message(self, text: str) -> str | None:
         """
         Извлекает код подтверждения из сообщения Telegram.
 
@@ -170,13 +175,13 @@ class FragmentAuth:
             return None
 
         patterns = [
-            r'Login code:\s*(\d{5,6})',
-            r'Код входа:\s*(\d{5,6})',
-            r'login code[:\s]+(\d{5,6})',
-            r'code[:\s]+(\d{5,6})',
-            r'code\s+is\s+(\d{5,6})',
+            r"Login code:\s*(\d{5,6})",
+            r"Код входа:\s*(\d{5,6})",
+            r"login code[:\s]+(\d{5,6})",
+            r"code[:\s]+(\d{5,6})",
+            r"code\s+is\s+(\d{5,6})",
             # Fallback: standalone code on its own line (not embedded in unrelated numbers)
-            r'^\s*(\d{5,6})\s*$',
+            r"^\s*(\d{5,6})\s*$",
         ]
 
         for pattern in patterns:
@@ -204,18 +209,14 @@ class FragmentAuth:
         """
         try:
             # Primary: check Aj.state.unAuth JS variable (minified, may break on update)
-            is_unauth = await page.evaluate(
-                "() => (typeof Aj !== 'undefined' && Aj.state) ? Aj.state.unAuth : null"
-            )
+            is_unauth = await page.evaluate("() => (typeof Aj !== 'undefined' && Aj.state) ? Aj.state.unAuth : null")
             if is_unauth is False:
                 return "authorized"
             if is_unauth is True:
                 return "not_authorized"
 
             # FIX-3.2: Fallback selectors — by CSS class first, then by text content
-            has_login_btn = await page.evaluate(
-                "() => !!document.querySelector('button.login-link')"
-            )
+            has_login_btn = await page.evaluate("() => !!document.querySelector('button.login-link')")
             # Text-based fallback for login button (robust against CSS class changes)
             if not has_login_btn:
                 has_login_btn = await page.evaluate("""
@@ -226,9 +227,7 @@ class FragmentAuth:
                 return "not_authorized"
 
             # Fallback: check for logout link (means logged in)
-            has_logout = await page.evaluate(
-                "() => !!document.querySelector('.logout-link')"
-            )
+            has_logout = await page.evaluate("() => !!document.querySelector('.logout-link')")
             # Text-based fallback for logout indicator
             if not has_logout:
                 has_logout = await page.evaluate("""
@@ -270,7 +269,7 @@ class FragmentAuth:
         async with page.expect_popup(timeout=20000) as popup_info:
             # FIX-3.2: Try CSS class first, then text-based fallback
             try:
-                await page.click('button.login-link')
+                await page.click("button.login-link")
             except Exception:
                 # Fallback: click by text content
                 login_btn = await page.evaluate("""
@@ -282,9 +281,9 @@ class FragmentAuth:
                     }
                 """)
                 if not login_btn:
-                    raise RuntimeError("Login button not found on fragment.com")
+                    raise RuntimeError("Login button not found on fragment.com") from None
         popup = await popup_info.value
-        await popup.wait_for_load_state('domcontentloaded')
+        await popup.wait_for_load_state("domcontentloaded")
         logger.info("OAuth popup opened: %s", popup.url)
         return popup
 
@@ -301,17 +300,13 @@ class FragmentAuth:
         Returns:
             True if already-logged-in form is shown (no phone input needed)
         """
-        has_phone = await popup.evaluate(
-            "() => !!document.getElementById('login-phone')"
-        )
+        has_phone = await popup.evaluate("() => !!document.getElementById('login-phone')")
         if has_phone:
             return False
 
         # Check for ACCEPT button (already logged in flow)
-        body_text = await popup.evaluate(
-            "() => document.body.innerText"
-        )
-        if 'ACCEPT' in body_text and 'DECLINE' in body_text:
+        body_text = await popup.evaluate("() => document.body.innerText")
+        if "ACCEPT" in body_text and "DECLINE" in body_text:
             logger.info("Popup shows already-logged-in form (ACCEPT/DECLINE)")
             return True
 
@@ -388,7 +383,7 @@ class FragmentAuth:
                 pass
             return False
         except Exception as e:
-            logger.error("Failed to click ACCEPT: %s", e)
+            logger.exception("Failed to click ACCEPT: %s", e)
             return False
 
     async def _submit_phone_on_popup(self, popup: Any, phone: str) -> bool:
@@ -410,12 +405,13 @@ class FragmentAuth:
             logger.error("Cannot submit empty phone number")
             return False
 
-        formatted = f'+{phone}' if not phone.startswith('+') else phone
+        formatted = f"+{phone}" if not phone.startswith("+") else phone
         logger.info("Submitting phone: %s", _mask_phone(formatted))
 
         # Set phone value via JS (bypasses country code selection complexity)
         # FIX-A1: Dispatch 'input' and 'change' events so React/Vue frameworks detect the change
-        await popup.evaluate("""(phone) => {
+        await popup.evaluate(
+            """(phone) => {
             const codeEl = document.getElementById('login-phone-code');
             const phoneEl = document.getElementById('login-phone');
             if (codeEl) codeEl.value = '';
@@ -424,7 +420,9 @@ class FragmentAuth:
                 phoneEl.dispatchEvent(new Event('input', {bubbles: true}));
                 phoneEl.dispatchEvent(new Event('change', {bubbles: true}));
             }
-        }""", formatted)
+        }""",
+            formatted,
+        )
 
         # FIX-3.2: Click submit with fallback
         try:
@@ -461,17 +459,15 @@ class FragmentAuth:
 
         # Wait for confirmation form to appear (#login-form loses .hide class)
         try:
-            await popup.wait_for_selector('#login-form:not(.hide)', timeout=15000)
+            await popup.wait_for_selector("#login-form:not(.hide)", timeout=15000)
             logger.info("Phone accepted, confirmation form visible")
             return True
         except Exception as e:
             logger.debug("Phone submission wait failed: %s", e)
             # Check for error message
-            error = await popup.evaluate(
-                "() => document.getElementById('login-alert')?.textContent || ''"
-            )
+            error = await popup.evaluate("() => document.getElementById('login-alert')?.textContent || ''")
             if error:
-                logger.error("OAuth phone error: %s", error)
+                logger.exception("OAuth phone error: %s", error)
             return False
 
     def _create_confirmation_handler(self, client: TelegramClient, confirmed: asyncio.Event):
@@ -490,6 +486,7 @@ class FragmentAuth:
         Returns:
             Handler function (to be registered with client.add_event_handler)
         """
+
         async def handler(event):
             msg = event.message
 
@@ -498,12 +495,12 @@ class FragmentAuth:
                 for row_idx, row in enumerate(msg.buttons):
                     for col_idx, btn in enumerate(row):
                         btn_text = btn.text.lower()
-                        if any(kw in btn_text for kw in ('confirm', 'accept', 'подтвердить', 'принять')):
+                        if any(kw in btn_text for kw in ("confirm", "accept", "подтвердить", "принять")):
                             logger.info("Clicking confirmation button: %r", btn.text)
                             try:
                                 await msg.click(row_idx, col_idx)
                             except Exception as e:
-                                logger.error("Failed to click confirmation button: %s", e)
+                                logger.exception("Failed to click confirmation button: %s", e)
                             confirmed.set()
                             return
                 # If buttons exist but none matched keywords, click first button
@@ -511,7 +508,7 @@ class FragmentAuth:
                 try:
                     await msg.click(0, 0)
                 except Exception as e:
-                    logger.error("Failed to click fallback button: %s", e)
+                    logger.exception("Failed to click fallback button: %s", e)
                 confirmed.set()
                 return
 
@@ -524,7 +521,9 @@ class FragmentAuth:
 
             # Variant C: unknown message format — do NOT auto-confirm,
             # it may be an unrelated stale message from 777000
-            logger.warning("Unknown message from 777000 (not confirming): [%d chars, redacted]", len(event.raw_text or ""))
+            logger.warning(
+                "Unknown message from 777000 (not confirming): [%d chars, redacted]", len(event.raw_text or "")
+            )
 
         return handler
 
@@ -549,7 +548,7 @@ class FragmentAuth:
         try:
             await asyncio.wait_for(confirmed.wait(), timeout=timeout)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("Confirmation timeout after %ds", timeout)
             return False
         finally:
@@ -616,10 +615,7 @@ class FragmentAuth:
         Returns:
             FragmentResult with outcome
         """
-        profile = self.browser_manager.get_profile(
-            self.account.name,
-            self.account.proxy
-        )
+        profile = self.browser_manager.get_profile(self.account.name, self.account.proxy)
 
         logger.info("=" * 60)
         logger.info("FRAGMENT.COM AUTHORIZATION")
@@ -638,7 +634,7 @@ class FragmentAuth:
         # Only the first worker installs the handler; only the last one restores original.
         loop = asyncio.get_running_loop()
         cls = type(self)
-        if not hasattr(cls, '_suppressor_refcount'):
+        if not hasattr(cls, "_suppressor_refcount"):
             cls._suppressor_refcount = 0
             cls._original_exception_handler = None
 
@@ -646,8 +642,8 @@ class FragmentAuth:
             cls._original_exception_handler = loop.get_exception_handler()
 
             def _suppress_telethon_bg_errors(loop_: asyncio.AbstractEventLoop, context: dict) -> None:
-                exc = context.get('exception')
-                if isinstance(exc, (asyncio.IncompleteReadError, ConnectionError, OSError)):
+                exc = context.get("exception")
+                if isinstance(exc, asyncio.IncompleteReadError | ConnectionError | OSError):
                     logger.debug("Suppressed background error: %s: %s", type(exc).__name__, exc)
                     return
                 # For all other errors, delegate to original handler or default
@@ -673,7 +669,7 @@ class FragmentAuth:
                 return FragmentResult(
                     success=False,
                     account_name=self.account.name,
-                    error="Phone number not available from Telethon session"
+                    error="Phone number not available from Telethon session",
                 )
 
             # 2. Launch browser
@@ -681,11 +677,7 @@ class FragmentAuth:
             browser_extra_args = {
                 "os": self.account.device.browser_os_list,
             }
-            browser_ctx = await self.browser_manager.launch(
-                profile,
-                headless=headless,
-                extra_args=browser_extra_args
-            )
+            browser_ctx = await self.browser_manager.launch(profile, headless=headless, extra_args=browser_extra_args)
             page = await browser_ctx.new_page()
             await page.set_viewport_size({"width": 1280, "height": 800})
 
@@ -700,9 +692,14 @@ class FragmentAuth:
                 error_str = str(e).lower()
                 # Fail fast for non-recoverable network/proxy errors
                 fatal_patterns = (
-                    'err_proxy', 'err_tunnel', 'ns_error_proxy',
-                    'err_name_not_resolved', 'connection_refused',
-                    'target closed', 'net::err_name', 'net::err_connection',
+                    "err_proxy",
+                    "err_tunnel",
+                    "ns_error_proxy",
+                    "err_name_not_resolved",
+                    "connection_refused",
+                    "target closed",
+                    "net::err_name",
+                    "net::err_connection",
                 )
                 if any(p in error_str for p in fatal_patterns):
                     raise RuntimeError(f"Page load failed (non-recoverable): {e}") from e
@@ -723,10 +720,7 @@ class FragmentAuth:
                 if browser_ctx:
                     browser_ctx.save_state_on_close = True
                 return FragmentResult(
-                    success=True,
-                    account_name=self.account.name,
-                    already_authorized=True,
-                    telegram_connected=True
+                    success=True, account_name=self.account.name, already_authorized=True, telegram_connected=True
                 )
 
             # 5. Open OAuth popup
@@ -735,9 +729,7 @@ class FragmentAuth:
                 popup = await self._open_oauth_popup(page)
             except Exception as e:
                 return FragmentResult(
-                    success=False,
-                    account_name=self.account.name,
-                    error=f"Failed to open OAuth popup: {e}"
+                    success=False, account_name=self.account.name, error=f"Failed to open OAuth popup: {e}"
                 )
 
             await self._human_delay(0.5, 1.0)
@@ -749,7 +741,7 @@ class FragmentAuth:
                     return FragmentResult(
                         success=False,
                         account_name=self.account.name,
-                        error="Failed to click ACCEPT on existing session popup"
+                        error="Failed to click ACCEPT on existing session popup",
                     )
                 logger.info("[6/6] Skipping Telethon confirmation (existing session)")
             else:
@@ -766,7 +758,7 @@ class FragmentAuth:
                         return FragmentResult(
                             success=False,
                             account_name=self.account.name,
-                            error="Phone submission failed on OAuth popup"
+                            error="Phone submission failed on OAuth popup",
                         )
 
                     # 7. Wait for Telethon confirmation (handler already registered)
@@ -789,7 +781,7 @@ class FragmentAuth:
                             return FragmentResult(
                                 success=False,
                                 account_name=self.account.name,
-                                error="Confirmation timeout — no message from Telegram"
+                                error="Confirmation timeout — no message from Telegram",
                             )
                         logger.info("Fragment authorized despite no Telethon confirmation")
                 finally:
@@ -808,31 +800,19 @@ class FragmentAuth:
                 return FragmentResult(
                     success=False,
                     account_name=self.account.name,
-                    error="Fragment auth did not complete after confirmation"
+                    error="Fragment auth did not complete after confirmation",
                 )
 
             if browser_ctx:
                 browser_ctx.save_state_on_close = True
-            return FragmentResult(
-                success=True,
-                account_name=self.account.name,
-                telegram_connected=True
-            )
+            return FragmentResult(success=True, account_name=self.account.name, telegram_connected=True)
 
         except FloodWaitError as e:
-            logger.error("FloodWait: %ds", e.seconds)
-            return FragmentResult(
-                success=False,
-                account_name=self.account.name,
-                error=f"FloodWait: {e.seconds}s"
-            )
+            logger.exception("FloodWait: %ds", e.seconds)
+            return FragmentResult(success=False, account_name=self.account.name, error=f"FloodWait: {e.seconds}s")
         except Exception as e:
             logger.error("Fragment auth error: %s", e, exc_info=True)
-            return FragmentResult(
-                success=False,
-                account_name=self.account.name,
-                error=str(e)
-            )
+            return FragmentResult(success=False, account_name=self.account.name, error=str(e))
         finally:
             # Restore original exception handler only when last worker finishes
             cls._suppressor_refcount -= 1
@@ -858,11 +838,11 @@ class FragmentAuth:
 
 async def fragment_account(
     account_dir: Path,
-    password_2fa: Optional[str] = None,
+    password_2fa: str | None = None,
     headless: bool = True,
-    proxy_override: Optional[str] = None,
-    browser_manager: Optional[BrowserManager] = None,
-    on_status: Optional[Callable[[str], None]] = None,
+    proxy_override: str | None = None,
+    browser_manager: BrowserManager | None = None,
+    on_status: Callable[[str], None] | None = None,
 ) -> AuthResult:
     """Authorize one account on fragment.com. Pool-compatible wrapper.
 

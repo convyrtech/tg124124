@@ -16,16 +16,15 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
 
 from .paths import LOGS_DIR
 
 
 def setup_logging(
     level: int = logging.INFO,
-    log_file: Optional[Path] = None,
-    format_string: Optional[str] = None,
-    enable_file_logging: bool = True
+    log_file: Path | None = None,
+    format_string: str | None = None,
+    enable_file_logging: bool = True,
 ) -> None:
     """
     Configure root logger with consistent formatting.
@@ -40,7 +39,7 @@ def setup_logging(
         TGWA_DEBUG: Set to '1' or 'true' to force DEBUG level logging
     """
     # Override level if TGWA_DEBUG env var is set
-    if os.environ.get('TGWA_DEBUG', '').lower() in ('1', 'true'):
+    if os.environ.get("TGWA_DEBUG", "").lower() in ("1", "true"):
         level = logging.DEBUG
 
     if format_string is None:
@@ -68,10 +67,7 @@ def setup_logging(
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
             rotating_handler = RotatingFileHandler(
-                LOGS_DIR / "app.log",
-                maxBytes=10 * 1024 * 1024,
-                backupCount=5,
-                encoding='utf-8'
+                LOGS_DIR / "app.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
             )
             rotating_handler.setLevel(level)
             rotating_handler.setFormatter(formatter)
@@ -84,7 +80,7 @@ def setup_logging(
     # Optional additional file handler (for CLI --log-file)
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
@@ -105,6 +101,7 @@ def get_logger(name: str) -> logging.Logger:
 
 # Default setup on import (can be reconfigured by CLI)
 _initialized = False
+
 
 def _ensure_initialized() -> None:
     """Initialize logging with defaults if not already done."""

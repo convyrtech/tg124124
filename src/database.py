@@ -2,15 +2,17 @@
 SQLite database for TG Web Auth metadata.
 Sessions remain as files for portability.
 """
+
 import asyncio
+import logging
 import sqlite3
 import uuid
-import aiosqlite
-from pathlib import Path
-from typing import Optional, List, Any
 from dataclasses import dataclass
 from datetime import datetime
-import logging
+from pathlib import Path
+from typing import Any
+
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
@@ -18,44 +20,47 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AccountRecord:
     """Account metadata stored in database."""
+
     id: int
     name: str
-    phone: Optional[str]
-    username: Optional[str]
+    phone: str | None
+    username: str | None
     session_path: str
-    proxy_id: Optional[int]
+    proxy_id: int | None
     status: str  # pending, healthy, error, migrating
-    last_check: Optional[datetime]
-    error_message: Optional[str]
+    last_check: datetime | None
+    error_message: str | None
     created_at: datetime
-    fragment_status: Optional[str] = None  # None, "authorized"
+    fragment_status: str | None = None  # None, "authorized"
 
 
 @dataclass
 class ProxyRecord:
     """Proxy metadata stored in database."""
+
     id: int
     host: str
     port: int
-    username: Optional[str]
-    password: Optional[str]
+    username: str | None
+    password: str | None
     protocol: str  # socks5, http
     status: str  # active, dead, reserved
-    assigned_account_id: Optional[int]
-    last_check: Optional[datetime]
+    assigned_account_id: int | None
+    last_check: datetime | None
     created_at: datetime
 
 
 @dataclass
 class MigrationRecord:
     """Migration history record."""
+
     id: int
     account_id: int
     started_at: datetime
-    completed_at: Optional[datetime]
-    success: Optional[bool]
-    error_message: Optional[str]
-    profile_path: Optional[str]
+    completed_at: datetime | None
+    success: bool | None
+    error_message: str | None
+    profile_path: str | None
 
 
 class Database:
@@ -63,20 +68,34 @@ class Database:
 
     # Whitelist of allowed fields for update_account to prevent SQL injection
     ALLOWED_ACCOUNT_FIELDS = {
-        'name', 'phone', 'username', 'session_path',
-        'proxy_id', 'status', 'last_check', 'error_message',
-        'fragment_status', 'web_last_verified', 'auth_ttl_days'
+        "name",
+        "phone",
+        "username",
+        "session_path",
+        "proxy_id",
+        "status",
+        "last_check",
+        "error_message",
+        "fragment_status",
+        "web_last_verified",
+        "auth_ttl_days",
     }
 
     # Whitelist for update_proxy
     ALLOWED_PROXY_FIELDS = {
-        'host', 'port', 'username', 'password', 'protocol',
-        'status', 'assigned_account_id', 'last_check'
+        "host",
+        "port",
+        "username",
+        "password",
+        "protocol",
+        "status",
+        "assigned_account_id",
+        "last_check",
     }
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self._connection: Optional[aiosqlite.Connection] = None
+        self._connection: aiosqlite.Connection | None = None
         # BUG-2 FIX: Lock to serialize multi-step write operations
         # across concurrent workers sharing a single aiosqlite connection.
         self._db_lock: asyncio.Lock = asyncio.Lock()
@@ -196,10 +215,12 @@ class Database:
                 return
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e) and attempt < max_retries - 1:
-                    wait = 0.1 * (2 ** attempt)  # 0.1s, 0.2s, 0.4s
+                    wait = 0.1 * (2**attempt)  # 0.1s, 0.2s, 0.4s
                     logger.warning(
                         "SQLite busy (attempt %d/%d), retrying in %.1fs",
-                        attempt + 1, max_retries, wait,
+                        attempt + 1,
+                        max_retries,
+                        wait,
                     )
                     await asyncio.sleep(wait)
                     continue
@@ -209,17 +230,15 @@ class Database:
         self,
         name: str,
         session_path: str,
-        phone: Optional[str] = None,
-        username: Optional[str] = None,
-        proxy_id: Optional[int] = None,
-        status: str = "pending"
+        phone: str | None = None,
+        username: str | None = None,
+        proxy_id: int | None = None,
+        status: str = "pending",
     ) -> int:
         """Add new account, return ID. Skips if name already exists."""
         async with self._db_lock:
             # Check for existing account to prevent duplicates
-            async with self._connection.execute(
-                "SELECT id FROM accounts WHERE name = ? LIMIT 1", (name,)
-            ) as cursor:
+            async with self._connection.execute("SELECT id FROM accounts WHERE name = ? LIMIT 1", (name,)) as cursor:
                 existing = await cursor.fetchone()
                 if existing:
                     return existing[0]
@@ -228,16 +247,14 @@ class Database:
                 INSERT INTO accounts (name, session_path, phone, username, proxy_id, status)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (name, session_path, phone, username, proxy_id, status)
+                (name, session_path, phone, username, proxy_id, status),
             ) as cursor:
                 await self._commit_with_retry()
                 return cursor.lastrowid
 
     async def account_exists(self, name: str) -> bool:
         """Check if account with exact name exists. O(1) via index."""
-        async with self._connection.execute(
-            "SELECT 1 FROM accounts WHERE name = ? LIMIT 1", (name,)
-        ) as cursor:
+        async with self._connection.execute("SELECT 1 FROM accounts WHERE name = ? LIMIT 1", (name,)) as cursor:
             return await cursor.fetchone() is not None
 
     async def remove_duplicate_accounts(self) -> int:
@@ -275,19 +292,14 @@ class Database:
             placeholders = ",".join("?" * len(dup_ids))
 
             # Delete duplicates (keeping first occurrence)
-            await self._connection.execute(
-                f"DELETE FROM accounts WHERE id IN ({placeholders})",
-                dup_ids
-            )
+            await self._connection.execute(f"DELETE FROM accounts WHERE id IN ({placeholders})", dup_ids)
             await self._commit_with_retry()
             logger.info("Removed %d duplicate accounts", len(dup_ids))
             return len(dup_ids)
 
-    async def get_account(self, account_id: int) -> Optional[AccountRecord]:
+    async def get_account(self, account_id: int) -> AccountRecord | None:
         """Get account by ID."""
-        async with self._connection.execute(
-            "SELECT * FROM accounts WHERE id = ?", (account_id,)
-        ) as cursor:
+        async with self._connection.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
                 return AccountRecord(
@@ -305,14 +317,10 @@ class Database:
                 )
             return None
 
-    async def list_accounts(
-        self,
-        status: Optional[str] = None,
-        search: Optional[str] = None
-    ) -> List[AccountRecord]:
+    async def list_accounts(self, status: str | None = None, search: str | None = None) -> list[AccountRecord]:
         """List accounts with optional filters."""
         query = "SELECT * FROM accounts WHERE 1=1"
-        params: List[Any] = []
+        params: list[Any] = []
 
         if status:
             query += " AND status = ?"
@@ -351,13 +359,16 @@ class Database:
             Dict with account status counts and proxy counts.
         """
         result = {
-            "total": 0, "healthy": 0, "migrating": 0, "errors": 0,
-            "fragment_authorized": 0, "proxies_active": 0, "proxies_total": 0,
+            "total": 0,
+            "healthy": 0,
+            "migrating": 0,
+            "errors": 0,
+            "fragment_authorized": 0,
+            "proxies_active": 0,
+            "proxies_total": 0,
         }
         # Account status counts
-        async with self._connection.execute(
-            "SELECT status, COUNT(*) as cnt FROM accounts GROUP BY status"
-        ) as cursor:
+        async with self._connection.execute("SELECT status, COUNT(*) as cnt FROM accounts GROUP BY status") as cursor:
             rows = await cursor.fetchall()
             for row in rows:
                 result["total"] += row["cnt"]
@@ -377,9 +388,7 @@ class Database:
                 result["fragment_authorized"] = row["cnt"]
 
         # Proxy counts
-        async with self._connection.execute(
-            "SELECT status, COUNT(*) as cnt FROM proxies GROUP BY status"
-        ) as cursor:
+        async with self._connection.execute("SELECT status, COUNT(*) as cnt FROM proxies GROUP BY status") as cursor:
             rows = await cursor.fetchall()
             for row in rows:
                 result["proxies_total"] += row["cnt"]
@@ -399,22 +408,19 @@ class Database:
             raise ValueError(f"Invalid account fields: {invalid_fields}")
 
         fields = ", ".join(f"{k} = ?" for k in kwargs.keys())
-        values = list(kwargs.values()) + [account_id]
+        values = [*list(kwargs.values()), account_id]
 
         async with self._db_lock:
-            await self._connection.execute(
-                f"UPDATE accounts SET {fields} WHERE id = ?",
-                values
-            )
+            await self._connection.execute(f"UPDATE accounts SET {fields} WHERE id = ?", values)
             await self._commit_with_retry()
 
     async def add_proxy(
         self,
         host: str,
         port: int,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
-        protocol: str = "socks5"
+        username: str | None = None,
+        password: str | None = None,
+        protocol: str = "socks5",
     ) -> int:
         """Add new proxy, return ID."""
         async with self._db_lock:
@@ -423,16 +429,14 @@ class Database:
                 INSERT INTO proxies (host, port, username, password, protocol)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (host, port, username, password, protocol)
+                (host, port, username, password, protocol),
             ) as cursor:
                 await self._commit_with_retry()
                 return cursor.lastrowid
 
-    async def get_proxy(self, proxy_id: int) -> Optional[ProxyRecord]:
+    async def get_proxy(self, proxy_id: int) -> ProxyRecord | None:
         """Get proxy by ID."""
-        async with self._connection.execute(
-            "SELECT * FROM proxies WHERE id = ?", (proxy_id,)
-        ) as cursor:
+        async with self._connection.execute("SELECT * FROM proxies WHERE id = ?", (proxy_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
                 return ProxyRecord(
@@ -445,11 +449,11 @@ class Database:
                     status=row["status"],
                     assigned_account_id=row["assigned_account_id"],
                     last_check=row["last_check"],
-                    created_at=row["created_at"]
+                    created_at=row["created_at"],
                 )
             return None
 
-    async def find_proxy_by_host_port(self, host: str, port: int) -> Optional[int]:
+    async def find_proxy_by_host_port(self, host: str, port: int) -> int | None:
         """Find proxy ID by host and port. O(1) via UNIQUE index.
 
         Args:
@@ -460,13 +464,12 @@ class Database:
             Proxy ID if found, None otherwise.
         """
         async with self._connection.execute(
-            "SELECT id FROM proxies WHERE host = ? AND port = ?",
-            (host, port)
+            "SELECT id FROM proxies WHERE host = ? AND port = ?", (host, port)
         ) as cursor:
             row = await cursor.fetchone()
             return row["id"] if row else None
 
-    async def get_free_proxy(self) -> Optional[ProxyRecord]:
+    async def get_free_proxy(self) -> ProxyRecord | None:
         """Get unassigned active proxy."""
         async with self._connection.execute(
             """
@@ -488,7 +491,7 @@ class Database:
                     status=row["status"],
                     assigned_account_id=row["assigned_account_id"],
                     last_check=row["last_check"],
-                    created_at=row["created_at"]
+                    created_at=row["created_at"],
                 )
             return None
 
@@ -511,34 +514,25 @@ class Database:
                    SET assigned_account_id = ?
                    WHERE id = ?
                      AND (assigned_account_id IS NULL OR assigned_account_id = ?)""",
-                (account_id, proxy_id, account_id)
+                (account_id, proxy_id, account_id),
             ) as cursor:
                 if cursor.rowcount == 0:
                     # Either proxy doesn't exist or is assigned to another account
                     async with self._connection.execute(
-                        "SELECT assigned_account_id FROM proxies WHERE id = ?",
-                        (proxy_id,)
+                        "SELECT assigned_account_id FROM proxies WHERE id = ?", (proxy_id,)
                     ) as check:
                         row = await check.fetchone()
                         if row is None:
                             raise ValueError(f"Proxy {proxy_id} not found")
-                        raise ValueError(
-                            f"Proxy {proxy_id} already assigned to account {row[0]}"
-                        )
+                        raise ValueError(f"Proxy {proxy_id} already assigned to account {row[0]}")
 
-            await self._connection.execute(
-                "UPDATE accounts SET proxy_id = ? WHERE id = ?",
-                (proxy_id, account_id)
-            )
+            await self._connection.execute("UPDATE accounts SET proxy_id = ? WHERE id = ?", (proxy_id, account_id))
             await self._commit_with_retry()
 
     async def delete_proxy(self, proxy_id: int) -> None:
         """Delete proxy by ID."""
         async with self._db_lock:
-            await self._connection.execute(
-                "DELETE FROM proxies WHERE id = ?",
-                (proxy_id,)
-            )
+            await self._connection.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
             await self._commit_with_retry()
 
     async def update_proxy(self, proxy_id: int, **kwargs) -> None:
@@ -567,20 +561,13 @@ class Database:
         values.append(proxy_id)
 
         async with self._db_lock:
-            await self._connection.execute(
-                f"UPDATE proxies SET {', '.join(fields)} WHERE id = ?",
-                values
-            )
+            await self._connection.execute(f"UPDATE proxies SET {', '.join(fields)} WHERE id = ?", values)
             await self._commit_with_retry()
 
-    async def list_proxies(
-        self,
-        status: Optional[str] = None,
-        unassigned_only: bool = False
-    ) -> List[ProxyRecord]:
+    async def list_proxies(self, status: str | None = None, unassigned_only: bool = False) -> list[ProxyRecord]:
         """List proxies with filters."""
         query = "SELECT * FROM proxies WHERE 1=1"
-        params: List[Any] = []
+        params: list[Any] = []
 
         if status:
             query += " AND status = ?"
@@ -604,7 +591,7 @@ class Database:
                     status=row["status"],
                     assigned_account_id=row["assigned_account_id"],
                     last_check=row["last_check"],
-                    created_at=row["created_at"]
+                    created_at=row["created_at"],
                 )
                 for row in rows
             ]
@@ -649,27 +636,20 @@ class Database:
             Migration record ID.
         """
         async with self._db_lock:
-            await self._connection.execute(
-                "UPDATE accounts SET status = ? WHERE id = ?",
-                ("migrating", account_id)
-            )
+            await self._connection.execute("UPDATE accounts SET status = ? WHERE id = ?", ("migrating", account_id))
             async with self._connection.execute(
                 """
                 INSERT INTO migrations (account_id, started_at)
                 VALUES (?, ?)
                 """,
-                (account_id, datetime.now().isoformat())
+                (account_id, datetime.now().isoformat()),
             ) as cursor:
                 migration_id = cursor.lastrowid
             await self._commit_with_retry()
             return migration_id
 
     async def complete_migration(
-        self,
-        migration_id: int,
-        success: bool,
-        error_message: Optional[str] = None,
-        profile_path: Optional[str] = None
+        self, migration_id: int, success: bool, error_message: str | None = None, profile_path: str | None = None
     ) -> None:
         """Record migration completion.
 
@@ -690,13 +670,12 @@ class Database:
                     profile_path = ?
                 WHERE id = ?
                 """,
-                (1 if success else 0, error_message, profile_path, migration_id)
+                (1 if success else 0, error_message, profile_path, migration_id),
             )
 
             # Get account_id and update status BEFORE committing
             async with self._connection.execute(
-                "SELECT account_id FROM migrations WHERE id = ?",
-                (migration_id,)
+                "SELECT account_id FROM migrations WHERE id = ?", (migration_id,)
             ) as cursor:
                 row = await cursor.fetchone()
                 if row:
@@ -704,13 +683,13 @@ class Database:
                     new_status = "healthy" if success else "error"
                     await self._connection.execute(
                         "UPDATE accounts SET status = ?, error_message = ? WHERE id = ?",
-                        (new_status, error_message, account_id)
+                        (new_status, error_message, account_id),
                     )
 
             # Single commit covers both tables
             await self._commit_with_retry()
 
-    async def get_pending_migrations(self) -> List[AccountRecord]:
+    async def get_pending_migrations(self) -> list[AccountRecord]:
         """
         Get accounts that need migration (status='pending' or 'migrating').
 
@@ -740,7 +719,7 @@ class Database:
                 for row in rows
             ]
 
-    async def get_incomplete_migrations(self) -> List[MigrationRecord]:
+    async def get_incomplete_migrations(self) -> list[MigrationRecord]:
         """
         Get migrations that started but never completed.
 
@@ -762,7 +741,7 @@ class Database:
                     completed_at=row["completed_at"],
                     success=bool(row["success"]) if row["success"] is not None else None,
                     error_message=row["error_message"],
-                    profile_path=row["profile_path"]
+                    profile_path=row["profile_path"],
                 )
                 for row in rows
             ]
@@ -791,7 +770,7 @@ class Database:
                         error_message = 'Interrupted - reset on restart'
                     WHERE id = ?
                     """,
-                    (migration.id,)
+                    (migration.id,),
                 )
 
                 # Reset account status to pending
@@ -802,7 +781,7 @@ class Database:
                         error_message = 'Previous migration interrupted'
                     WHERE id = ? AND status = 'migrating'
                     """,
-                    (migration.account_id,)
+                    (migration.account_id,),
                 )
                 count += 1
 
@@ -814,18 +793,9 @@ class Database:
 
     async def get_migration_stats(self) -> dict:
         """Get migration statistics using SQL COUNT + GROUP BY."""
-        stats = {
-            "total": 0,
-            "pending": 0,
-            "migrating": 0,
-            "healthy": 0,
-            "error": 0,
-            "success_rate": 0.0
-        }
+        stats = {"total": 0, "pending": 0, "migrating": 0, "healthy": 0, "error": 0, "success_rate": 0.0}
 
-        async with self._connection.execute(
-            "SELECT status, COUNT(*) as cnt FROM accounts GROUP BY status"
-        ) as cursor:
+        async with self._connection.execute("SELECT status, COUNT(*) as cnt FROM accounts GROUP BY status") as cursor:
             async for row in cursor:
                 status = row["status"]
                 if status in stats:
@@ -855,8 +825,7 @@ class Database:
         async with self._db_lock:
             # FIX D3: Auto-close orphaned batches from previous crashes
             await self._connection.execute(
-                "UPDATE batches SET finished_at = ? WHERE finished_at IS NULL",
-                (datetime.now().isoformat(),)
+                "UPDATE batches SET finished_at = ? WHERE finished_at IS NULL", (datetime.now().isoformat(),)
             )
 
             batch_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
@@ -866,16 +835,14 @@ class Database:
                 INSERT INTO batches (batch_id, total_count)
                 VALUES (?, ?)
                 """,
-                (batch_id, len(account_names))
+                (batch_id, len(account_names)),
             ) as cursor:
                 db_id = cursor.lastrowid
 
             # Create pending migration records linked to batch
             for name in account_names:
                 # Find or skip account — caller must ensure accounts exist in DB
-                async with self._connection.execute(
-                    "SELECT id FROM accounts WHERE name = ?", (name,)
-                ) as cursor:
+                async with self._connection.execute("SELECT id FROM accounts WHERE name = ?", (name,)) as cursor:
                     row = await cursor.fetchone()
                     if row:
                         await self._connection.execute(
@@ -883,14 +850,14 @@ class Database:
                             INSERT INTO migrations (account_id, batch_id)
                             VALUES (?, ?)
                             """,
-                            (row["id"], db_id)
+                            (row["id"], db_id),
                         )
 
             await self._commit_with_retry()
             logger.info("Started batch %s with %d accounts", batch_id, len(account_names))
             return batch_id
 
-    async def get_active_batch(self) -> Optional[dict]:
+    async def get_active_batch(self) -> dict | None:
         """
         Get the most recent unfinished batch.
 
@@ -916,9 +883,7 @@ class Database:
                 }
             return None
 
-    async def mark_batch_account_completed(
-        self, batch_id: int, account_name: str
-    ) -> None:
+    async def mark_batch_account_completed(self, batch_id: int, account_name: str) -> None:
         """Mark an account's migration as completed within a batch.
 
         BUG-11 FIX: Inlined account UPDATE SQL instead of calling
@@ -930,9 +895,7 @@ class Database:
             account_name: Account name.
         """
         async with self._db_lock:
-            async with self._connection.execute(
-                "SELECT id FROM accounts WHERE name = ?", (account_name,)
-            ) as cursor:
+            async with self._connection.execute("SELECT id FROM accounts WHERE name = ?", (account_name,)) as cursor:
                 row = await cursor.fetchone()
                 if not row:
                     return
@@ -944,19 +907,14 @@ class Database:
                 SET completed_at = datetime('now'), success = 1
                 WHERE batch_id = ? AND account_id = ? AND completed_at IS NULL
                 """,
-                (batch_id, account_id)
+                (batch_id, account_id),
             )
             # BUG-11 FIX: Inline account update instead of self.update_account()
             # to avoid double-commit (update_account commits internally)
-            await self._connection.execute(
-                "UPDATE accounts SET status = ? WHERE id = ?",
-                ("healthy", account_id)
-            )
+            await self._connection.execute("UPDATE accounts SET status = ? WHERE id = ?", ("healthy", account_id))
             await self._commit_with_retry()
 
-    async def mark_batch_account_failed(
-        self, batch_id: int, account_name: str, error: str
-    ) -> None:
+    async def mark_batch_account_failed(self, batch_id: int, account_name: str, error: str) -> None:
         """Mark an account's migration as failed within a batch.
 
         BUG-11 FIX: Inlined account UPDATE SQL instead of calling
@@ -969,9 +927,7 @@ class Database:
             error: Error message.
         """
         async with self._db_lock:
-            async with self._connection.execute(
-                "SELECT id FROM accounts WHERE name = ?", (account_name,)
-            ) as cursor:
+            async with self._connection.execute("SELECT id FROM accounts WHERE name = ?", (account_name,)) as cursor:
                 row = await cursor.fetchone()
                 if not row:
                     return
@@ -983,13 +939,12 @@ class Database:
                 SET completed_at = datetime('now'), success = 0, error_message = ?
                 WHERE batch_id = ? AND account_id = ? AND completed_at IS NULL
                 """,
-                (error, batch_id, account_id)
+                (error, batch_id, account_id),
             )
             # BUG-11 FIX: Inline account update instead of self.update_account()
             # to avoid double-commit (update_account commits internally)
             await self._connection.execute(
-                "UPDATE accounts SET status = ?, error_message = ? WHERE id = ?",
-                ("error", error, account_id)
+                "UPDATE accounts SET status = ?, error_message = ? WHERE id = ?", ("error", error, account_id)
             )
             await self._commit_with_retry()
 
@@ -1009,7 +964,7 @@ class Database:
             JOIN accounts a ON a.id = m.account_id
             WHERE m.batch_id = ? AND m.completed_at IS NULL
             """,
-            (batch_id,)
+            (batch_id,),
         ) as cursor:
             rows = await cursor.fetchall()
             return [row["name"] for row in rows]
@@ -1030,15 +985,12 @@ class Database:
             JOIN accounts a ON a.id = m.account_id
             WHERE m.batch_id = ? AND m.success = 0
             """,
-            (batch_id,)
+            (batch_id,),
         ) as cursor:
             rows = await cursor.fetchall()
-            return [
-                {"account": row["name"], "error": row["error_message"]}
-                for row in rows
-            ]
+            return [{"account": row["name"], "error": row["error_message"]} for row in rows]
 
-    async def get_batch_status(self) -> Optional[dict]:
+    async def get_batch_status(self) -> dict | None:
         """
         Get status summary of the most recent batch.
 
@@ -1064,20 +1016,17 @@ class Database:
 
         # Count completed/failed/pending
         async with self._connection.execute(
-            "SELECT COUNT(*) as cnt FROM migrations WHERE batch_id = ? AND success = 1",
-            (batch_db_id,)
+            "SELECT COUNT(*) as cnt FROM migrations WHERE batch_id = ? AND success = 1", (batch_db_id,)
         ) as cursor:
             completed = (await cursor.fetchone())["cnt"]
 
         async with self._connection.execute(
-            "SELECT COUNT(*) as cnt FROM migrations WHERE batch_id = ? AND success = 0",
-            (batch_db_id,)
+            "SELECT COUNT(*) as cnt FROM migrations WHERE batch_id = ? AND success = 0", (batch_db_id,)
         ) as cursor:
             failed = (await cursor.fetchone())["cnt"]
 
         async with self._connection.execute(
-            "SELECT COUNT(*) as cnt FROM migrations WHERE batch_id = ? AND completed_at IS NULL",
-            (batch_db_id,)
+            "SELECT COUNT(*) as cnt FROM migrations WHERE batch_id = ? AND completed_at IS NULL", (batch_db_id,)
         ) as cursor:
             pending = (await cursor.fetchone())["cnt"]
 
@@ -1094,14 +1043,20 @@ class Database:
             "is_finished": finished_at is not None,
         }
 
-    async def get_last_batch(self) -> Optional[dict]:
+    async def get_last_batch(self) -> dict | None:
         """Get the most recent batch (including finished ones)."""
         async with self._connection.execute(
             "SELECT id, batch_id, total_count, started_at, finished_at FROM batches ORDER BY started_at DESC LIMIT 1"
         ) as cursor:
             row = await cursor.fetchone()
             if row:
-                return {"id": row[0], "batch_id": row[1], "total_count": row[2], "started_at": row[3], "finished_at": row[4]}
+                return {
+                    "id": row[0],
+                    "batch_id": row[1],
+                    "total_count": row[2],
+                    "started_at": row[3],
+                    "finished_at": row[4],
+                }
             return None
 
     async def finish_batch(self, batch_id: int) -> None:
@@ -1112,10 +1067,7 @@ class Database:
             batch_id: Internal batch row ID.
         """
         async with self._db_lock:
-            await self._connection.execute(
-                "UPDATE batches SET finished_at = datetime('now') WHERE id = ?",
-                (batch_id,)
-            )
+            await self._connection.execute("UPDATE batches SET finished_at = datetime('now') WHERE id = ?", (batch_id,))
             await self._commit_with_retry()
 
     # ==================== Operation Log ====================
@@ -1125,11 +1077,11 @@ class Database:
 
     async def log_operation(
         self,
-        account_id: Optional[int],
+        account_id: int | None,
         operation: str,
         success: bool,
-        error_message: Optional[str] = None,
-        details: Optional[str] = None,
+        error_message: str | None = None,
+        details: str | None = None,
     ) -> None:
         """
         Write an entry to the operation log.
@@ -1149,12 +1101,10 @@ class Database:
                 INSERT INTO operation_log (account_id, operation, success, error_message, details)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (account_id, operation, 1 if success else 0, error_message, details)
+                (account_id, operation, 1 if success else 0, error_message, details),
             )
             # Auto-rotate: delete oldest entries beyond limit (every 100 inserts)
-            async with self._connection.execute(
-                "SELECT COUNT(*) as cnt FROM operation_log"
-            ) as cursor:
+            async with self._connection.execute("SELECT COUNT(*) as cnt FROM operation_log") as cursor:
                 row = await cursor.fetchone()
                 if row and row["cnt"] > self.OPERATION_LOG_MAX_ROWS + 100:
                     await self._connection.execute(
@@ -1163,14 +1113,14 @@ class Database:
                             SELECT id FROM operation_log ORDER BY id DESC LIMIT ?
                         )
                         """,
-                        (self.OPERATION_LOG_MAX_ROWS,)
+                        (self.OPERATION_LOG_MAX_ROWS,),
                     )
             await self._commit_with_retry()
 
     async def get_operation_log(
         self,
-        account_id: Optional[int] = None,
-        operation: Optional[str] = None,
+        account_id: int | None = None,
+        operation: str | None = None,
         limit: int = 100,
     ) -> list[dict]:
         """

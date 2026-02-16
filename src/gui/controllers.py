@@ -1,12 +1,12 @@
 """Business logic controllers for GUI."""
+
 import asyncio
-import socket
-from pathlib import Path
-from typing import Optional, List, Callable
 import logging
 import shutil
+from collections.abc import Callable
+from pathlib import Path
 
-from ..database import Database, AccountRecord, ProxyRecord
+from ..database import AccountRecord, Database, ProxyRecord
 from ..proxy_manager import parse_proxy_line
 
 logger = logging.getLogger(__name__)
@@ -16,10 +16,7 @@ async def check_proxy_connection(host: str, port: int, timeout: float = 5.0) -> 
     """Check if proxy is reachable via TCP connection."""
     try:
         # Use asyncio to check TCP connection
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
-            timeout=timeout
-        )
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
         writer.close()
         await writer.wait_closed()
         return True
@@ -34,9 +31,10 @@ class AppController:
         self.data_dir = data_dir
         self.db_path = data_dir / "tgwebauth.db"
         from ..paths import ACCOUNTS_DIR
+
         self.sessions_dir = ACCOUNTS_DIR
-        self.db: Optional[Database] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self.db: Database | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def initialize(self) -> None:
         """Initialize database and directories."""
@@ -61,7 +59,7 @@ class AppController:
         """
         return await self.db.get_counts()
 
-    async def search_accounts(self, query: str) -> List[AccountRecord]:
+    async def search_accounts(self, query: str) -> list[AccountRecord]:
         """Search accounts by name/username/phone."""
         return await self.db.list_accounts(search=query if query else None)
 
@@ -70,9 +68,7 @@ class AppController:
         return await check_proxy_connection(proxy.host, proxy.port, timeout)
 
     async def import_sessions(
-        self,
-        source_dir: Path,
-        on_progress: Optional[Callable[[int, int, str], None]] = None
+        self, source_dir: Path, on_progress: Callable[[int, int, str], None] | None = None
     ) -> tuple[int, int]:
         """
         Import session files from directory.
@@ -90,9 +86,7 @@ class AppController:
         loop = asyncio.get_running_loop()
 
         # Offload glob to executor (can be slow on network drives / large dirs)
-        session_files = await loop.run_in_executor(
-            None, lambda: list(source_dir.glob("**/*.session"))
-        )
+        session_files = await loop.run_in_executor(None, lambda: list(source_dir.glob("**/*.session")))
         total = len(session_files)
 
         if total == 0:
@@ -113,8 +107,7 @@ class AppController:
                 base = a.name.rsplit(" (", 1)[0]
                 existing_base_names.add(base)
 
-        logger.info("Found %d .session files to import, %d accounts already in DB",
-                     total, len(existing_names))
+        logger.info("Found %d .session files to import, %d accounts already in DB", total, len(existing_names))
 
         imported = 0
         skipped = 0
@@ -131,14 +124,15 @@ class AppController:
                 config_name = None
                 if config_json.exists():
                     try:
+
                         def _read_config(p: Path) -> dict:
-                            with open(p, 'r', encoding='utf-8') as f:
+                            with open(p, encoding="utf-8") as f:
                                 return json_mod.load(f)
 
                         config = await loop.run_in_executor(None, _read_config, config_json)
                         proxy_str = config.get("Proxy")
                         config_name = config.get("Name")
-                    except (json_mod.JSONDecodeError, IOError) as e:
+                    except (OSError, json_mod.JSONDecodeError) as e:
                         logger.warning("Failed to parse config %s: %s", config_json, e)
 
                 # Build final name: "folder (config_name)" only if config_name differs
@@ -155,14 +149,11 @@ class AppController:
                     continue
 
                 # Validate session file size (must be non-empty SQLite)
-                file_size = await loop.run_in_executor(
-                    None, lambda p=session_path: p.stat().st_size
-                )
+                file_size = await loop.run_in_executor(None, lambda p=session_path: p.stat().st_size)
                 if file_size < 1024:
                     skipped += 1
                     reason = f"skip (too small {file_size}B): {name}"
-                    logger.warning("Session file too small: %s (%d bytes)",
-                                   session_path, file_size)
+                    logger.warning("Session file too small: %s (%d bytes)", session_path, file_size)
                     if on_progress:
                         on_progress(i + 1, total, reason)
                     continue
@@ -181,16 +172,12 @@ class AppController:
                     if cfg_json.exists():
                         shutil.copy2(cfg_json, dst_dir / "___config.json")
 
-                await loop.run_in_executor(
-                    None, _copy_files, session_path, account_dir, dest_dir, dest_session
-                )
+                await loop.run_in_executor(None, _copy_files, session_path, account_dir, dest_dir, dest_session)
 
                 # Add to database
                 from ..paths import to_relative_path
-                account_id = await self.db.add_account(
-                    name=name,
-                    session_path=to_relative_path(dest_session)
-                )
+
+                account_id = await self.db.add_account(name=name, session_path=to_relative_path(dest_session))
 
                 # Track in dedup sets for this batch
                 existing_names.add(name)
@@ -216,7 +203,7 @@ class AppController:
         logger.info("Import complete: %d imported, %d skipped", imported, skipped)
         return imported, skipped
 
-    async def _find_or_create_proxy(self, proxy_str: str) -> Optional[int]:
+    async def _find_or_create_proxy(self, proxy_str: str) -> int | None:
         """Find existing proxy or create new one from config string. Returns proxy ID."""
         try:
             host, port, username, password, protocol = self._parse_proxy_line(proxy_str)
@@ -230,9 +217,7 @@ class AppController:
 
             # Create new proxy
             return await self.db.add_proxy(
-                host=host, port=port,
-                username=username, password=password,
-                protocol=protocol
+                host=host, port=port, username=username, password=password, protocol=protocol
             )
         except Exception as e:
             logger.warning("Failed to parse/create proxy from config: %s", e)
@@ -262,11 +247,7 @@ class AppController:
 
                 if host and port:
                     await self.db.add_proxy(
-                        host=host,
-                        port=port,
-                        username=username,
-                        password=password,
-                        protocol=protocol
+                        host=host, port=port, username=username, password=password, protocol=protocol
                     )
                     imported += 1
                 else:

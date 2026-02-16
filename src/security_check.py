@@ -5,6 +5,7 @@ Security Check Module
 Запуск:
     python -m src.security_check --account "account_name" --proxy "socks5:host:port:user:pass"
 """
+
 import asyncio
 import hashlib
 import json
@@ -12,16 +13,15 @@ import logging
 import os
 import re
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 # FIX: WINDOWS ENCODING
-if sys.platform == 'win32':
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-    os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 from .utils import parse_proxy_for_camoufox as parse_proxy
 
@@ -37,11 +37,12 @@ except ImportError as e:
 @dataclass
 class SecurityCheckResult:
     """Результат проверки безопасности"""
+
     timestamp: str
     proxy_ip: str
     detected_ip: str
     webrtc_leak: bool
-    webrtc_local_ip: Optional[str]
+    webrtc_local_ip: str | None
     timezone_match: bool
     expected_timezone: str
     detected_timezone: str
@@ -56,11 +57,7 @@ class SecurityCheckResult:
     @property
     def is_safe(self) -> bool:
         """Проверка что всё безопасно"""
-        return (
-            not self.webrtc_leak and
-            self.timezone_match and
-            self.proxy_ip == self.detected_ip
-        )
+        return not self.webrtc_leak and self.timezone_match and self.proxy_ip == self.detected_ip
 
 
 async def check_ip_and_geo(page) -> dict:
@@ -68,7 +65,7 @@ async def check_ip_and_geo(page) -> dict:
     await page.goto("https://ipapi.co/json/", wait_until="networkidle")
     content = await page.content()
 
-    json_match = re.search(r'\{.*\}', content, re.DOTALL)
+    json_match = re.search(r"\{.*\}", content, re.DOTALL)
     if json_match:
         try:
             return json.loads(json_match.group())
@@ -170,19 +167,14 @@ async def get_fingerprint(page) -> dict:
     """)
 
     # Создаём hash canvas для сравнения
-    fingerprint['canvasHash'] = hashlib.md5(
-        fingerprint['canvasDataUrl'].encode()
-    ).hexdigest()[:16]
-    del fingerprint['canvasDataUrl']  # Не сохраняем raw data
+    fingerprint["canvasHash"] = hashlib.md5(fingerprint["canvasDataUrl"].encode(), usedforsecurity=False).hexdigest()[:16]
+    del fingerprint["canvasDataUrl"]  # Не сохраняем raw data
 
     return fingerprint
 
 
 async def run_security_check(
-    proxy: str,
-    profile_path: Optional[Path] = None,
-    headless: bool = False,
-    use_geoip: bool = False
+    proxy: str, profile_path: Path | None = None, headless: bool = False, use_geoip: bool = False
 ) -> SecurityCheckResult:
     """
     Выполняет полную проверку безопасности.
@@ -220,7 +212,7 @@ async def run_security_check(
         camoufox_args["persistent_context"] = True
         camoufox_args["user_data_dir"] = str(profile_path / "browser_data")
 
-    proxy_info = proxy_config.get('server', 'no proxy')
+    proxy_info = proxy_config.get("server", "no proxy")
     logger.info("Starting Camoufox with proxy: %s, headless: %s", proxy_info, headless)
     if proxy_relay:
         logger.info("Proxy relay active: %s", proxy_relay.local_url)
@@ -232,34 +224,43 @@ async def run_security_check(
             # 1. Проверяем IP и геолокацию
             logger.info("[1/4] Checking IP and geolocation...")
             geo_info = await check_ip_and_geo(page)
-            detected_ip = geo_info.get('ip', 'unknown')
-            expected_tz = geo_info.get('timezone', 'unknown')
-            logger.info("IP: %s, Location: %s %s, Expected TZ: %s",
-                        detected_ip, geo_info.get('city', '?'),
-                        geo_info.get('country_name', '?'), expected_tz)
+            detected_ip = geo_info.get("ip", "unknown")
+            expected_tz = geo_info.get("timezone", "unknown")
+            logger.info(
+                "IP: %s, Location: %s %s, Expected TZ: %s",
+                detected_ip,
+                geo_info.get("city", "?"),
+                geo_info.get("country_name", "?"),
+                expected_tz,
+            )
 
             # 2. Проверяем WebRTC leak
             logger.info("[2/4] Checking WebRTC leak...")
             webrtc_info = await check_webrtc_leak(page)
-            logger.info("WebRTC leak detected: %s", webrtc_info.get('hasLeak', False))
-            if webrtc_info.get('localIPs'):
-                logger.warning("Local IPs exposed via WebRTC: %s", webrtc_info['localIPs'])
+            logger.info("WebRTC leak detected: %s", webrtc_info.get("hasLeak", False))
+            if webrtc_info.get("localIPs"):
+                logger.warning("Local IPs exposed via WebRTC: %s", webrtc_info["localIPs"])
 
             # 3. Собираем fingerprint
             logger.info("[3/4] Collecting fingerprint...")
             fingerprint = await get_fingerprint(page)
-            logger.info("Platform: %s, Screen: %s, Timezone: %s",
-                        fingerprint['platform'], fingerprint['screenResolution'],
-                        fingerprint['timezone'])
-            logger.info("Canvas hash: %s, WebGL: %s..., Webdriver: %s",
-                        fingerprint['canvasHash'], fingerprint['webglVendor'][:30],
-                        fingerprint['webdriver'])
+            logger.info(
+                "Platform: %s, Screen: %s, Timezone: %s",
+                fingerprint["platform"],
+                fingerprint["screenResolution"],
+                fingerprint["timezone"],
+            )
+            logger.info(
+                "Canvas hash: %s, WebGL: %s..., Webdriver: %s",
+                fingerprint["canvasHash"],
+                fingerprint["webglVendor"][:30],
+                fingerprint["webdriver"],
+            )
 
             # 4. Проверяем совпадение timezone
             logger.info("[4/4] Validating timezone match...")
-            tz_match = fingerprint['timezone'] == expected_tz
-            logger.info("TZ match: %s (expected=%s, detected=%s)",
-                        tz_match, expected_tz, fingerprint['timezone'])
+            tz_match = fingerprint["timezone"] == expected_tz
+            logger.info("TZ match: %s (expected=%s, detected=%s)", tz_match, expected_tz, fingerprint["timezone"])
 
             proxy_parts = proxy.split(":")
             proxy_ip = proxy_parts[1] if len(proxy_parts) >= 3 else "unknown"
@@ -268,24 +269,24 @@ async def run_security_check(
                 timestamp=datetime.now().isoformat(),
                 proxy_ip=proxy_ip,
                 detected_ip=detected_ip,
-                webrtc_leak=webrtc_info.get('hasLeak', False),
-                webrtc_local_ip=(webrtc_info.get('localIPs') or [None])[0],
+                webrtc_leak=webrtc_info.get("hasLeak", False),
+                webrtc_local_ip=(webrtc_info.get("localIPs") or [None])[0],
                 timezone_match=tz_match,
                 expected_timezone=expected_tz,
-                detected_timezone=fingerprint['timezone'],
-                canvas_hash=fingerprint['canvasHash'],
-                webgl_vendor=fingerprint['webglVendor'],
-                webgl_renderer=fingerprint['webglRenderer'],
-                user_agent=fingerprint['userAgent'],
-                screen_resolution=fingerprint['screenResolution'],
-                languages=fingerprint['languages'],
-                platform=fingerprint['platform'],
+                detected_timezone=fingerprint["timezone"],
+                canvas_hash=fingerprint["canvasHash"],
+                webgl_vendor=fingerprint["webglVendor"],
+                webgl_renderer=fingerprint["webglRenderer"],
+                user_agent=fingerprint["userAgent"],
+                screen_resolution=fingerprint["screenResolution"],
+                languages=fingerprint["languages"],
+                platform=fingerprint["platform"],
             )
 
             # Сохраняем результат если указан профиль
             if profile_path:
                 result_path = profile_path / "security_check.json"
-                with open(result_path, 'w', encoding='utf-8') as f:
+                with open(result_path, "w", encoding="utf-8") as f:
                     json.dump(asdict(result), f, indent=2, ensure_ascii=False)
                 logger.info("Results saved to: %s", result_path)
 
@@ -316,20 +317,24 @@ def print_summary(result: SecurityCheckResult):
 
     # WebRTC check
     webrtc_ok = not result.webrtc_leak
-    lines.append(f"{'WebRTC Leak':<25} {'✓ Blocked' if webrtc_ok else '✗ LEAK!':<15} {result.webrtc_local_ip or 'None'}")
+    lines.append(
+        f"{'WebRTC Leak':<25} {'✓ Blocked' if webrtc_ok else '✗ LEAK!':<15} {result.webrtc_local_ip or 'None'}"
+    )
 
     # Timezone check
     tz_ok = result.timezone_match
     lines.append(f"{'Timezone Match':<25} {'✓ OK' if tz_ok else '✗ MISMATCH':<15} {result.detected_timezone}")
 
     # Fingerprint info
-    lines.extend([
-        "",
-        f"{'Canvas Hash':<25} {result.canvas_hash}",
-        f"{'Screen':<25} {result.screen_resolution}",
-        f"{'Platform':<25} {result.platform}",
-        "=" * 60,
-    ])
+    lines.extend(
+        [
+            "",
+            f"{'Canvas Hash':<25} {result.canvas_hash}",
+            f"{'Screen':<25} {result.screen_resolution}",
+            f"{'Platform':<25} {result.platform}",
+            "=" * 60,
+        ]
+    )
 
     if not result.is_safe:
         lines.append("")
@@ -361,10 +366,7 @@ async def main():
 
     try:
         result = await run_security_check(
-            proxy=args.proxy,
-            profile_path=profile_path,
-            headless=args.headless,
-            use_geoip=args.geoip
+            proxy=args.proxy, profile_path=profile_path, headless=args.headless, use_geoip=args.geoip
         )
         print_summary(result)
 

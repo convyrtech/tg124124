@@ -11,13 +11,13 @@ Proxy Relay Module
     # Используем local_url в браузере
     await relay.stop()
 """
+
 import asyncio
 import logging
 import os
 import socket
 import sys
 from dataclasses import dataclass
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +25,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ProxyConfig:
     """Конфигурация SOCKS5 прокси"""
+
     protocol: str
     host: str
     port: int
-    username: Optional[str] = None
-    password: Optional[str] = None
+    username: str | None = None
+    password: str | None = None
 
     @classmethod
     def parse(cls, proxy_str: str) -> "ProxyConfig":
@@ -61,7 +62,7 @@ class ProxyConfig:
 def find_free_port() -> int:
     """Находит свободный порт"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
+        s.bind(("127.0.0.1", 0))
         s.listen(1)
         port = s.getsockname()[1]
     return port
@@ -83,21 +84,21 @@ class ProxyRelay:
         """
         self.config = ProxyConfig.parse(socks5_proxy)
         self.local_host = local_host
-        self.local_port: Optional[int] = None
-        self._process: Optional[asyncio.subprocess.Process] = None
+        self.local_port: int | None = None
+        self._process: asyncio.subprocess.Process | None = None
         self._server_handle = None  # For in-process pproxy (frozen exe)
         self._pproxy_task = None  # Monitoring task for in-process pproxy
         self._started = False
 
     @property
-    def local_url(self) -> Optional[str]:
+    def local_url(self) -> str | None:
         """URL локального HTTP прокси для браузера"""
         if self.local_port:
             return f"http://{self.local_host}:{self.local_port}"
         return None
 
     @property
-    def browser_proxy_config(self) -> Optional[dict]:
+    def browser_proxy_config(self) -> dict | None:
         """Конфиг прокси для Camoufox/Playwright (без auth!)"""
         if self.local_port:
             return {"server": f"http://{self.local_host}:{self.local_port}"}
@@ -130,7 +131,7 @@ class ProxyRelay:
                 logger.debug("Listen: %s", listen_uri)
                 logger.debug("Remote: %s://%s:%s", self.config.protocol, self.config.host, self.config.port)
 
-                if getattr(sys, 'frozen', False):
+                if getattr(sys, "frozen", False):
                     await self._start_in_process(listen_uri, remote_uri)
                 else:
                     await self._start_subprocess(listen_uri, remote_uri)
@@ -143,13 +144,13 @@ class ProxyRelay:
                             sock.connect((self.local_host, self.local_port))
                             logger.debug("Relay verified listening on port %d", self.local_port)
                             break
-                    except (socket.error, socket.timeout):
+                    except (TimeoutError, OSError):
                         if retry < 9:
                             await asyncio.sleep(0.3)
                         else:
                             raise RuntimeError(
                                 f"Proxy relay not responding on {self.local_host}:{self.local_port}"
-                            )
+                            ) from None
 
                 self._started = True
                 logger.info("Started on %s", self.local_url)
@@ -176,7 +177,7 @@ class ProxyRelay:
 
         server = pproxy.Server(listen_uri)
         remote = pproxy.Connection(remote_uri)
-        self._server_handle = await server.start_server({'rserver': [remote]})
+        self._server_handle = await server.start_server({"rserver": [remote]})
         # Wrap in a monitored task so exceptions are caught
         self._pproxy_task = asyncio.create_task(self._monitor_pproxy_server())
         logger.debug("ProxyRelay started in-process (frozen mode)")
@@ -188,24 +189,17 @@ class ProxyRelay:
             if self._server_handle:
                 await self._server_handle.wait_closed()
         except Exception as e:
-            logger.error("In-process pproxy server crashed: %s", e)
+            logger.exception("In-process pproxy server crashed: %s", e)
             # Don't let it propagate to the event loop
 
     async def _start_subprocess(self, listen_uri: str, remote_uri: str) -> None:
         """Start pproxy relay as subprocess (dev mode)."""
         wrapper_path = os.path.join(os.path.dirname(__file__), "pproxy_wrapper.py")
 
-        cmd = [
-            sys.executable, wrapper_path,
-            "-l", listen_uri,
-            "-r", remote_uri,
-            "-v"
-        ]
+        cmd = [sys.executable, wrapper_path, "-l", listen_uri, "-r", remote_uri, "-v"]
 
         self._process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
 
         await asyncio.sleep(0.5)
@@ -214,6 +208,7 @@ class ProxyRelay:
             stderr = await self._process.stderr.read()
             self._process = None
             from .utils import sanitize_error
+
             raise RuntimeError(f"ProxyRelay failed to start: {sanitize_error(stderr.decode())}")
 
         logger.debug("ProxyRelay process started (PID: %d)", self._process.pid)
@@ -258,13 +253,13 @@ class ProxyRelay:
                 self._process.terminate()
                 await asyncio.wait_for(self._process.wait(), timeout=5)
                 logger.debug("ProxyRelay process terminated (PID: %d)", pid)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("ProxyRelay process did not terminate in 5s, killing (PID: %d)", pid)
                 self._process.kill()
                 try:
                     await asyncio.wait_for(self._process.wait(), timeout=3)
-                except asyncio.TimeoutError:
-                    logger.error("ProxyRelay process stuck after kill (PID: %d)", pid)
+                except TimeoutError:
+                    logger.exception("ProxyRelay process stuck after kill (PID: %d)", pid)
             except ProcessLookupError:
                 logger.debug("Process already terminated (PID: %d)", pid)
             finally:
@@ -333,7 +328,7 @@ def needs_relay(proxy_str: str) -> bool:
         return False
 
     config = ProxyConfig.parse(proxy_str)
-    return config.protocol.lower() in ('socks5', 'socks4') and config.has_auth
+    return config.protocol.lower() in ("socks5", "socks4") and config.has_auth
 
 
 async def test_relay():

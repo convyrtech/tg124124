@@ -27,8 +27,8 @@ def _write_crash_file(exc_type, exc_value, exc_tb) -> None:
                 crash_path.unlink()
         except OSError:
             pass
-        with open(crash_path, 'a', encoding='utf-8') as f:
-            f.write(f"\n{'='*60}\n")
+        with open(crash_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'=' * 60}\n")
             f.write(f"Crash at: {datetime.now().isoformat()}\n")
             f.write(f"Exception: {exc_type.__name__}: {sanitize_error(str(exc_value))}\n\n")
             # Format traceback but sanitize each line
@@ -51,22 +51,21 @@ def _excepthook(exc_type, exc_value, exc_tb) -> None:
         sys.__excepthook__(exc_type, exc_value, exc_tb)
         return
 
-    logger.critical(
-        "Unhandled exception: %s: %s", exc_type.__name__, exc_value,
-        exc_info=(exc_type, exc_value, exc_tb)
-    )
+    logger.critical("Unhandled exception: %s: %s", exc_type.__name__, exc_value, exc_info=(exc_type, exc_value, exc_tb))
     _write_crash_file(exc_type, exc_value, exc_tb)
 
 
 def _asyncio_exception_handler(loop, context) -> None:
     """Handle uncaught asyncio exceptions."""
-    exception = context.get('exception')
-    message = context.get('message', 'Unknown asyncio error')
+    exception = context.get("exception")
+    message = context.get("message", "Unknown asyncio error")
 
     if exception:
         logger.error(
-            "Asyncio unhandled: %s — %s", message, exception,
-            exc_info=(type(exception), exception, exception.__traceback__)
+            "Asyncio unhandled: %s — %s",
+            message,
+            exception,
+            exc_info=(type(exception), exception, exception.__traceback__),
         )
         _write_crash_file(type(exception), exception, exception.__traceback__)
     else:

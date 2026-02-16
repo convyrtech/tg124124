@@ -1,0 +1,55 @@
+# Ruff configuration for tg-web-auth
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+  "E",      # pycodestyle errors
+  "F",      # pyflakes
+  "W",      # pycodestyle warnings
+  "I",      # isort
+  "UP",     # pyupgrade
+  "ASYNC",  # flake8-async
+  "S",      # flake8-bandit (security)
+  "TRY",    # tryceratops (exception handling)
+  "B",      # flake8-bugbear
+  "C901",   # mccabe complexity
+  "RUF",    # ruff-specific rules
+]
+ignore = [
+  "S101",   # assert used (OK in non-production code paths)
+  "S603",   # subprocess call with shell=False (pproxy needs it)
+  "S607",   # start process with partial executable path
+  "TRY003", # long exception messages (we use Russian)
+  "TRY301", # abstract raise to inner function
+  "E402",   # imports not at top (intentional: after try/except for optional deps)
+  "E501",   # line too long (handled by formatter)
+  "RUF001", # ambiguous unicode in string (Cyrillic is intentional — Russian project)
+  "RUF002", # ambiguous unicode in docstring
+  "RUF003", # ambiguous unicode in comment
+  "RUF012", # mutable class variable annotation
+  "S311",   # pseudo-random generators (used for cooldown timers, not crypto)
+  "S110",   # try-except-pass (best-effort cleanup paths)
+  "TRY300", # return in try (stylistic, not a bug)
+  "S112",   # try-except-continue (intentional fallback)
+  "S608",   # SQL injection false positive (column names from code, not user input)
+  "ASYNC109", # asyncio.wait_for (would require restructuring)
+  "ASYNC110", # while True sleep loop (acceptable pattern)
+  "ASYNC220", # blocking process call in async (subprocess for pproxy)
+  "ASYNC230", # blocking file open (small config files, negligible)
+  "TRY401", # verbose logging in except (logger.exception already includes exc)
+  "C901",   # complex functions (known, would require major refactoring)
+  "RUF013", # implicit Optional (project uses = None style consistently)
+  "S324",   # hashlib insecure hash (not used for crypto)
+  "S310",   # URL audit (URLs are from config, not user input)
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["S", "ASYNC"]
+
+[lint.mccabe]
+max-complexity = 25
+
+[format]
+quote-style = "double"
+indent-style = "space"

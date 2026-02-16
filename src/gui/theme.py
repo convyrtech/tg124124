@@ -1,4 +1,5 @@
 """Hacker-style dark theme for Dear PyGui."""
+
 import dearpygui.dearpygui as dpg
 
 

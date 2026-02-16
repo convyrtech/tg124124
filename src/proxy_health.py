@@ -1,9 +1,10 @@
 """Batch proxy health check with concurrent TCP and SOCKS5+Telegram probing."""
+
 import asyncio
 import logging
 import struct
-from dataclasses import dataclass, field
-from typing import Optional, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from .database import Database, ProxyRecord
 
@@ -17,13 +18,14 @@ _TG_DC2_PORT = 443
 @dataclass
 class ProxyCheckResult:
     """Result of a single proxy health check."""
+
     proxy_id: int
     host: str
     port: int
     alive: bool
     old_status: str
     telegram_reachable: bool = False
-    error: Optional[str] = None
+    error: str | None = None
 
 
 async def check_proxy_connection(host: str, port: int, timeout: float = 5.0) -> bool:
@@ -38,9 +40,7 @@ async def check_proxy_connection(host: str, port: int, timeout: float = 5.0) -> 
         True if TCP connection succeeded.
     """
     try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
-        )
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
         writer.close()
         await writer.wait_closed()
         return True
@@ -51,10 +51,10 @@ async def check_proxy_connection(host: str, port: int, timeout: float = 5.0) -> 
 async def check_proxy_telegram(
     host: str,
     port: int,
-    username: Optional[str] = None,
-    password: Optional[str] = None,
+    username: str | None = None,
+    password: str | None = None,
     timeout: float = 10.0,
-) -> tuple[bool, Optional[str]]:
+) -> tuple[bool, str | None]:
     """Check if proxy can route traffic to Telegram DC via raw SOCKS5 handshake.
 
     Does NOT use python_socks (broken on Python 3.13). Implements SOCKS5
@@ -73,9 +73,7 @@ async def check_proxy_telegram(
     reader = None
     writer = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
-        )
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
 
         # --- SOCKS5 Greeting ---
         if username and password:
@@ -99,11 +97,7 @@ async def check_proxy_telegram(
                 return False, "Proxy requires auth but no credentials provided"
             user_bytes = username.encode("utf-8")
             pass_bytes = password.encode("utf-8")
-            auth_msg = (
-                b"\x01"
-                + bytes([len(user_bytes)]) + user_bytes
-                + bytes([len(pass_bytes)]) + pass_bytes
-            )
+            auth_msg = b"\x01" + bytes([len(user_bytes)]) + user_bytes + bytes([len(pass_bytes)]) + pass_bytes
             writer.write(auth_msg)
             await writer.drain()
 
@@ -150,7 +144,7 @@ async def check_proxy_telegram(
         error_msg = error_map.get(reply_code, f"Unknown error code: {reply_code}")
         return False, error_msg
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return False, "Timeout"
     except ConnectionRefusedError:
         return False, "Connection refused"
@@ -172,7 +166,7 @@ async def check_proxy_batch(
     concurrency: int = 50,
     timeout: float = 10.0,
     deep: bool = True,
-    progress_callback: Optional[Callable[[int, int, ProxyCheckResult], None]] = None,
+    progress_callback: Callable[[int, int, ProxyCheckResult], None] | None = None,
 ) -> dict[str, int]:
     """Batch check all proxies in the database.
 
@@ -201,8 +195,10 @@ async def check_proxy_batch(
         async with sem:
             if deep:
                 alive, error = await check_proxy_telegram(
-                    proxy.host, proxy.port,
-                    username=proxy.username, password=proxy.password,
+                    proxy.host,
+                    proxy.port,
+                    username=proxy.username,
+                    password=proxy.password,
                     timeout=timeout,
                 )
             else:

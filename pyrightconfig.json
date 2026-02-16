@@ -1,0 +1,11 @@
+{
+  "include": ["src"],
+  "exclude": ["tests", "**/__pycache__"],
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.11",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "reportUnusedImport": true,
+  "reportUnusedVariable": true,
+  "reportDuplicateImport": true
+}

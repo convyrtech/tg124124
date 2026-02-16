@@ -11,26 +11,28 @@ QR-код авторизация web.telegram.org через существую�
 
 ВАЖНО: НЕ логировать auth_key или api_hash!
 """
+
 import asyncio
 import base64
-import json
 import io
+import json
 import logging
-import random
 import math
+import random
 import sqlite3
 import sys
 import threading
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any, Callable, Set, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 
 # Logger for this module
 logger = logging.getLogger(__name__)
 
 # Suppress noisy Telethon internal logs
-logging.getLogger('telethon').setLevel(logging.ERROR)
+logging.getLogger("telethon").setLevel(logging.ERROR)
 
 # QR decoding - use OpenCV (works on Windows without extra DLLs)
 try:
@@ -42,27 +44,30 @@ except ImportError as e:
 
 # pyzbar is optional - lazy load to avoid DLL errors on Windows
 pyzbar = None
+
+
 def _get_pyzbar():
     global pyzbar
     if pyzbar is None:
         try:
             from pyzbar import pyzbar as _pyzbar
+
             pyzbar = _pyzbar
         except (ImportError, OSError, FileNotFoundError):
             logger.warning("pyzbar not available (DLL not found or import error), will use OpenCV only")
     return pyzbar
 
+
 # Telethon
 try:
     from telethon import TelegramClient
-    from telethon.sessions import SQLiteSession
-    from telethon.tl.functions.auth import AcceptLoginTokenRequest
+    from telethon.errors import FloodWaitError
     from telethon.tl.functions.account import SetAuthorizationTTLRequest
-    from telethon.errors import SessionPasswordNeededError, FloodWaitError
+    from telethon.tl.functions.auth import AcceptLoginTokenRequest
 except ImportError as e:
     raise ImportError("telethon not installed. Run: pip install telethon") from e
 
-from .browser_manager import BrowserManager, BrowserProfile, BrowserContext
+from .browser_manager import BrowserManager
 from .utils import sanitize_error
 
 if TYPE_CHECKING:
@@ -93,8 +98,13 @@ class BrowserWatchdog:
             watchdog.cancel()
     """
 
-    def __init__(self, driver_pid: Optional[int], browser_pid: Optional[int],
-                 profile_name: str, timeout: float = BROWSER_WATCHDOG_TIMEOUT):
+    def __init__(
+        self,
+        driver_pid: int | None,
+        browser_pid: int | None,
+        profile_name: str,
+        timeout: float = BROWSER_WATCHDOG_TIMEOUT,
+    ):
         self._driver_pid = driver_pid
         self._browser_pid = browser_pid
         self._profile_name = profile_name
@@ -115,10 +125,11 @@ class BrowserWatchdog:
         import psutil
 
         logger.warning(
-            "Watchdog timeout (%ds) for '%s' — killing browser process tree "
-            "(driver PID %s, browser PID %s)",
-            self._timeout, self._profile_name,
-            self._driver_pid, self._browser_pid,
+            "Watchdog timeout (%ds) for '%s' — killing browser process tree (driver PID %s, browser PID %s)",
+            self._timeout,
+            self._profile_name,
+            self._driver_pid,
+            self._browser_pid,
         )
 
         # Kill browser first, then driver (driver holds the pipe to Python)
@@ -136,19 +147,23 @@ class BrowserWatchdog:
                 proc.kill()
                 logger.info(
                     "Watchdog killed PID %d for '%s'",
-                    pid, self._profile_name,
+                    pid,
+                    self._profile_name,
                 )
             except psutil.NoSuchProcess:
                 pass
             except Exception as e:
                 logger.warning(
-                    "Watchdog kill failed for PID %d: %s", pid, e,
+                    "Watchdog kill failed for PID %d: %s",
+                    pid,
+                    e,
                 )
 
 
 @dataclass
 class DeviceConfig:
     """Конфигурация устройства для синхронизации Telethon/Browser"""
+
     device_model: str = "Desktop"
     system_version: str = "Windows 10"
     app_version: str = "5.5.2 x64"
@@ -159,13 +174,13 @@ class DeviceConfig:
     def os_type(self) -> str:
         """Определяет тип ОС из system_version"""
         sv = self.system_version.lower()
-        if 'windows' in sv:
-            return 'windows'
-        elif 'mac' in sv or 'darwin' in sv:
-            return 'macos'
-        elif 'linux' in sv or 'ubuntu' in sv:
-            return 'linux'
-        return 'windows'  # Default
+        if "windows" in sv:
+            return "windows"
+        elif "mac" in sv or "darwin" in sv:
+            return "macos"
+        elif "linux" in sv or "ubuntu" in sv:
+            return "linux"
+        return "windows"  # Default
 
     @property
     def browser_os_list(self) -> list:
@@ -176,12 +191,13 @@ class DeviceConfig:
 @dataclass
 class AccountConfig:
     """Конфигурация аккаунта из файлов"""
+
     name: str
     session_path: Path
     api_id: int
     api_hash: str
-    proxy: Optional[str] = None
-    phone: Optional[str] = None
+    proxy: str | None = None
+    phone: str | None = None
     device: DeviceConfig = field(default_factory=DeviceConfig)
 
     @classmethod
@@ -212,13 +228,10 @@ class AccountConfig:
             raise FileNotFoundError(f"api.json not found in {account_dir}")
 
         try:
-            with open(api_path, 'r', encoding='utf-8') as f:
+            with open(api_path, encoding="utf-8") as f:
                 api_config = json.load(f)
         except json.JSONDecodeError as e:
-            raise json.JSONDecodeError(
-                f"Invalid JSON in {api_path}: {e.msg}",
-                e.doc, e.pos
-            )
+            raise json.JSONDecodeError(f"Invalid JSON in {api_path}: {e.msg}", e.doc, e.pos) from e
 
         # Проверяем обязательные поля
         if "api_id" not in api_config:
@@ -241,13 +254,13 @@ class AccountConfig:
         config_path = account_dir / "___config.json"
         if config_path.exists():
             try:
-                with open(config_path, 'r', encoding='utf-8') as f:
+                with open(config_path, encoding="utf-8") as f:
                     config = json.load(f)
                     proxy = config.get("Proxy")
                     name = config.get("Name", name)
             except json.JSONDecodeError as e:
                 # Config опциональный, но логируем ошибку
-                logger.error(f"[AccountConfig] Invalid JSON in {config_path}: {e.msg} at line {e.lineno}")
+                logger.exception(f"[AccountConfig] Invalid JSON in {config_path}: {e.msg} at line {e.lineno}")
 
         return cls(
             name=name,
@@ -261,6 +274,7 @@ class AccountConfig:
 
 class ErrorCategory:
     """FIX-4.1: Error categories for batch error breakdown."""
+
     DEAD_SESSION = "dead_session"
     BAD_PROXY = "bad_proxy"
     QR_DECODE_FAIL = "qr_decode_fail"
@@ -287,7 +301,10 @@ def classify_error(error_message: str) -> str:
 
     if any(s in msg for s in ("not authorized", "auth_key_unregistered", "session is not authorized", "dead session")):
         return ErrorCategory.DEAD_SESSION
-    if any(s in msg for s in ("connectionerror", "proxy error", "proxy connection", "connection refused", "socks", "proxy failed")):
+    if any(
+        s in msg
+        for s in ("connectionerror", "proxy error", "proxy connection", "connection refused", "socks", "proxy failed")
+    ):
         return ErrorCategory.BAD_PROXY
     if any(s in msg for s in ("failed to extract qr", "qr not found", "qr_decode", "qr token")):
         return ErrorCategory.QR_DECODE_FAIL
@@ -306,12 +323,13 @@ def classify_error(error_message: str) -> str:
 @dataclass
 class AuthResult:
     """Результат авторизации"""
+
     success: bool
     profile_name: str
-    error: Optional[str] = None
+    error: str | None = None
     error_category: str = ""
     required_2fa: bool = False
-    user_info: Optional[Dict[str, Any]] = None
+    user_info: dict[str, Any] | None = None
     telethon_alive: bool = False  # FIX #2: Session safety check
 
     def __post_init__(self):
@@ -320,7 +338,7 @@ class AuthResult:
             self.error_category = classify_error(self.error)
 
 
-def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
+def decode_qr_from_screenshot(screenshot_bytes: bytes) -> bytes | None:
     """
     Декодирует QR-код из скриншота.
 
@@ -330,20 +348,20 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
     Returns:
         Token bytes или None если QR не найден/не декодирован
     """
-    from PIL import ImageOps, ImageEnhance, ImageFilter
+    from PIL import ImageEnhance, ImageOps
 
     image = Image.open(io.BytesIO(screenshot_bytes))
 
     def extract_token(data):
         """Extract token bytes from tg://login URL"""
-        if not data or 'tg://login?token=' not in data:
+        if not data or "tg://login?token=" not in data:
             return None
-        token_b64 = data.split('token=')[1]
-        if '&' in token_b64:
-            token_b64 = token_b64.split('&')[0]
+        token_b64 = data.split("token=")[1]
+        if "&" in token_b64:
+            token_b64 = token_b64.split("&")[0]
         padding = 4 - len(token_b64) % 4
         if padding != 4:
-            token_b64 += '=' * padding
+            token_b64 += "=" * padding
         return base64.urlsafe_b64decode(token_b64)
 
     # Try zxing-cpp with morphological preprocessing (handles Telegram dot-style QR)
@@ -355,12 +373,12 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
             # 1. Try raw image
             results = zxingcpp.read_barcodes(pil_img)
             for r in results:
-                if r.text and 'tg://login?token=' in r.text:
+                if r.text and "tg://login?token=" in r.text:
                     return r.text
 
             # 2. Scale up + binarize + morphological close
             # Two presets: high-contrast (dots) and low-contrast (thin lines)
-            img_gray = np.array(pil_img.convert('L'))
+            img_gray = np.array(pil_img.convert("L"))
             h, w = img_gray.shape
             scaled = cv2.resize(img_gray, (w * 4, h * 4), interpolation=cv2.INTER_NEAREST)
 
@@ -371,7 +389,7 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
                     closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
                     results = zxingcpp.read_barcodes(Image.fromarray(closed))
                     for r in results:
-                        if r.text and 'tg://login?token=' in r.text:
+                        if r.text and "tg://login?token=" in r.text:
                             return r.text
             return None
 
@@ -381,12 +399,10 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
             crops = []
 
             # 1. Contour-based detection (multiple thresholds)
-            gray_np = np.array(pil_img.convert('L'))
+            gray_np = np.array(pil_img.convert("L"))
             for thr in (150, 120, 100):
                 _, thresh = cv2.threshold(gray_np, thr, 255, cv2.THRESH_BINARY)
-                contours, _ = cv2.findContours(
-                    thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-                )
+                contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
                 squares = []
                 for c in contours:
                     bx, by, bw, bh = cv2.boundingRect(c)
@@ -447,12 +463,12 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
     # Try QRCodeDetectorAruco (more robust than standard detector)
     try:
         aruco_detector = cv2.QRCodeDetectorAruco()
-        img_np = np.array(image.convert('RGB'))
+        img_np = np.array(image.convert("RGB"))
         cv_img = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         decoded, _, _ = aruco_detector.detectAndDecode(cv_img)
         if decoded and decoded[0]:
             for data in decoded:
-                if data and 'tg://login?token=' in data:
+                if data and "tg://login?token=" in data:
                     token_bytes = extract_token(data)
                     if token_bytes:
                         logger.info("Decoded QR with QRCodeDetectorAruco")
@@ -463,15 +479,15 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
     # Конвертируем PIL Image в numpy array для OpenCV
     def pil_to_cv2(pil_img):
         """Convert PIL Image to OpenCV format"""
-        if pil_img.mode == '1':
-            pil_img = pil_img.convert('L')
-        if pil_img.mode == 'L':
+        if pil_img.mode == "1":
+            pil_img = pil_img.convert("L")
+        if pil_img.mode == "L":
             return np.array(pil_img)
-        elif pil_img.mode == 'RGB':
+        elif pil_img.mode == "RGB":
             return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-        elif pil_img.mode == 'RGBA':
+        elif pil_img.mode == "RGBA":
             return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGBA2BGR)
-        return np.array(pil_img.convert('RGB'))
+        return np.array(pil_img.convert("RGB"))
 
     def decode_with_opencv(cv_img):
         """Try to decode QR with OpenCV"""
@@ -487,7 +503,7 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
         try:
             decoded = pyzbar_module.decode(pil_img)
             for obj in decoded:
-                return obj.data.decode('utf-8')
+                return obj.data.decode("utf-8")
         except Exception as e:
             logger.warning(f"[QR] pyzbar decode error: {type(e).__name__}: {e}")
         return None
@@ -500,12 +516,12 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
     variants.append(("original", image))
 
     # 2. Grayscale
-    gray = image.convert('L')
+    gray = image.convert("L")
     variants.append(("grayscale", gray))
 
     # 3. Инвертированный RGB (для белого QR на тёмном)
     try:
-        inverted_rgb = ImageOps.invert(image.convert('RGB'))
+        inverted_rgb = ImageOps.invert(image.convert("RGB"))
         variants.append(("inverted_rgb", inverted_rgb))
     except Exception as e:
         logger.debug(f"[QR] inverted_rgb variant failed: {e}")
@@ -528,9 +544,9 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
 
     # 6. Thresholding (бинаризация)
     try:
-        threshold = gray.point(lambda x: 255 if x > 128 else 0, 'L')
+        threshold = gray.point(lambda x: 255 if x > 128 else 0, "L")
         variants.append(("threshold", threshold))
-        threshold_inv = gray.point(lambda x: 0 if x > 128 else 255, 'L')
+        threshold_inv = gray.point(lambda x: 0 if x > 128 else 255, "L")
         variants.append(("threshold_inv", threshold_inv))
     except Exception as e:
         logger.debug(f"[QR] threshold variant failed: {e}")
@@ -540,7 +556,7 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
         try:
             cv_img = pil_to_cv2(img_variant)
             data = decode_with_opencv(cv_img)
-            if data and 'tg://login?token=' in data:
+            if data and "tg://login?token=" in data:
                 token_bytes = extract_token(data)
                 if token_bytes:
                     logger.info(f"Decoded QR with OpenCV using {name}")
@@ -551,7 +567,7 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
         # Fallback to pyzbar if available
         try:
             data = decode_with_pyzbar(img_variant)
-            if data and 'tg://login?token=' in data:
+            if data and "tg://login?token=" in data:
                 token_bytes = extract_token(data)
                 if token_bytes:
                     logger.info(f"Decoded QR with pyzbar using {name}")
@@ -562,7 +578,7 @@ def decode_qr_from_screenshot(screenshot_bytes: bytes) -> Optional[bytes]:
     return None
 
 
-def extract_token_from_tg_url(url_str: str) -> Optional[bytes]:
+def extract_token_from_tg_url(url_str: str) -> bytes | None:
     """
     Извлекает token bytes из tg://login URL.
 
@@ -572,25 +588,25 @@ def extract_token_from_tg_url(url_str: str) -> Optional[bytes]:
     Returns:
         Token bytes или None
     """
-    if not url_str or 'tg://login?token=' not in url_str:
+    if not url_str or "tg://login?token=" not in url_str:
         return None
 
     try:
-        token_b64 = url_str.split('token=')[1]
+        token_b64 = url_str.split("token=")[1]
         # Удаляем возможные лишние параметры
-        if '&' in token_b64:
-            token_b64 = token_b64.split('&')[0]
+        if "&" in token_b64:
+            token_b64 = token_b64.split("&")[0]
         # Добавляем padding
         padding = 4 - len(token_b64) % 4
         if padding != 4:
-            token_b64 += '=' * padding
+            token_b64 += "=" * padding
         return base64.urlsafe_b64decode(token_b64)
     except Exception as e:
         logger.debug(f"Error extracting token from URL: {e}")
         return None
 
 
-def parse_telethon_proxy(proxy_str: str) -> Optional[tuple]:
+def parse_telethon_proxy(proxy_str: str) -> tuple | None:
     """
     Конвертирует прокси в формат Telethon.
     Input: socks5:host:port:user:pass (password may contain colons)
@@ -606,11 +622,11 @@ def parse_telethon_proxy(proxy_str: str) -> Optional[tuple]:
     try:
         if len(parts) == 5:
             proto, host, port, user, pwd = parts
-            proxy_type = socks.SOCKS5 if 'socks5' in proto.lower() else socks.HTTP
+            proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
             return (proxy_type, host, int(port), True, user, pwd)
         elif len(parts) == 3:
             proto, host, port = parts
-            proxy_type = socks.SOCKS5 if 'socks5' in proto.lower() else socks.HTTP
+            proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
             return (proxy_type, host, int(port))
     except (ValueError, AttributeError):
         return None
@@ -629,11 +645,15 @@ class TelegramAuth:
     QR_MAX_RETRIES = 8  # FIX-6.1: Increased from 5 to 8 for 1000-account reliability
     QR_RETRY_DELAY = 5  # секунд между retry
 
-    def __init__(self, account: AccountConfig, browser_manager: Optional[BrowserManager] = None,
-                 on_status: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        account: AccountConfig,
+        browser_manager: BrowserManager | None = None,
+        on_status: Callable[[str], None] | None = None,
+    ):
         self.account = account
         self.browser_manager = browser_manager or BrowserManager()
-        self._client: Optional[TelegramClient] = None
+        self._client: TelegramClient | None = None
         self._on_status = on_status
 
     def _status(self, msg: str) -> None:
@@ -668,13 +688,15 @@ class TelegramAuth:
         # Offloaded to executor: sqlite3.connect(timeout=10) can block up to 10s
         session_path = self.account.session_path
         if session_path.exists():
+
             def _enable_wal(path: str) -> None:
                 c = sqlite3.connect(path, timeout=10)
                 try:
-                    c.execute('PRAGMA journal_mode=WAL')
-                    c.execute('PRAGMA busy_timeout=10000')
+                    c.execute("PRAGMA journal_mode=WAL")
+                    c.execute("PRAGMA busy_timeout=10000")
                 finally:
                     c.close()
+
             try:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, _enable_wal, str(session_path))
@@ -685,7 +707,7 @@ class TelegramAuth:
         # FIX #3: DEVICE SYNC - передаём device параметры
         try:
             client = TelegramClient(
-                str(self.account.session_path.with_suffix('')),  # Без .session
+                str(self.account.session_path.with_suffix("")),  # Без .session
                 self.account.api_id,
                 self.account.api_hash,
                 proxy=proxy,
@@ -705,7 +727,7 @@ class TelegramAuth:
         # FIX-4.4: Catch TypeError from broken proxy libs + ConnectionError
         # Improved diagnostics: include proxy info (host:port only, no credentials)
         proxy_info = ""
-        if proxy and isinstance(proxy, (list, tuple)) and len(proxy) >= 3:
+        if proxy and isinstance(proxy, list | tuple) and len(proxy) >= 3:
             proxy_info = f" [proxy: {proxy[1]}:{proxy[2]}]"
         elif not proxy:
             proxy_info = " [no proxy]"
@@ -715,12 +737,12 @@ class TelegramAuth:
         except sqlite3.DatabaseError as e:
             await self._safe_disconnect(client)
             raise RuntimeError(f"Session file corrupted: {e}") from e
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await self._safe_disconnect(client)
-            raise RuntimeError(f"Telethon connect timeout after 30s{proxy_info}")
+            raise RuntimeError(f"Telethon connect timeout after 30s{proxy_info}") from None
         except TypeError as e:
             await self._safe_disconnect(client)
-            raise RuntimeError(f"Telethon connection failed (proxy lib error): {e}{proxy_info}")
+            raise RuntimeError(f"Telethon connection failed (proxy lib error): {e}{proxy_info}") from e
         except (ConnectionError, OSError) as e:
             await self._safe_disconnect(client)
             error_msg = str(e)
@@ -729,13 +751,12 @@ class TelegramAuth:
                 error_msg = f"Cannot connect to Telegram (check proxy/network){proxy_info}"
             else:
                 error_msg = f"Telethon connection failed: {e}{proxy_info}"
-            raise RuntimeError(error_msg)
+            raise RuntimeError(error_msg) from e
 
         if not await client.is_user_authorized():
             await client.disconnect()
             raise RuntimeError(
-                f"Session is not authorized (expired or revoked){proxy_info}. "
-                "Re-login or get a fresh .session file."
+                f"Session is not authorized (expired or revoked){proxy_info}. Re-login or get a fresh .session file."
             )
 
         # Получаем инфо о текущем пользователе (без логирования sensitive data)
@@ -771,9 +792,7 @@ class TelegramAuth:
             True if TTL was set successfully
         """
         try:
-            result = await client(SetAuthorizationTTLRequest(
-                authorization_ttl_days=self.AUTH_TTL_DAYS
-            ))
+            result = await client(SetAuthorizationTTLRequest(authorization_ttl_days=self.AUTH_TTL_DAYS))
             logger.info("Authorization TTL set to %d days", self.AUTH_TTL_DAYS)
             return bool(result)
         except Exception as e:
@@ -791,7 +810,7 @@ class TelegramAuth:
         if not storage_state_path.exists():
             return False
         try:
-            with open(storage_state_path, "r", encoding="utf-8") as f:
+            with open(storage_state_path, encoding="utf-8") as f:
                 state = json.load(f)
             for origin in state.get("origins", []):
                 if origin.get("origin") != "https://web.telegram.org":
@@ -802,6 +821,7 @@ class TelegramAuth:
                         if user_auth.get("id"):
                             # Validate auth age — reject if older than TTL
                             import time as _time
+
                             auth_date = user_auth.get("date")
                             if auth_date:
                                 try:
@@ -809,14 +829,14 @@ class TelegramAuth:
                                     if age_days > self.AUTH_TTL_DAYS:
                                         logger.info(
                                             "Pre-check: auth expired (%.0f days old, TTL=%d)",
-                                            age_days, self.AUTH_TTL_DAYS,
+                                            age_days,
+                                            self.AUTH_TTL_DAYS,
                                         )
                                         return False
                                 except (ValueError, TypeError):
                                     pass  # Can't parse date, treat as valid
                             logger.info(
-                                "Pre-check: storage_state.json has user_auth "
-                                "(date=%s)",
+                                "Pre-check: storage_state.json has user_auth (date=%s)",
                                 user_auth.get("date"),
                             )
                             return True
@@ -861,10 +881,10 @@ class TelegramAuth:
 
             # Метод 1: Проверяем наличие chat items (самый надёжный индикатор)
             chat_items = await page.query_selector(
-                '[data-peer-id], '                    # Chat items with peer ID
-                '.chatlist-chat, '                    # Individual chats
-                'li.chatlist-chat, '                  # Chat list items
-                '.dialog, '                           # Dialog elements
+                "[data-peer-id], "  # Chat items with peer ID
+                ".chatlist-chat, "  # Individual chats
+                "li.chatlist-chat, "  # Chat list items
+                ".dialog, "  # Dialog elements
                 '[class*="ListItem"][class*="Chat"]'  # Generic chat list items
             )
             if chat_items:
@@ -880,13 +900,13 @@ class TelegramAuth:
 
             # Метод 2: Проверяем структуру страницы (columns/sidebar)
             columns = await page.query_selector(
-                '.tabs-tab, '                        # Tab navigation
-                '.sidebar, '                          # Sidebar
-                '#column-left, '                      # Left column
-                '.chats-container, '                  # Chats container
-                '.folders-tabs, '                     # Folder tabs
-                '[class*="LeftColumn"], '             # Left column variations
-                '[class*="ChatFolders"]'              # Chat folders
+                ".tabs-tab, "  # Tab navigation
+                ".sidebar, "  # Sidebar
+                "#column-left, "  # Left column
+                ".chats-container, "  # Chats container
+                ".folders-tabs, "  # Folder tabs
+                '[class*="LeftColumn"], '  # Left column variations
+                '[class*="ChatFolders"]'  # Chat folders
             )
             if columns:
                 try:
@@ -899,10 +919,10 @@ class TelegramAuth:
 
             # Метод 3: Проверяем наличие аватара пользователя в шапке (признак авторизации)
             user_avatar = await page.query_selector(
-                '.avatar-like-icon, '                # User avatar
-                '[class*="Avatar"], '                 # Avatar component
-                '.profile-photo, '                    # Profile photo
-                '.menu-toggle'                        # Menu toggle (only in authorized state)
+                ".avatar-like-icon, "  # User avatar
+                '[class*="Avatar"], '  # Avatar component
+                ".profile-photo, "  # Profile photo
+                ".menu-toggle"  # Menu toggle (only in authorized state)
             )
             if user_avatar:
                 try:
@@ -919,7 +939,7 @@ class TelegramAuth:
             # Метод 4: Проверяем URL pattern (после авторизации URL меняется)
             # /k/#@ или /a/#@ - указывает на конкретный чат
             # /k/# без дополнительных параметров после # может быть и login и main page
-            if ('@' in current_url) or ('/k/#-' in current_url) or ('/a/#-' in current_url):
+            if ("@" in current_url) or ("/k/#-" in current_url) or ("/a/#-" in current_url):
                 logger.debug(f"Authorized: URL pattern indicates chat view: {current_url}")
                 return "authorized"
 
@@ -963,24 +983,24 @@ class TelegramAuth:
 
             # Проверяем текст "Enter Your Password" на странице
             try:
-                page_text = await page.inner_text('body')
-                if 'Enter Your Password' in page_text or 'Two-Step Verification' in page_text:
+                page_text = await page.inner_text("body")
+                if "Enter Your Password" in page_text or "Two-Step Verification" in page_text:
                     logger.debug("2FA required: password text found")
                     return "2fa_required"
             except Exception:
                 pass
 
             # Проверяем QR код (только если это не 2FA страница и не authorized)
-            qr_canvas = await page.query_selector('canvas')
+            qr_canvas = await page.query_selector("canvas")
             if qr_canvas:
                 try:
                     is_visible = await qr_canvas.is_visible()
                     if is_visible:
                         # Дополнительно проверяем что это QR login page по тексту
                         try:
-                            qr_text = await page.inner_text('body')
+                            qr_text = await page.inner_text("body")
                             # QR login page has specific text
-                            qr_indicators = ['scan', 'qr', 'log in', 'phone', 'quick']
+                            qr_indicators = ["scan", "qr", "log in", "phone", "quick"]
                             if any(ind in qr_text.lower() for ind in qr_indicators):
                                 logger.debug("QR login: canvas and login text found")
                                 return "qr_login"
@@ -1007,16 +1027,18 @@ class TelegramAuth:
             return "unknown"
 
         except Exception as e:
-            error_msg = str(e).encode('ascii', 'replace').decode('ascii')
+            error_msg = str(e).encode("ascii", "replace").decode("ascii")
             # Detect dead browser from any unhandled Playwright exception
             err_lower = error_msg.lower()
-            if any(p in err_lower for p in ("target closed", "connection closed", "has been closed", "browser has been")):
+            if any(
+                p in err_lower for p in ("target closed", "connection closed", "has been closed", "browser has been")
+            ):
                 logger.debug(f"Browser dead (from exception): {error_msg}")
                 return "dead"
             logger.debug(f"Error checking page state: {error_msg}")
             return "unknown"
 
-    async def _wait_for_qr(self, page, timeout: int = QR_WAIT_TIMEOUT) -> Optional[bytes]:
+    async def _wait_for_qr(self, page, timeout: int = QR_WAIT_TIMEOUT) -> bytes | None:
         """
         Ждёт появления QR-кода и извлекает токен.
 
@@ -1069,7 +1091,7 @@ class TelegramAuth:
                     }
                 """)
 
-                if qr_token_direct and 'tg://login?token=' in str(qr_token_direct):
+                if qr_token_direct and "tg://login?token=" in str(qr_token_direct):
                     logger.info("Token found directly in app state")
                     token_bytes = extract_token_from_tg_url(qr_token_direct)
                     if token_bytes:
@@ -1093,10 +1115,10 @@ class TelegramAuth:
                     }
                 """)
 
-                if qr_from_canvas and qr_from_canvas.get('dataUrl'):
+                if qr_from_canvas and qr_from_canvas.get("dataUrl"):
                     # Decode the canvas data URL externally
                     try:
-                        canvas_data = qr_from_canvas['dataUrl'].split(',')[1]
+                        canvas_data = qr_from_canvas["dataUrl"].split(",")[1]
                         canvas_bytes = base64.b64decode(canvas_data)
 
                         # Try to decode this smaller canvas image
@@ -1159,7 +1181,7 @@ class TelegramAuth:
                     }
                 """)
 
-                if token_from_js and 'tg://login?token=' in str(token_from_js):
+                if token_from_js and "tg://login?token=" in str(token_from_js):
                     logger.info("Token found via JS extraction")
                     # Извлекаем token bytes напрямую
                     token_bytes = extract_token_from_tg_url(token_from_js)
@@ -1167,12 +1189,12 @@ class TelegramAuth:
                         return token_bytes
 
                 # Метод 2: Ищем QR canvas и делаем скриншот элемента
-                qr_element = await page.query_selector('canvas')
+                qr_element = await page.query_selector("canvas")
 
                 if qr_element:
                     # Check bounding box — skip if canvas is hidden or zero-sized
                     bbox = await qr_element.bounding_box()
-                    if not bbox or bbox['width'] < 10 or bbox['height'] < 10:
+                    if not bbox or bbox["width"] < 10 or bbox["height"] < 10:
                         continue  # Canvas not visible yet, retry next iteration
 
                     # Ждём полной отрисовки QR
@@ -1190,7 +1212,10 @@ class TelegramAuth:
             except Exception as e:
                 # Detect dead browser immediately instead of waiting for timeout
                 err_str = str(e).lower()
-                if any(p in err_str for p in ("target closed", "connection closed", "has been closed", "browser has been closed")):
+                if any(
+                    p in err_str
+                    for p in ("target closed", "connection closed", "has been closed", "browser has been closed")
+                ):
                     logger.warning("Browser died during QR wait")
                     return None
                 # Ignore selector errors, keep retrying
@@ -1224,15 +1249,15 @@ class TelegramAuth:
             return False
 
         # PNG magic: 89 50 4E 47 0D 0A 1A 0A
-        if data[:8] == b'\x89PNG\r\n\x1a\n':
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
             return True
 
         # JPEG magic: FF D8 FF
-        if data[:3] == b'\xff\xd8\xff':
+        if data[:3] == b"\xff\xd8\xff":
             return True
 
         # GIF magic: GIF87a or GIF89a
-        if data[:6] in (b'GIF87a', b'GIF89a'):
+        if data[:6] in (b"GIF87a", b"GIF89a"):
             return True
 
         return False
@@ -1242,16 +1267,16 @@ class TelegramAuth:
         FIX-001: Проверяет является ли data tg://login?token=... URL.
         """
         try:
-            text = data.decode('utf-8', errors='strict')
-            if 'tg://login?token=' in text:
-                token_part = text.split('token=')[1].split('&')[0]
+            text = data.decode("utf-8", errors="strict")
+            if "tg://login?token=" in text:
+                token_part = text.split("token=")[1].split("&")[0]
                 if 20 <= len(token_part) <= 100:
                     return True
             return False
         except (UnicodeDecodeError, IndexError):
             return False
 
-    async def _extract_qr_token_with_retry(self, page) -> Optional[bytes]:
+    async def _extract_qr_token_with_retry(self, page) -> bytes | None:
         """
         FIX #4: QR RETRY - извлекает QR токен с повторными попытками.
 
@@ -1271,7 +1296,7 @@ class TelegramAuth:
         except Exception:
             pass  # Non-critical cleanup
 
-        profile_name = self.account.name.replace(' ', '_').replace('/', '_')
+        profile_name = self.account.name.replace(" ", "_").replace("/", "_")
 
         for retry in range(self.QR_MAX_RETRIES):
             if retry > 0:
@@ -1296,7 +1321,7 @@ class TelegramAuth:
                     pass
 
                 # FIX-6.2: Exponential backoff between retries (capped at 25s to stay within QR token lifetime)
-                delay = min(self.QR_RETRY_DELAY * (1.5 ** retry), 25)
+                delay = min(self.QR_RETRY_DELAY * (1.5**retry), 25)
                 await asyncio.sleep(delay)
 
             result = await self._wait_for_qr(page)
@@ -1312,7 +1337,7 @@ class TelegramAuth:
 
             if self._is_tg_url_token(result):
                 # tg://login?token=... URL - извлекаем token bytes
-                token = extract_token_from_tg_url(result.decode('utf-8'))
+                token = extract_token_from_tg_url(result.decode("utf-8"))
                 if token:
                     logger.info(f"Token extracted from URL ({len(token)} bytes)")
                     return token
@@ -1326,10 +1351,10 @@ class TelegramAuth:
                 else:
                     logger.warning(f"Failed to decode QR from screenshot (attempt {retry + 1})")
                     # FIX-009: Сохраняем debug скриншот с timestamp
-                    timestamp = datetime.now().strftime('%H%M%S')
+                    timestamp = datetime.now().strftime("%H%M%S")
                     debug_path = Path("profiles") / f"debug_qr_{profile_name}_{timestamp}_r{retry}.png"
                     debug_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(debug_path, 'wb') as f:
+                    with open(debug_path, "wb") as f:
                         f.write(result)
                     logger.info(f"Debug screenshot saved: {debug_path}")
 
@@ -1364,9 +1389,10 @@ class TelegramAuth:
             except FloodWaitError as e:
                 wait_time = e.seconds
                 logger.warning(
-                    "FloodWaitError: must wait %ds — token is now stale, "
-                    "need fresh QR (attempt %d/%d)",
-                    wait_time, attempt + 1, max_retries,
+                    "FloodWaitError: must wait %ds — token is now stale, need fresh QR (attempt %d/%d)",
+                    wait_time,
+                    attempt + 1,
+                    max_retries,
                 )
                 # QR tokens expire in ~30s. After any FloodWait, the token is
                 # definitely stale. Return False so the outer retry loop
@@ -1377,18 +1403,15 @@ class TelegramAuth:
                 error_str = str(e).upper()
                 # FIX #7: Don't retry stale/invalid tokens — let outer loop
                 # re-fetch a fresh QR instead of wasting time + FloodWait risk
-                non_retryable = ('EXPIRED', 'ALREADY_ACCEPTED', 'INVALID')
+                non_retryable = ("EXPIRED", "ALREADY_ACCEPTED", "INVALID")
                 if any(keyword in error_str for keyword in non_retryable):
-                    logger.warning(
-                        "Token error (non-retryable): %s — need fresh QR", e
-                    )
+                    logger.warning("Token error (non-retryable): %s — need fresh QR", e)
                     return False
 
                 # Exponential backoff для других ошибок
-                delay = base_delay * (2 ** attempt) + random.uniform(0, 3)
+                delay = base_delay * (2**attempt) + random.uniform(0, 3)
                 logger.warning(
-                    f"Error accepting token: {e}, "
-                    f"retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                    f"Error accepting token: {e}, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
                 )
 
                 if attempt < max_retries - 1:
@@ -1397,7 +1420,7 @@ class TelegramAuth:
         logger.error("Failed to accept token after all retries")
         return False
 
-    async def _wait_for_auth_complete(self, page, timeout: int = AUTH_WAIT_TIMEOUT) -> Tuple[bool, bool]:
+    async def _wait_for_auth_complete(self, page, timeout: int = AUTH_WAIT_TIMEOUT) -> tuple[bool, bool]:
         """
         Ждёт завершения авторизации в браузере.
         Returns: (success, required_2fa)
@@ -1425,7 +1448,7 @@ class TelegramAuth:
                 return (True, False)
 
             # Также проверяем URL
-            if '/k/#' in current_url and 'auth' not in current_url.lower():
+            if "/k/#" in current_url and "auth" not in current_url.lower():
                 login_form = await page.query_selector('.auth-form, [class*="auth-page"]')
                 if not login_form:
                     logger.info("Authorization successful (URL check)")
@@ -1433,10 +1456,7 @@ class TelegramAuth:
 
             # Проверяем 2FA форму
             password_input = await page.query_selector(
-                'input[type="password"], '
-                '[class*="password"], '
-                '[placeholder*="Password"], '
-                '[placeholder*="пароль"]'
+                'input[type="password"], [class*="password"], [placeholder*="Password"], [placeholder*="пароль"]'
             )
             if password_input:
                 logger.info("2FA password required")
@@ -1472,14 +1492,14 @@ class TelegramAuth:
         # FIX-005: Расширенный список селекторов для разных версий Telegram Web
         password_selectors = [
             'input[type="password"].input-field-input',  # Telegram Web K
-            'input[name="notsearch_password"]',          # Telegram Web K by name
-            'input[type="password"]:not(.stealthy)',     # Exclude hidden inputs
+            'input[name="notsearch_password"]',  # Telegram Web K by name
+            'input[type="password"]:not(.stealthy)',  # Exclude hidden inputs
             '.input-field-input[type="password"]',
             'input[placeholder="Password"]',
             'input[placeholder*="assword"]',
             'input[autocomplete="current-password"]',
             # Telegram Web A / mobile
-            'input.PasswordForm__input',
+            "input.PasswordForm__input",
             'input[data-test="password-input"]',
             # Generic fallbacks
             'input[type="password"]',
@@ -1499,7 +1519,7 @@ class TelegramAuth:
                         is_enabled = await element.is_enabled()
                         box = await element.bounding_box()
 
-                        if is_visible and is_enabled and box and box['width'] > 0:
+                        if is_visible and is_enabled and box and box["width"] > 0:
                             password_input = element
                             found_selector = selector
                             logger.debug(f"Found password input: {selector}")
@@ -1515,7 +1535,7 @@ class TelegramAuth:
 
         if not password_input or not found_selector:
             # Debug screenshot с timestamp
-            timestamp = datetime.now().strftime('%H%M%S')
+            timestamp = datetime.now().strftime("%H%M%S")
             debug_path = Path("profiles") / f"debug_2fa_notfound_{timestamp}.png"
             debug_path.parent.mkdir(parents=True, exist_ok=True)
             await page.screenshot(path=str(debug_path))
@@ -1535,14 +1555,14 @@ class TelegramAuth:
 
             # Короткая пауза перед Enter
             await asyncio.sleep(0.5)
-            await page.keyboard.press('Enter')
+            await page.keyboard.press("Enter")
             logger.debug("Pressed Enter to submit")
 
         except Exception as e:
-            error_msg = str(e).encode('ascii', 'replace').decode('ascii')
-            logger.error(f"Password input failed: {error_msg}")
+            error_msg = str(e).encode("ascii", "replace").decode("ascii")
+            logger.exception(f"Password input failed: {error_msg}")
             # Debug screenshot
-            timestamp = datetime.now().strftime('%H%M%S')
+            timestamp = datetime.now().strftime("%H%M%S")
             debug_path = Path("profiles") / f"debug_2fa_error_{timestamp}.png"
             await page.screenshot(path=str(debug_path))
             return False
@@ -1551,7 +1571,7 @@ class TelegramAuth:
 
         # Ждём результата - увеличено время для медленных соединений
         # Также ждём пока кнопка перестанет показывать "PLEASE WAIT..."
-        for wait_attempt in range(15):  # До 15 секунд
+        for _wait_attempt in range(15):  # До 15 секунд
             await asyncio.sleep(1)
 
             # Проверяем не исчезла ли форма пароля (успешный вход)
@@ -1561,7 +1581,9 @@ class TelegramAuth:
                 break
 
             # Check for INCORRECT PASSWORD on submit button
-            incorrect_btn = await page.query_selector('button:has-text("INCORRECT PASSWORD"), button:has-text("INCORRECT")')
+            incorrect_btn = await page.query_selector(
+                'button:has-text("INCORRECT PASSWORD"), button:has-text("INCORRECT")'
+            )
             if incorrect_btn:
                 logger.error("2FA error: INCORRECT PASSWORD")
                 return False
@@ -1573,7 +1595,7 @@ class TelegramAuth:
                 break
 
         # Debug screenshot
-        timestamp = datetime.now().strftime('%H%M%S')
+        timestamp = datetime.now().strftime("%H%M%S")
         debug_path = Path("profiles") / f"debug_2fa_after_{timestamp}.png"
         await page.screenshot(path=str(debug_path))
         logger.debug(f"Debug screenshot: {debug_path}")
@@ -1581,8 +1603,8 @@ class TelegramAuth:
         # Проверяем ошибки
         error_selectors = [
             '[class*="error"]',
-            '.error',
-            '.input-field-error',
+            ".error",
+            ".input-field-error",
             '[class*="shake"]',
         ]
         for selector in error_selectors:
@@ -1600,11 +1622,7 @@ class TelegramAuth:
 
         return True
 
-    async def authorize(
-        self,
-        password_2fa: Optional[str] = None,
-        headless: bool = False
-    ) -> AuthResult:
+    async def authorize(self, password_2fa: str | None = None, headless: bool = False) -> AuthResult:
         """
         Выполняет полный цикл QR-авторизации.
 
@@ -1616,10 +1634,7 @@ class TelegramAuth:
             AuthResult с результатом
         """
         # FIX #3: DEVICE SYNC - передаём device config в browser manager
-        profile = self.browser_manager.get_profile(
-            self.account.name,
-            self.account.proxy
-        )
+        profile = self.browser_manager.get_profile(self.account.name, self.account.proxy)
 
         logger.info("=" * 60)
         logger.info("TELEGRAM WEB AUTHORIZATION")
@@ -1672,11 +1687,7 @@ class TelegramAuth:
             browser_extra_args = {
                 "os": self.account.device.browser_os_list,
             }
-            browser_ctx = await self.browser_manager.launch(
-                profile,
-                headless=headless,
-                extra_args=browser_extra_args
-            )
+            browser_ctx = await self.browser_manager.launch(profile, headless=headless, extra_args=browser_extra_args)
             page = await browser_ctx.new_page()
 
             # Start thread-based watchdog to kill browser if authorize() hangs.
@@ -1706,9 +1717,14 @@ class TelegramAuth:
                 error_str = str(e).lower()
                 # Fail fast for non-recoverable network/proxy errors
                 fatal_patterns = (
-                    'err_proxy', 'err_tunnel', 'ns_error_proxy',
-                    'err_name_not_resolved', 'connection_refused',
-                    'target closed', 'net::err_name', 'net::err_connection',
+                    "err_proxy",
+                    "err_tunnel",
+                    "ns_error_proxy",
+                    "err_name_not_resolved",
+                    "connection_refused",
+                    "target closed",
+                    "net::err_name",
+                    "net::err_connection",
                 )
                 if any(p in error_str for p in fatal_patterns):
                     raise RuntimeError(f"Page load failed (non-recoverable): {e}") from e
@@ -1719,11 +1735,11 @@ class TelegramAuth:
             for i in range(15):
                 await asyncio.sleep(1)
                 # Проверяем что страница загрузилась
-                body = await page.query_selector('body')
+                body = await page.query_selector("body")
                 if body:
                     html = await page.content()
-                    if 'telegram' in html.lower() or 'qr' in html.lower() or 'password' in html.lower():
-                        logger.debug(f"Page loaded after {i+1}s")
+                    if "telegram" in html.lower() or "qr" in html.lower() or "password" in html.lower():
+                        logger.debug(f"Page loaded after {i + 1}s")
                         break
 
             await asyncio.sleep(3)  # Дополнительная пауза для рендеринга
@@ -1745,11 +1761,7 @@ class TelegramAuth:
 
             if current_state == "dead":
                 logger.error("Browser crashed or disconnected during auth")
-                return AuthResult(
-                    success=False,
-                    profile_name=profile.name,
-                    error="Browser crashed (target closed)"
-                )
+                return AuthResult(success=False, profile_name=profile.name, error="Browser crashed (target closed)")
 
             if current_state == "authorized":
                 logger.info("Already authorized! Skipping QR login.")
@@ -1760,7 +1772,7 @@ class TelegramAuth:
                     success=True,
                     profile_name=profile.name,
                     required_2fa=False,
-                    telethon_alive=await self._verify_telethon_session(client)
+                    telethon_alive=await self._verify_telethon_session(client),
                 )
 
             if current_state == "2fa_required":
@@ -1777,7 +1789,7 @@ class TelegramAuth:
                                 success=True,
                                 profile_name=profile.name,
                                 required_2fa=True,
-                                telethon_alive=await self._verify_telethon_session(client)
+                                telethon_alive=await self._verify_telethon_session(client),
                             )
                         # 2FA entered but auth didn't complete
                         return AuthResult(
@@ -1806,7 +1818,7 @@ class TelegramAuth:
                         profile_name=profile.name,
                         required_2fa=True,
                         error=None if success else "2FA password required",
-                        telethon_alive=await self._verify_telethon_session(client)
+                        telethon_alive=await self._verify_telethon_session(client),
                     )
 
             # FIX-2.3: Recovery reload for "unknown"/"loading" state
@@ -1826,9 +1838,7 @@ class TelegramAuth:
                     logger.info("Page state after recovery reload: %s", current_state)
                     if current_state == "dead":
                         return AuthResult(
-                            success=False,
-                            profile_name=profile.name,
-                            error="Browser crashed during recovery reload"
+                            success=False, profile_name=profile.name, error="Browser crashed during recovery reload"
                         )
                     if current_state == "authorized":
                         logger.info("Already authorized after recovery reload!")
@@ -1839,7 +1849,7 @@ class TelegramAuth:
                             success=True,
                             profile_name=profile.name,
                             required_2fa=False,
-                            telethon_alive=await self._verify_telethon_session(client)
+                            telethon_alive=await self._verify_telethon_session(client),
                         )
                     # FIX: Check 2FA state after recovery reload
                     if current_state == "2fa_required":
@@ -1856,27 +1866,29 @@ class TelegramAuth:
                                         success=True,
                                         profile_name=profile.name,
                                         required_2fa=True,
-                                        telethon_alive=await self._verify_telethon_session(client)
+                                        telethon_alive=await self._verify_telethon_session(client),
                                     )
                         return AuthResult(
-                            success=False,
-                            profile_name=profile.name,
-                            required_2fa=True,
-                            error="2FA password required"
+                            success=False, profile_name=profile.name, required_2fa=True, error="2FA password required"
                         )
                 except Exception as e:
                     error_str = str(e).lower()
                     # Unified with primary goto fatal_patterns (line 1689)
                     fatal_patterns = (
-                        'err_proxy', 'err_tunnel', 'ns_error_proxy',
-                        'err_name_not_resolved', 'connection_refused',
-                        'target closed', 'net::err_name', 'net::err_connection',
+                        "err_proxy",
+                        "err_tunnel",
+                        "ns_error_proxy",
+                        "err_name_not_resolved",
+                        "connection_refused",
+                        "target closed",
+                        "net::err_name",
+                        "net::err_connection",
                     )
                     if any(p in error_str for p in fatal_patterns):
                         return AuthResult(
                             success=False,
                             profile_name=profile.name,
-                            error=f"Recovery reload failed (non-recoverable): {e}"
+                            error=f"Recovery reload failed (non-recoverable): {e}",
                         )
                     logger.warning("Recovery reload failed (will proceed to QR): %s", e)
 
@@ -1896,19 +1908,19 @@ class TelegramAuth:
                     return AuthResult(
                         success=True,
                         profile_name=profile.name,
-                        telethon_alive=await self._verify_telethon_session(client)
+                        telethon_alive=await self._verify_telethon_session(client),
                     )
                 if final_state == "2fa_required":
                     return AuthResult(
                         success=False,
                         profile_name=profile.name,
                         required_2fa=True,
-                        error="2FA required but no password provided"
+                        error="2FA required but no password provided",
                     )
                 return AuthResult(
                     success=False,
                     profile_name=profile.name,
-                    error=f"Failed to extract QR token after {self.QR_MAX_RETRIES} attempts"
+                    error=f"Failed to extract QR token after {self.QR_MAX_RETRIES} attempts",
                 )
 
             # 5. Подтверждаем токен через Telethon
@@ -1916,11 +1928,7 @@ class TelegramAuth:
             accepted = await self._accept_token(client, token)
 
             if not accepted:
-                return AuthResult(
-                    success=False,
-                    profile_name=profile.name,
-                    error="Failed to accept login token"
-                )
+                return AuthResult(success=False, profile_name=profile.name, error="Failed to accept login token")
 
             # Обновляем страницу чтобы браузер увидел авторизацию
             await asyncio.sleep(2)  # Даём время на синхронизацию
@@ -1967,7 +1975,7 @@ class TelegramAuth:
                     profile_name=profile.name,
                     required_2fa=need_2fa,
                     user_info=user_info,
-                    telethon_alive=telethon_alive
+                    telethon_alive=telethon_alive,
                 )
             else:
                 return AuthResult(
@@ -1975,16 +1983,12 @@ class TelegramAuth:
                     profile_name=profile.name,
                     error="Authorization did not complete",
                     required_2fa=need_2fa,
-                    telethon_alive=telethon_alive
+                    telethon_alive=telethon_alive,
                 )
 
         except Exception as e:
             logger.error("Authorization failed for '%s': %s", profile.name, sanitize_error(str(e)), exc_info=True)
-            return AuthResult(
-                success=False,
-                profile_name=profile.name,
-                error=sanitize_error(str(e))
-            )
+            return AuthResult(success=False, profile_name=profile.name, error=sanitize_error(str(e)))
 
         finally:
             # Cancel watchdog first (before cleanup attempts that might also hang)
@@ -2005,19 +2009,15 @@ class TelegramAuth:
                 except Exception as e:
                     logger.warning(f"Error closing browser: {e}")
 
-    async def _get_browser_user_info(self, page) -> Optional[dict]:
+    async def _get_browser_user_info(self, page) -> dict | None:
         """Извлекает информацию о пользователе из браузера"""
         try:
             # Пробуем получить имя из UI
-            name_element = await page.query_selector(
-                '.user-title, '
-                '[class*="peer-title"], '
-                '.profile-name'
-            )
+            name_element = await page.query_selector('.user-title, [class*="peer-title"], .profile-name')
             if name_element:
                 name = await name_element.inner_text()
                 return {"name": name.strip()}
-        except Exception as e:
+        except Exception:
             # UI element not found, not accessible, or browser dead
             pass
         return None
@@ -2061,11 +2061,11 @@ def get_randomized_cooldown(base_cooldown: float = DEFAULT_ACCOUNT_COOLDOWN) -> 
 
 async def migrate_account(
     account_dir: Path,
-    password_2fa: Optional[str] = None,
+    password_2fa: str | None = None,
     headless: bool = False,
-    proxy_override: Optional[str] = None,
-    browser_manager: Optional[BrowserManager] = None,
-    on_status: Optional[Callable[[str], None]] = None,
+    proxy_override: str | None = None,
+    browser_manager: BrowserManager | None = None,
+    on_status: Callable[[str], None] | None = None,
 ) -> AuthResult:
     """
     Мигрирует один аккаунт из session в browser profile.
@@ -2093,12 +2093,12 @@ async def migrate_account(
 
 async def migrate_accounts_batch(
     account_dirs: list[Path],
-    password_2fa: Optional[str] = None,
+    password_2fa: str | None = None,
     headless: bool = False,
     cooldown: int = DEFAULT_ACCOUNT_COOLDOWN,
-    on_result: Optional[Callable[["AuthResult"], Any]] = None,
-    passwords_map: Optional[dict[str, str]] = None,
-    proxy_map: Optional[dict[str, str]] = None,
+    on_result: Callable[["AuthResult"], Any] | None = None,
+    passwords_map: dict[str, str] | None = None,
+    proxy_map: dict[str, str] | None = None,
 ) -> list[AuthResult]:
     """
     FIX #6: Мигрирует несколько аккаунтов с cooldown между ними.
@@ -2187,11 +2187,7 @@ class CircuitBreaker:
             breaker.record_success()
     """
 
-    def __init__(
-        self,
-        failure_threshold: int = 5,
-        reset_timeout: float = 60.0
-    ):
+    def __init__(self, failure_threshold: int = 5, reset_timeout: float = 60.0):
         """
         Args:
             failure_threshold: Number of consecutive failures before opening
@@ -2219,6 +2215,7 @@ class CircuitBreaker:
     def record_failure(self) -> None:
         """Record a failure. Opens circuit if threshold exceeded."""
         import time
+
         self._consecutive_failures += 1
         self._last_failure_time = time.time()
 
@@ -2254,6 +2251,7 @@ class CircuitBreaker:
             return True
 
         import time
+
         elapsed = time.time() - self._last_failure_time
 
         if elapsed >= self._reset_timeout:
@@ -2262,8 +2260,7 @@ class CircuitBreaker:
                 # Another worker is already probing
                 return False
             logger.info(
-                f"Circuit breaker: reset timeout elapsed "
-                f"({elapsed:.1f}s >= {self._reset_timeout}s), allowing probe"
+                f"Circuit breaker: reset timeout elapsed ({elapsed:.1f}s >= {self._reset_timeout}s), allowing probe"
             )
             return True
 
@@ -2296,6 +2293,7 @@ class CircuitBreaker:
             return 0.0
 
         import time
+
         elapsed = time.time() - self._last_failure_time
         remaining = self._reset_timeout - elapsed
         return max(0.0, remaining)
@@ -2327,7 +2325,7 @@ class ParallelMigrationController:
         max_concurrent: int = 10,
         cooldown: float = 5.0,
         resource_monitor: Optional["ResourceMonitor"] = None,
-        circuit_breaker: Optional[CircuitBreaker] = None
+        circuit_breaker: CircuitBreaker | None = None,
     ):
         self.max_concurrent = max_concurrent
         # Enforce minimum cooldown to prevent mass bans at scale
@@ -2335,7 +2333,7 @@ class ParallelMigrationController:
         self.resource_monitor = resource_monitor
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self._shutdown_requested = False
-        self._active_tasks: Set[asyncio.Task[Any]] = set()
+        self._active_tasks: set[asyncio.Task[Any]] = set()
         self._completed = 0
         self._total = 0
         self._paused_for_resources = False
@@ -2358,11 +2356,11 @@ class ParallelMigrationController:
     async def run(
         self,
         account_dirs: list[Path],
-        password_2fa: Optional[str] = None,
+        password_2fa: str | None = None,
         headless: bool = False,
-        on_progress: Optional[ProgressCallback] = None,
-        passwords_map: Optional[dict[str, str]] = None,
-        proxy_map: Optional[dict[str, str]] = None,
+        on_progress: ProgressCallback | None = None,
+        passwords_map: dict[str, str] | None = None,
+        proxy_map: dict[str, str] | None = None,
     ) -> list[AuthResult]:
         """
         Run parallel migration with shutdown support.
@@ -2415,9 +2413,7 @@ class ParallelMigrationController:
                     if wait_count > 60:  # 5 min timeout
                         async with lock:
                             results[index] = AuthResult(
-                                success=False,
-                                profile_name=account_dir.name,
-                                error="Timeout waiting for resources"
+                                success=False, profile_name=account_dir.name, error="Timeout waiting for resources"
                             )
                             self._completed += 1
                         return results[index]
@@ -2447,19 +2443,13 @@ class ParallelMigrationController:
                             browser_manager=browser_manager,
                             proxy_override=account_proxy,
                         )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning(f"Task timeout after {TASK_TIMEOUT}s for {account_dir.name}")
                     result = AuthResult(
-                        success=False,
-                        profile_name=account_dir.name,
-                        error=f"Task timeout after {TASK_TIMEOUT}s"
+                        success=False, profile_name=account_dir.name, error=f"Task timeout after {TASK_TIMEOUT}s"
                     )
                 except Exception as e:
-                    result = AuthResult(
-                        success=False,
-                        profile_name=account_dir.name,
-                        error=sanitize_error(str(e))
-                    )
+                    result = AuthResult(success=False, profile_name=account_dir.name, error=sanitize_error(str(e)))
 
                 # Record result for circuit breaker
                 if result.success:
@@ -2506,11 +2496,7 @@ class ParallelMigrationController:
             logger.info(f"Batch timeout: {BATCH_TIMEOUT}s for {len(account_dirs)} accounts")
 
             if tasks:
-                done, pending = await asyncio.wait(
-                    tasks,
-                    timeout=BATCH_TIMEOUT,
-                    return_when=asyncio.ALL_COMPLETED
-                )
+                done, pending = await asyncio.wait(tasks, timeout=BATCH_TIMEOUT, return_when=asyncio.ALL_COMPLETED)
 
                 # Cancel any stuck tasks that exceeded batch timeout
                 if pending:
@@ -2535,22 +2521,20 @@ class ParallelMigrationController:
                 ordered_results.append(results[i])
             elif self._shutdown_requested:
                 # Mark as skipped due to shutdown
-                ordered_results.append(AuthResult(
-                    success=False,
-                    profile_name=account_dirs[i].name,
-                    error="Skipped due to shutdown"
-                ))
+                ordered_results.append(
+                    AuthResult(success=False, profile_name=account_dirs[i].name, error="Skipped due to shutdown")
+                )
 
         return ordered_results
 
 
 async def migrate_accounts_parallel(
     account_dirs: list[Path],
-    password_2fa: Optional[str] = None,
+    password_2fa: str | None = None,
     headless: bool = False,
     max_concurrent: int = 10,
     cooldown: float = 5.0,
-    on_progress: Optional[ProgressCallback] = None
+    on_progress: ProgressCallback | None = None,
 ) -> list[AuthResult]:
     """
     Migrates multiple accounts in parallel with concurrency control.
@@ -2589,11 +2573,7 @@ async def migrate_accounts_parallel(
                 )
             except BaseException as e:
                 # BaseException catches CancelledError (Python 3.11+)
-                result = AuthResult(
-                    success=False,
-                    profile_name=account_dir.name,
-                    error=sanitize_error(str(e))
-                )
+                result = AuthResult(success=False, profile_name=account_dir.name, error=sanitize_error(str(e)))
                 # Re-raise CancelledError after recording result
                 if isinstance(e, asyncio.CancelledError):
                     async with lock:
@@ -2633,7 +2613,10 @@ async def migrate_accounts_parallel(
             logger.warning("BrowserManager cleanup error in migrate_accounts_parallel: %s", e)
 
     # Return results in original order
-    return [results.get(i, AuthResult(success=False, profile_name=str(account_dirs[i].name), error="Task cancelled")) for i in range(len(account_dirs))]
+    return [
+        results.get(i, AuthResult(success=False, profile_name=str(account_dirs[i].name), error="Task cancelled"))
+        for i in range(len(account_dirs))
+    ]
 
 
 async def main():
@@ -2652,11 +2635,7 @@ async def main():
         logger.error("Account directory not found: %s", account_path)
         sys.exit(1)
 
-    result = await migrate_account(
-        account_dir=account_path,
-        password_2fa=args.password,
-        headless=args.headless
-    )
+    result = await migrate_account(account_dir=account_path, password_2fa=args.password, headless=args.headless)
 
     logger.info("=" * 60)
     logger.info("RESULT")

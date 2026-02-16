@@ -16,17 +16,15 @@ producer-consumer pattern supporting:
 import asyncio
 import logging
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
-
-from .paths import PROFILES_DIR
-from typing import Callable, Optional
 
 from .browser_manager import BrowserManager
 from .database import AccountRecord, Database
 from .fragment_auth import fragment_account
+from .paths import PROFILES_DIR
 from .resource_monitor import ResourceMonitor
-from .telegram_auth import CircuitBreaker, AuthResult, migrate_account
+from .telegram_auth import AuthResult, CircuitBreaker, migrate_account
 from .utils import sanitize_error
 
 logger = logging.getLogger(__name__)
@@ -49,7 +47,7 @@ _ERROR_MAP = {
 }
 
 
-def humanize_error(error: Optional[str]) -> str:
+def humanize_error(error: str | None) -> str:
     """Convert technical error to human-readable Russian message."""
     if not error:
         return "Неизвестная ошибка"
@@ -62,16 +60,18 @@ def humanize_error(error: Optional[str]) -> str:
 @dataclass
 class AccountResult:
     """Result of a single account migration attempt."""
+
     account_id: int
     account_name: str
     success: bool
-    error: Optional[str] = None
+    error: str | None = None
     retries_used: int = 0
 
 
 @dataclass
 class PoolResult:
     """Aggregate result of a worker pool run."""
+
     total: int = 0
     success_count: int = 0
     error_count: int = 0
@@ -106,12 +106,12 @@ class MigrationWorkerPool:
         batch_pause_range: tuple[float, float] = (120.0, 180.0),
         max_retries: int = 2,
         task_timeout: float = 300.0,
-        resource_monitor: Optional[ResourceMonitor] = None,
-        circuit_breaker: Optional[CircuitBreaker] = None,
-        password_2fa: Optional[str] = None,
+        resource_monitor: ResourceMonitor | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
+        password_2fa: str | None = None,
         headless: bool = True,
-        on_progress: Optional[Callable[[int, int, Optional[AccountResult]], None]] = None,
-        on_log: Optional[Callable[[str], None]] = None,
+        on_progress: Callable[[int, int, AccountResult | None], None] | None = None,
+        on_log: Callable[[str], None] | None = None,
         mode: str = "web",
     ) -> None:
         """
@@ -139,9 +139,7 @@ class MigrationWorkerPool:
         self._max_retries = max_retries
         self._task_timeout = task_timeout
         self._resource_monitor = resource_monitor or ResourceMonitor()
-        self._circuit_breaker = circuit_breaker or CircuitBreaker(
-            failure_threshold=5, reset_timeout=60.0
-        )
+        self._circuit_breaker = circuit_breaker or CircuitBreaker(failure_threshold=5, reset_timeout=60.0)
         self._password_2fa = password_2fa
         self._headless = headless
         self._on_progress = on_progress
@@ -202,10 +200,7 @@ class MigrationWorkerPool:
         total = len(account_ids)
         result = PoolResult(total=total)
 
-        self._log(
-            f"[Pool] Starting migration: {total} accounts, "
-            f"{self._num_workers} workers"
-        )
+        self._log(f"[Pool] Starting migration: {total} accounts, {self._num_workers} workers")
 
         # FIX-C: Wrap worker execution in try/finally to ensure BrowserManager
         # cleanup on any exception (prevents zombie browsers on pool crash/cancel).
@@ -213,10 +208,7 @@ class MigrationWorkerPool:
         try:
             # Create producer and worker tasks
             producer = asyncio.create_task(self._producer(account_ids))
-            workers = [
-                asyncio.create_task(self._worker(i, total, result))
-                for i in range(self._num_workers)
-            ]
+            workers = [asyncio.create_task(self._worker(i, total, result)) for i in range(self._num_workers)]
 
             # Wait for producer to finish feeding the queue
             await producer
@@ -229,7 +221,7 @@ class MigrationWorkerPool:
             join_timeout = items_per_worker * (self._task_timeout + max_cooldown) + 120
             try:
                 await asyncio.wait_for(self._queue.join(), timeout=join_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "Queue join timed out after %.0fs — sending stop sentinels anyway",
                     join_timeout,
@@ -276,9 +268,7 @@ class MigrationWorkerPool:
                 break
             await self._queue.put(account_id)
 
-    async def _worker(
-        self, worker_id: int, total: int, result: PoolResult
-    ) -> None:
+    async def _worker(self, worker_id: int, total: int, result: PoolResult) -> None:
         """
         Worker coroutine: consume account IDs from queue and migrate.
 
@@ -306,19 +296,18 @@ class MigrationWorkerPool:
             # if any exception occurs in result recording, progress callback, or cooldown.
             try:
                 try:
-                    account_result = await self._process_account(
-                        worker_id, total, account_id
-                    )
+                    account_result = await self._process_account(worker_id, total, account_id)
                 except Exception as exc:
-                    logger.error(
+                    logger.exception(
                         "[W%d] Unhandled error processing account %d: %s",
-                        worker_id, account_id, exc,
+                        worker_id,
+                        account_id,
+                        exc,
                     )
                     # FIX: Mark account as error in DB so it doesn't stay as "migrating"
                     try:
                         await self._db.update_account(
-                            account_id, status="error",
-                            error_message=f"Internal error: {exc}"
+                            account_id, status="error", error_message=f"Internal error: {exc}"
                         )
                     except Exception:
                         pass  # DB update is best-effort
@@ -330,10 +319,7 @@ class MigrationWorkerPool:
                     )
 
                 # Record result (only count non-retry results)
-                is_retry = (
-                    account_result.error
-                    and account_result.error.startswith("RETRY:")
-                )
+                is_retry = account_result.error and account_result.error.startswith("RETRY:")
                 if not is_retry:
                     result.results.append(account_result)
                     if account_result.success:
@@ -352,9 +338,7 @@ class MigrationWorkerPool:
                         self._completed_count += 1
                         completed = self._completed_count
                         should_pause = (
-                            self._batch_pause_every > 0
-                            and completed > 0
-                            and completed % self._batch_pause_every == 0
+                            self._batch_pause_every > 0 and completed > 0 and completed % self._batch_pause_every == 0
                         )
 
                 if self._on_progress and not is_retry:
@@ -373,9 +357,7 @@ class MigrationWorkerPool:
             finally:
                 self._queue.task_done()
 
-    async def _process_account(
-        self, worker_id: int, total: int, account_id: int
-    ) -> AccountResult:
+    async def _process_account(self, worker_id: int, total: int, account_id: int) -> AccountResult:
         """
         Process a single account: fetch from DB, migrate, update status.
 
@@ -404,10 +386,7 @@ class MigrationWorkerPool:
         # Wait for circuit breaker if open
         if not self._circuit_breaker.can_proceed():
             wait_time = self._circuit_breaker.time_until_reset()
-            self._log(
-                f"[W{worker_id}] Circuit breaker open, "
-                f"waiting {wait_time:.0f}s..."
-            )
+            self._log(f"[W{worker_id}] Circuit breaker open, waiting {wait_time:.0f}s...")
             await self._interruptible_sleep(wait_time)
             if self._shutdown_event.is_set():
                 return AccountResult(
@@ -426,8 +405,7 @@ class MigrationWorkerPool:
                 # Another worker is probing — wait for probe result
                 wait_time = self._circuit_breaker.time_until_reset() or 5.0
                 self._log(
-                    f"[W{worker_id}] Circuit breaker half-open, "
-                    f"another worker is probing — waiting {wait_time:.0f}s..."
+                    f"[W{worker_id}] Circuit breaker half-open, another worker is probing — waiting {wait_time:.0f}s..."
                 )
                 await self._interruptible_sleep(wait_time)
                 # Re-check after wait — the probe worker may have closed the circuit
@@ -443,10 +421,7 @@ class MigrationWorkerPool:
 
         # Check resource availability
         if not self._resource_monitor.can_launch_more():
-            self._log(
-                f"[W{worker_id}] Resources exhausted, "
-                f"waiting 30s for {name}..."
-            )
+            self._log(f"[W{worker_id}] Resources exhausted, waiting 30s for {name}...")
             await self._interruptible_sleep(30.0)
             if not self._resource_monitor.can_launch_more():
                 if probe_acquired:
@@ -468,8 +443,7 @@ class MigrationWorkerPool:
             self._log(f"[W{worker_id}] {name} - {error_msg}")
             try:
                 await self._db.update_account(
-                    account_id, status="error",
-                    error_message="Proxy unavailable — run proxy-refresh"
+                    account_id, status="error", error_message="Proxy unavailable — run proxy-refresh"
                 )
             except Exception as exc:
                 logger.warning("DB update failed for %s: %s", name, exc)
@@ -484,15 +458,13 @@ class MigrationWorkerPool:
 
         # Validate session dir exists
         from .paths import resolve_path
+
         session_path = resolve_path(account.session_path)
         session_dir = session_path.parent
         if not session_dir.exists():
             self._log(f"[W{worker_id}] {name} - SKIP (session dir not found)")
             try:
-                await self._db.update_account(
-                    account_id, status="error",
-                    error_message="Session dir not found"
-                )
+                await self._db.update_account(account_id, status="error", error_message="Session dir not found")
             except Exception as exc:
                 logger.warning("DB update failed for %s: %s", name, exc)
             if probe_acquired:
@@ -508,7 +480,7 @@ class MigrationWorkerPool:
 
         # Start migration tracking in DB (web mode only — fragment mode
         # must NOT overwrite account status or pollute migrations table)
-        migration_id: Optional[int] = None
+        migration_id: int | None = None
         if self._mode != "fragment":
             try:
                 migration_id = await self._db.start_migration(account_id)
@@ -547,48 +519,35 @@ class MigrationWorkerPool:
                 ),
                 timeout=self._task_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             error_msg = f"Timeout after {self._task_timeout:.0f}s"
             self._log(f"[W{worker_id}] {name} - TIMEOUT")
             if migration_id is not None:
-                await self._complete_migration_safe(
-                    migration_id, name, success=False, error_message=error_msg
-                )
+                await self._complete_migration_safe(migration_id, name, success=False, error_message=error_msg)
             elif self._mode == "fragment":
-                await self._update_fragment_status_safe(
-                    account_id, name, "error", error_msg
-                )
+                await self._update_fragment_status_safe(account_id, name, "error", error_msg)
             self._circuit_breaker.record_failure()
             self._circuit_breaker.release_half_open_probe()  # FIX #4
-            return await self._maybe_retry(
-                account_id, name, error_msg, retries
-            )
+            return await self._maybe_retry(account_id, name, error_msg, retries)
         except Exception as exc:
             error_msg = sanitize_error(str(exc))
             self._log(f"[W{worker_id}] {name} - ERROR: {humanize_error(error_msg)}")
             if migration_id is not None:
-                await self._complete_migration_safe(
-                    migration_id, name, success=False, error_message=error_msg
-                )
+                await self._complete_migration_safe(migration_id, name, success=False, error_message=error_msg)
             elif self._mode == "fragment":
-                await self._update_fragment_status_safe(
-                    account_id, name, "error", error_msg
-                )
+                await self._update_fragment_status_safe(account_id, name, "error", error_msg)
             self._circuit_breaker.record_failure()
             self._circuit_breaker.release_half_open_probe()  # FIX #4
-            return await self._maybe_retry(
-                account_id, name, error_msg, retries
-            )
+            return await self._maybe_retry(account_id, name, error_msg, retries)
 
         # Process result
         if auth_result.success:
             if self._mode == "fragment":
-                await self._update_fragment_status_safe(
-                    account_id, name, "authorized"
-                )
+                await self._update_fragment_status_safe(account_id, name, "authorized")
                 # Update last verified timestamp for fragment
                 try:
                     from datetime import datetime
+
                     await self._db.update_account(
                         account_id,
                         web_last_verified=datetime.now().isoformat(),
@@ -600,23 +559,20 @@ class MigrationWorkerPool:
                 if isinstance(auth_result.user_info, dict):
                     username = auth_result.user_info.get("username")
                 from .paths import to_relative_path
+
                 profile_path = (
-                    to_relative_path(PROFILES_DIR / auth_result.profile_name)
-                    if auth_result.profile_name else None
+                    to_relative_path(PROFILES_DIR / auth_result.profile_name) if auth_result.profile_name else None
                 )
-                await self._complete_migration_safe(
-                    migration_id, name, success=True, profile_path=profile_path
-                )
+                await self._complete_migration_safe(migration_id, name, success=True, profile_path=profile_path)
                 if username:
                     try:
-                        await self._db.update_account(
-                            account_id, username=username
-                        )
+                        await self._db.update_account(account_id, username=username)
                     except Exception as exc:
                         logger.warning("DB update username for %s: %s", name, exc)
                 # Record web_last_verified + auth_ttl_days on successful web migration
                 try:
                     from datetime import datetime
+
                     await self._db.update_account(
                         account_id,
                         web_last_verified=datetime.now().isoformat(),
@@ -636,27 +592,21 @@ class MigrationWorkerPool:
         else:
             error_msg = auth_result.error or "Unknown error"
             if migration_id is not None:
-                await self._complete_migration_safe(
-                    migration_id, name, success=False, error_message=error_msg
-                )
+                await self._complete_migration_safe(migration_id, name, success=False, error_message=error_msg)
             elif self._mode == "fragment":
-                await self._update_fragment_status_safe(
-                    account_id, name, "error", error_msg
-                )
+                await self._update_fragment_status_safe(account_id, name, "error", error_msg)
             self._circuit_breaker.record_failure()
             self._circuit_breaker.release_half_open_probe()  # FIX #4
             self._log(f"[W{worker_id}] {name} - FAILED: {humanize_error(error_msg)}")
-            return await self._maybe_retry(
-                account_id, name, error_msg, retries
-            )
+            return await self._maybe_retry(account_id, name, error_msg, retries)
 
     async def _complete_migration_safe(
         self,
         migration_id: int,
         name: str,
         success: bool,
-        error_message: Optional[str] = None,
-        profile_path: Optional[str] = None,
+        error_message: str | None = None,
+        profile_path: str | None = None,
     ) -> None:
         """Wrapper around db.complete_migration that won't crash the worker."""
         try:
@@ -667,9 +617,11 @@ class MigrationWorkerPool:
                 profile_path=profile_path,
             )
         except Exception as exc:
-            logger.error(
+            logger.exception(
                 "DB complete_migration failed for %s (migration_id=%d): %s",
-                name, migration_id, exc,
+                name,
+                migration_id,
+                exc,
             )
 
     async def _update_fragment_status_safe(
@@ -677,7 +629,7 @@ class MigrationWorkerPool:
         account_id: int,
         name: str,
         status: str,
-        error_message: Optional[str] = None,
+        error_message: str | None = None,
     ) -> None:
         """Update fragment_status without touching account status. Won't crash the worker."""
         try:
@@ -686,17 +638,26 @@ class MigrationWorkerPool:
                 kwargs["error_message"] = error_message
             await self._db.update_account(account_id, **kwargs)
         except Exception as exc:
-            logger.error(
-                "DB update fragment_status failed for %s: %s", name, exc,
+            logger.exception(
+                "DB update fragment_status failed for %s: %s",
+                name,
+                exc,
             )
 
     # Terminal errors that should NOT be retried — retrying wastes time and
     # pollutes the circuit breaker with expected failures.
     NON_RETRYABLE_PATTERNS = (
-        "phonenumberbanned", "userdeactivated", "authkeyunregistered",
-        "session is not authorized", "not authorized", "dead session",
-        "sessionpasswordneeded", "2fa required", "2fa password",
-        "unique constraint", "auth_key_duplicated",
+        "phonenumberbanned",
+        "userdeactivated",
+        "authkeyunregistered",
+        "session is not authorized",
+        "not authorized",
+        "dead session",
+        "sessionpasswordneeded",
+        "2fa required",
+        "2fa password",
+        "unique constraint",
+        "auth_key_duplicated",
     )
 
     def _is_retryable(self, error: str) -> bool:
@@ -733,15 +694,10 @@ class MigrationWorkerPool:
 
         if retries_used < self._max_retries and not self._shutdown_event.is_set():
             self._retry_counts[account_id] = retries_used + 1
-            self._log(
-                f"[Pool] {name} - scheduling retry "
-                f"#{retries_used + 1}/{self._max_retries}"
-            )
+            self._log(f"[Pool] {name} - scheduling retry #{retries_used + 1}/{self._max_retries}")
             try:
-                await asyncio.wait_for(
-                    self._queue.put(account_id), timeout=30.0
-                )
-            except asyncio.TimeoutError:
+                await asyncio.wait_for(self._queue.put(account_id), timeout=30.0)
+            except TimeoutError:
                 self._log(f"[Pool] {name} - queue full after 30s, retry dropped")
                 return AccountResult(
                     account_id=account_id,
@@ -766,9 +722,7 @@ class MigrationWorkerPool:
             retries_used=retries_used,
         )
 
-    async def _build_proxy_string(
-        self, account: AccountRecord
-    ) -> Optional[str]:
+    async def _build_proxy_string(self, account: AccountRecord) -> str | None:
         """Build proxy connection string from DB proxy record."""
         if not account.proxy_id:
             return None
@@ -778,19 +732,17 @@ class MigrationWorkerPool:
         # FIX: Skip dead proxies — retrying with a known-dead proxy wastes time
         if proxy.status == "dead":
             self._log(
-                f"[Pool] Proxy {proxy.host}:{proxy.port} is dead for "
-                f"{account.name} — run 'proxy-refresh' to replace"
+                f"[Pool] Proxy {proxy.host}:{proxy.port} is dead for {account.name} — run 'proxy-refresh' to replace"
             )
             return None
         if proxy.username and proxy.password:
-            return (
-                f"{proxy.protocol}:{proxy.host}:{proxy.port}"
-                f":{proxy.username}:{proxy.password}"
-            )
+            return f"{proxy.protocol}:{proxy.host}:{proxy.port}:{proxy.username}:{proxy.password}"
         return f"{proxy.protocol}:{proxy.host}:{proxy.port}"
 
     async def _cooldown(
-        self, completed_total: int, is_flood_wait: bool = False,
+        self,
+        completed_total: int,
+        is_flood_wait: bool = False,
         should_pause: bool = False,
     ) -> None:
         """
@@ -812,10 +764,7 @@ class MigrationWorkerPool:
         # should_pause is pre-computed under _count_lock to avoid race.
         if should_pause:
             pause = random.uniform(*self._batch_pause_range)
-            self._log(
-                f"[Pool] Batch pause {pause / 60:.1f} min "
-                f"(every {self._batch_pause_every} accounts)..."
-            )
+            self._log(f"[Pool] Batch pause {pause / 60:.1f} min (every {self._batch_pause_every} accounts)...")
             # Clear event — all workers will block at top of their loop
             self._batch_pause_event.clear()
             try:
@@ -830,23 +779,16 @@ class MigrationWorkerPool:
         base = random.uniform(*self._cooldown_range)
         cooldown = base * 3 if is_flood_wait else base
         if is_flood_wait:
-            self._log(
-                f"[Pool] FLOOD_WAIT — увеличенная пауза "
-                f"{cooldown:.0f}с (антибан)"
-            )
+            self._log(f"[Pool] FLOOD_WAIT — увеличенная пауза {cooldown:.0f}с (антибан)")
         else:
-            self._log(
-                f"[Pool] Пауза {cooldown:.0f}с между аккаунтами (антибан)..."
-            )
+            self._log(f"[Pool] Пауза {cooldown:.0f}с между аккаунтами (антибан)...")
         await self._interruptible_sleep(cooldown)
 
     async def _interruptible_sleep(self, seconds: float) -> None:
         """Sleep that can be interrupted by shutdown event."""
         try:
-            await asyncio.wait_for(
-                self._shutdown_event.wait(), timeout=seconds
-            )
-        except asyncio.TimeoutError:
+            await asyncio.wait_for(self._shutdown_event.wait(), timeout=seconds)
+        except TimeoutError:
             pass  # Normal: timeout means sleep completed without shutdown
 
     def _log(self, message: str) -> None:

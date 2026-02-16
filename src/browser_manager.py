@@ -10,6 +10,7 @@ Browser Manager Module
 ВАЖНО: Браузеры НЕ поддерживают SOCKS5 с авторизацией напрямую.
 Используем proxy_relay для создания локального HTTP прокси.
 """
+
 import asyncio
 import json
 import logging
@@ -18,9 +19,9 @@ import shutil
 import stat
 import sys
 import zipfile
-from pathlib import Path
-from typing import Optional, Dict, Any
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
 
 import psutil
 
@@ -31,16 +32,17 @@ try:
 except ImportError as e:
     raise ImportError("camoufox not installed. Run: pip install camoufox && camoufox fetch") from e
 
-from .proxy_relay import ProxyRelay, needs_relay
 from .paths import PROFILES_DIR as _PROFILES_DIR
+from .proxy_relay import ProxyRelay, needs_relay
 
 
 @dataclass
 class BrowserProfile:
     """Информация о browser профиле"""
+
     name: str
     path: Path
-    proxy: Optional[str]
+    proxy: str | None
     created: bool = False
 
     @property
@@ -77,7 +79,7 @@ def _rmtree_force(path: Path) -> None:
         shutil.rmtree(path, onerror=_on_rmtree_error)
 
 
-def _get_driver_pid(camoufox_instance) -> Optional[int]:
+def _get_driver_pid(camoufox_instance) -> int | None:
     """Extract Playwright driver process PID (root of browser process tree).
 
     This is the node.exe/driver process that communicates with Python via pipe.
@@ -100,7 +102,7 @@ def _get_driver_pid(camoufox_instance) -> Optional[int]:
         return None
 
 
-def _get_browser_pid(camoufox_instance) -> Optional[int]:
+def _get_browser_pid(camoufox_instance) -> int | None:
     """Extract PID of camoufox.exe via psutil process tree.
 
     Chain: camoufox._connection._transport._proc.pid -> node.exe PID
@@ -118,7 +120,7 @@ def _get_browser_pid(camoufox_instance) -> Optional[int]:
         parent = psutil.Process(node_pid)
         for child in parent.children(recursive=True):
             name = child.name().lower()
-            if 'camoufox' in name or 'firefox' in name:
+            if "camoufox" in name or "firefox" in name:
                 return child.pid
         # Fallback: return node_pid (kill node -> cascade kill children)
         return node_pid
@@ -206,7 +208,7 @@ class ProfileLifecycleManager:
         """Check if profile is compressed as a zip file."""
         return (self.profiles_dir / f"{name}.zip").exists() and not self.is_hot(name)
 
-    async def ensure_active(self, name: str, protected: Optional[set[str]] = None) -> Path:
+    async def ensure_active(self, name: str, protected: set[str] | None = None) -> Path:
         """Ensure profile is hot (decompressed). Decompress from zip if needed.
 
         Blocking zip I/O is offloaded to a thread executor so the asyncio
@@ -239,9 +241,10 @@ class ProfileLifecycleManager:
                     # FIX #7/#8: Corrupt zip — log, remove zip, and create empty
                     # profile dir so downstream code has a valid path.
                     # The session data is lost but browser will create a fresh profile.
-                    logger.error(
+                    logger.exception(
                         "Corrupt zip for profile '%s' — removing and creating fresh profile. "
-                        "Previous browser state is lost.", name
+                        "Previous browser state is lost.",
+                        name,
                     )
                     profile_path.mkdir(parents=True, exist_ok=True)
                 try:
@@ -263,7 +266,7 @@ class ProfileLifecycleManager:
 
         Validates all member paths to prevent ZIP Slip (path traversal) attacks.
         """
-        with zipfile.ZipFile(zip_path, 'r') as zf:
+        with zipfile.ZipFile(zip_path, "r") as zf:
             # Validate paths to prevent ZIP Slip
             dest_str = str(dest_path.resolve())
             for member in zf.namelist():
@@ -272,7 +275,7 @@ class ProfileLifecycleManager:
                     raise ValueError(f"ZIP path traversal detected: {member}")
             zf.extractall(dest_path)
 
-    async def hibernate(self, name: str) -> Optional[Path]:
+    async def hibernate(self, name: str) -> Path | None:
         """Compress a hot profile to zip and remove the directory.
 
         Blocking zip I/O is offloaded to a thread executor so the asyncio
@@ -318,8 +321,8 @@ class ProfileLifecycleManager:
     @staticmethod
     def _compress_zip(profile_path: Path, zip_path: Path) -> None:
         """Compress profile directory to zip (runs in executor thread)."""
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for file_path in profile_path.rglob('*'):
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in profile_path.rglob("*"):
                 if file_path.is_file():
                     arcname = file_path.relative_to(profile_path)
                     zf.write(file_path, arcname)
@@ -339,7 +342,7 @@ class ProfileLifecycleManager:
         """
         return len(self._access_order)
 
-    async def _evict_if_needed(self, protected: Optional[set[str]] = None) -> None:
+    async def _evict_if_needed(self, protected: set[str] | None = None) -> None:
         """Evict LRU profiles until under max_hot capacity."""
         protected = protected or set()
         while self._hot_count() >= self.max_hot:
@@ -349,16 +352,15 @@ class ProfileLifecycleManager:
                 # (another worker may be launching on them right now)
                 lock = self._locks.get(name)
                 if name not in protected and self.is_hot(name) and (lock is None or not lock.locked()):
-                    logger.info("Evicting LRU profile '%s' (capacity %d/%d)",
-                                name, self._hot_count(), self.max_hot)
+                    logger.info("Evicting LRU profile '%s' (capacity %d/%d)", name, self._hot_count(), self.max_hot)
                     await self.hibernate(name)
                     evicted = True
                     break
             if not evicted:
                 logger.warning(
-                    "Cannot evict: all %d hot profiles are protected. "
-                    "Temporarily exceeding max_hot=%d",
-                    self._hot_count(), self.max_hot
+                    "Cannot evict: all %d hot profiles are protected. Temporarily exceeding max_hot=%d",
+                    self._hot_count(),
+                    self.max_hot,
                 )
                 break
 
@@ -374,7 +376,7 @@ class ProfileLifecycleManager:
             for entry in self.profiles_dir.iterdir():
                 if entry.is_dir() and (entry / "browser_data").exists():
                     hot += 1
-                elif entry.suffix == '.zip' and entry.is_file():
+                elif entry.suffix == ".zip" and entry.is_file():
                     cold += 1
         return {"hot": hot, "cold": cold, "total": hot + cold, "max_hot": self.max_hot}
 
@@ -394,18 +396,18 @@ class BrowserManager:
 
     # Hardened Camoufox настройки
     DEFAULT_CONFIG = {
-        "geoip": True,           # Авто timezone/locale по IP
-        "block_webrtc": True,    # Блокируем WebRTC leak
-        "humanize": True,        # Human-like поведение мыши
-        "block_images": False,   # Не блокируем картинки (нужны для QR)
-        "addons": [],            # Без расширений по умолчанию
+        "geoip": True,  # Авто timezone/locale по IP
+        "block_webrtc": True,  # Блокируем WebRTC leak
+        "humanize": True,  # Human-like поведение мыши
+        "block_images": False,  # Не блокируем картинки (нужны для QR)
+        "addons": [],  # Без расширений по умолчанию
     }
 
-    def __init__(self, profiles_dir: Optional[Path] = None):
+    def __init__(self, profiles_dir: Path | None = None):
         self.profiles_dir = profiles_dir or self.PROFILES_DIR
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
-        self._active_browsers: Dict[str, Any] = {}
-        self._profile_locks: Dict[str, asyncio.Lock] = {}
+        self._active_browsers: dict[str, Any] = {}
+        self._profile_locks: dict[str, asyncio.Lock] = {}
         self.lifecycle = ProfileLifecycleManager(self.profiles_dir)
 
     def _get_profile_lock(self, name: str) -> asyncio.Lock:
@@ -414,15 +416,10 @@ class BrowserManager:
             self._profile_locks[name] = asyncio.Lock()
         return self._profile_locks[name]
 
-    def get_profile(self, name: str, proxy: Optional[str] = None) -> BrowserProfile:
+    def get_profile(self, name: str, proxy: str | None = None) -> BrowserProfile:
         """Получает или создаёт профиль"""
         profile_path = self.profiles_dir / name
-        profile = BrowserProfile(
-            name=name,
-            path=profile_path,
-            proxy=proxy,
-            created=not profile_path.exists()
-        )
+        profile = BrowserProfile(name=name, path=profile_path, proxy=proxy, created=not profile_path.exists())
         return profile
 
     def list_profiles(self) -> list[BrowserProfile]:
@@ -435,33 +432,27 @@ class BrowserManager:
                 proxy = None
                 if config_path.exists():
                     try:
-                        with open(config_path, 'r', encoding='utf-8') as f:
+                        with open(config_path, encoding="utf-8") as f:
                             config = json.load(f)
-                            proxy = config.get('proxy')
-                    except (json.JSONDecodeError, IOError) as e:
+                            proxy = config.get("proxy")
+                    except (OSError, json.JSONDecodeError) as e:
                         logger.warning("Failed to read profile config %s: %s", config_path, e)
 
-                profiles.append(BrowserProfile(
-                    name=path.name,
-                    path=path,
-                    proxy=proxy
-                ))
+                profiles.append(BrowserProfile(name=path.name, path=path, proxy=proxy))
         return profiles
 
     def _build_camoufox_args(
-        self,
-        profile: BrowserProfile,
-        headless: bool = False,
-        extra_args: Optional[Dict] = None
-    ) -> Dict[str, Any]:
+        self, profile: BrowserProfile, headless: bool = False, extra_args: dict | None = None
+    ) -> dict[str, Any]:
         """Собирает аргументы для Camoufox"""
         args = {**self.DEFAULT_CONFIG}
         args["headless"] = headless
 
         # In frozen mode: use bundled camoufox binary
-        if getattr(sys, 'frozen', False):
+        if getattr(sys, "frozen", False):
             from .paths import APP_ROOT
-            bundled_exe = APP_ROOT / "camoufox" / ("camoufox.exe" if sys.platform == 'win32' else "camoufox")
+
+            bundled_exe = APP_ROOT / "camoufox" / ("camoufox.exe" if sys.platform == "win32" else "camoufox")
             if bundled_exe.exists():
                 args["executable_path"] = str(bundled_exe)
 
@@ -494,7 +485,7 @@ class BrowserManager:
         return args
 
     @staticmethod
-    def _mask_proxy_for_config(proxy: Optional[str]) -> Optional[str]:
+    def _mask_proxy_for_config(proxy: str | None) -> str | None:
         """Strip credentials from proxy string for safe storage in profile config.
 
         Only protocol:host:port is stored. Actual credentials come from
@@ -514,7 +505,7 @@ class BrowserManager:
             "proxy": self._mask_proxy_for_config(profile.proxy),
         }
         profile.path.mkdir(parents=True, exist_ok=True)
-        with open(profile.config_path, 'w', encoding='utf-8') as f:
+        with open(profile.config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
 
     # FIX-007: Timeout для запуска браузера
@@ -532,7 +523,6 @@ class BrowserManager:
         IMPORTANT: PID-based kill only affects THIS browser instance,
         NOT other parallel workers' browsers.
         """
-        import subprocess
 
         # 1. Try graceful exit via Playwright context manager
         try:
@@ -566,19 +556,13 @@ class BrowserManager:
         # FIX-E: Do NOT use taskkill /IM — it kills ALL camoufox instances,
         # including other parallel workers' browsers. Accept the zombie as
         # lesser evil; it will be cleaned up on pool shutdown via close_all().
-        logger.warning(
-            "PID not found for zombie browser cleanup. "
-            "Process may remain until pool shutdown."
-        )
+        logger.warning("PID not found for zombie browser cleanup. Process may remain until pool shutdown.")
 
         # Wait for file locks to release
         await asyncio.sleep(1)
 
     async def launch(
-        self,
-        profile: BrowserProfile,
-        headless: bool = False,
-        extra_args: Optional[Dict] = None
+        self, profile: BrowserProfile, headless: bool = False, extra_args: dict | None = None
     ) -> "BrowserContext":
         """
         Запускает браузер с профилем.
@@ -599,10 +583,7 @@ class BrowserManager:
             return await self._launch_impl(profile, headless, extra_args)
 
     async def _launch_impl(
-        self,
-        profile: BrowserProfile,
-        headless: bool = False,
-        extra_args: Optional[Dict] = None
+        self, profile: BrowserProfile, headless: bool = False, extra_args: dict | None = None
     ) -> "BrowserContext":
         """Internal launch implementation, called under profile lock."""
         # Close stale browser if still active for this profile
@@ -635,7 +616,7 @@ class BrowserManager:
             # https://github.com/microsoft/playwright/issues/12632
             _clean_session_restore(browser_data_path)
 
-            lock_patterns = ['*.lock', 'parent.lock', '.parentlock', 'lock']
+            lock_patterns = ["*.lock", "parent.lock", ".parentlock", "lock"]
             for pattern in lock_patterns:
                 for lock_file in browser_data_path.glob(pattern):
                     try:
@@ -663,7 +644,7 @@ class BrowserManager:
             proxy_info = f"{proxy_relay.local_url} -> {profile.proxy.split(':')[1]}:***"
         else:
             args = self._build_camoufox_args(profile, headless, extra_args)
-            proxy_info = args.get('proxy', {}).get('server', 'no proxy')
+            proxy_info = args.get("proxy", {}).get("server", "no proxy")
 
         logger.info("Launching Camoufox for '%s'", profile.name)
         logger.info("Profile: %s", profile.browser_data_path)
@@ -677,28 +658,19 @@ class BrowserManager:
 
         try:
             try:
-                browser = await asyncio.wait_for(
-                    camoufox.__aenter__(),
-                    timeout=self.BROWSER_LAUNCH_TIMEOUT
-                )
-            except asyncio.TimeoutError:
+                browser = await asyncio.wait_for(camoufox.__aenter__(), timeout=self.BROWSER_LAUNCH_TIMEOUT)
+            except TimeoutError:
                 # Kill the zombie Firefox process left by the timed-out launch
                 await self._kill_zombie_browser(camoufox)
 
                 # Retry once with a fresh profile (delete corrupted browser_data)
-                logger.warning(
-                    "Browser launch timeout for '%s' — retrying with fresh profile...",
-                    profile.name
-                )
+                logger.warning("Browser launch timeout for '%s' — retrying with fresh profile...", profile.name)
                 if browser_data_path.exists():
                     try:
                         _rmtree_force(browser_data_path)
                         logger.info("Deleted corrupted browser_data for '%s'", profile.name)
                     except OSError as e:
-                        logger.warning(
-                            "Could not fully delete browser_data for '%s': %s",
-                            profile.name, e
-                        )
+                        logger.warning("Could not fully delete browser_data for '%s': %s", profile.name, e)
 
                 # Retry: recreate proxy relay (old one may be in broken state)
                 if proxy_relay:
@@ -725,19 +697,15 @@ class BrowserManager:
 
                 camoufox = AsyncCamoufox(**args)
                 try:
-                    browser = await asyncio.wait_for(
-                        camoufox.__aenter__(),
-                        timeout=self.BROWSER_LAUNCH_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
+                    browser = await asyncio.wait_for(camoufox.__aenter__(), timeout=self.BROWSER_LAUNCH_TIMEOUT)
+                except TimeoutError:
                     await self._kill_zombie_browser(camoufox)
                     if proxy_relay:
                         await proxy_relay.stop()
                         proxy_relay = None  # Prevent double-stop in outer except
                     raise RuntimeError(
-                        f"Browser launch timeout after {self.BROWSER_LAUNCH_TIMEOUT}s "
-                        f"(retried with fresh profile)"
-                    )
+                        f"Browser launch timeout after {self.BROWSER_LAUNCH_TIMEOUT}s (retried with fresh profile)"
+                    ) from None
 
             browser_pid = _get_browser_pid(camoufox)
             driver_pid = _get_driver_pid(camoufox)
@@ -757,8 +725,8 @@ class BrowserManager:
         except BaseException:
             # Cleanup proxy_relay and camoufox on ANY unhandled exception in launch flow
             # BaseException catches CancelledError (Python 3.11+: not subclass of Exception)
-            if 'camoufox' in locals() and camoufox:
-                if 'browser' in locals() and browser:
+            if "camoufox" in locals() and camoufox:
+                if "browser" in locals() and browser:
                     try:
                         await asyncio.wait_for(camoufox.__aexit__(None, None, None), timeout=10)
                     except Exception as cleanup_err:
@@ -797,7 +765,7 @@ class BrowserContext:
         profile: BrowserProfile,
         browser,
         camoufox,
-        proxy_relay: Optional[ProxyRelay] = None,
+        proxy_relay: ProxyRelay | None = None,
         manager: Optional["BrowserManager"] = None,
     ):
         self.profile = profile
@@ -807,8 +775,8 @@ class BrowserContext:
         self._manager = manager
         self._page = None
         self._closed = False
-        self._browser_pid: Optional[int] = None
-        self._driver_pid: Optional[int] = None
+        self._browser_pid: int | None = None
+        self._driver_pid: int | None = None
         # FIX #6: Only save storage_state on close when auth succeeded.
         # Callers set this to True after confirmed successful authorization.
         # Default False prevents overwriting valid profiles with failed auth data.
@@ -824,9 +792,9 @@ class BrowserContext:
         await asyncio.sleep(0.5)
 
         pages = []
-        if hasattr(self.browser, 'pages'):
+        if hasattr(self.browser, "pages"):
             pages = self.browser.pages
-        elif hasattr(self.browser, 'contexts'):
+        elif hasattr(self.browser, "contexts"):
             # Если это Browser, а не BrowserContext - ищем страницы в контекстах
             for ctx in self.browser.contexts:
                 pages.extend(ctx.pages)
@@ -855,7 +823,7 @@ class BrowserContext:
         """Сохраняет storage state (cookies, localStorage)"""
         if self._page and self._page.context:
             state = await self._page.context.storage_state()
-            with open(self.profile.storage_state_path, 'w', encoding='utf-8') as f:
+            with open(self.profile.storage_state_path, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2)
             logger.info("Storage state saved: %s", self.profile.storage_state_path)
 
@@ -891,7 +859,7 @@ class BrowserContext:
         if self.save_state_on_close:
             try:
                 await asyncio.wait_for(self.save_storage_state(), timeout=5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Storage state save timed out for '%s'", self.profile.name)
             except Exception as e:
                 logger.warning("Couldn't save state: %s", e)
@@ -899,14 +867,12 @@ class BrowserContext:
             logger.debug("Skipping storage state save for '%s' (save_state_on_close=False)", self.profile.name)
 
         try:
-            await asyncio.wait_for(
-                self._camoufox.__aexit__(None, None, None),
-                timeout=self.CLOSE_TIMEOUT
-            )
-        except asyncio.TimeoutError:
+            await asyncio.wait_for(self._camoufox.__aexit__(None, None, None), timeout=self.CLOSE_TIMEOUT)
+        except TimeoutError:
             logger.warning(
                 "Browser close timed out for '%s' - force killing PID %s",
-                self.profile.name, self._browser_pid,
+                self.profile.name,
+                self._browser_pid,
             )
             self._force_kill_by_pid()
         except Exception as e:
@@ -932,11 +898,7 @@ class BrowserContext:
 
 
 # Utility functions
-async def quick_launch(
-    profile_name: str,
-    proxy: str,
-    headless: bool = False
-) -> BrowserContext:
+async def quick_launch(profile_name: str, proxy: str, headless: bool = False) -> BrowserContext:
     """
     Быстрый запуск браузера с профилем.
 
