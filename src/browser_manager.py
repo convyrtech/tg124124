@@ -226,6 +226,11 @@ class ProfileLifecycleManager:
         async with self._get_lock(name):
             profile_path = self.profiles_dir / name
             zip_path = self.profiles_dir / f"{name}.zip"
+            # Clean up orphaned .zip.tmp from interrupted hibernate
+            tmp_zip = self.profiles_dir / f"{name}.zip.tmp"
+            if tmp_zip.exists():
+                tmp_zip.unlink(missing_ok=True)
+                logger.debug("Cleaned orphaned tmp zip for '%s'", name)
 
             if self.is_hot(name):
                 self._touch(name)
@@ -752,6 +757,8 @@ class BrowserManager:
             except Exception as e:
                 logger.warning("Error closing %s: %s", name, e)
         self._active_browsers.clear()
+        # Prune profile locks to prevent unbounded memory growth over 1000+ accounts
+        self._profile_locks.clear()
 
 
 class BrowserContext:
@@ -820,11 +827,14 @@ class BrowserContext:
         return self._page
 
     async def save_storage_state(self):
-        """Сохраняет storage state (cookies, localStorage)"""
+        """Сохраняет storage state (cookies, localStorage) atomically"""
         if self._page and self._page.context:
             state = await self._page.context.storage_state()
-            with open(self.profile.storage_state_path, "w", encoding="utf-8") as f:
+            # Atomic write: write to .tmp, then rename to prevent truncated files
+            tmp_path = Path(str(self.profile.storage_state_path) + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2)
+            os.replace(tmp_path, self.profile.storage_state_path)
             logger.info("Storage state saved: %s", self.profile.storage_state_path)
 
     CLOSE_TIMEOUT = 15  # секунд на закрытие браузера

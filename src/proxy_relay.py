@@ -239,7 +239,7 @@ class ProxyRelay:
         if self._server_handle:
             try:
                 self._server_handle.close()
-                await self._server_handle.wait_closed()
+                await asyncio.wait_for(self._server_handle.wait_closed(), timeout=5)
                 logger.debug("ProxyRelay in-process server closed")
             except Exception as e:
                 logger.warning("Error closing in-process relay: %s", e)

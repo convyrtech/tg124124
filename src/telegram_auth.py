@@ -754,7 +754,7 @@ class TelegramAuth:
             raise RuntimeError(error_msg) from e
 
         if not await client.is_user_authorized():
-            await client.disconnect()
+            await asyncio.wait_for(client.disconnect(), timeout=5)
             raise RuntimeError(
                 f"Session is not authorized (expired or revoked){proxy_info}. Re-login or get a fresh .session file."
             )
@@ -1661,7 +1661,7 @@ class TelegramAuth:
             finally:
                 if client:
                     try:
-                        await client.disconnect()
+                        await asyncio.wait_for(client.disconnect(), timeout=5)
                     except Exception:
                         pass
             return AuthResult(
@@ -1998,7 +1998,7 @@ class TelegramAuth:
             # FIX #5: ERROR RECOVERY - гарантированный cleanup
             if client:
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), timeout=5)
                     logger.debug("Telethon client disconnected")
                 except Exception as e:
                     logger.warning(f"Error disconnecting client: {e}")
@@ -2217,7 +2217,7 @@ class CircuitBreaker:
         import time
 
         self._consecutive_failures += 1
-        self._last_failure_time = time.time()
+        self._last_failure_time = time.monotonic()
 
         if self._consecutive_failures >= self._failure_threshold:
             if not self._is_open:
@@ -2252,7 +2252,7 @@ class CircuitBreaker:
 
         import time
 
-        elapsed = time.time() - self._last_failure_time
+        elapsed = time.monotonic() - self._last_failure_time
 
         if elapsed >= self._reset_timeout:
             # FIX #4: Only allow one probe during half-open.
@@ -2294,7 +2294,7 @@ class CircuitBreaker:
 
         import time
 
-        elapsed = time.time() - self._last_failure_time
+        elapsed = time.monotonic() - self._last_failure_time
         remaining = self._reset_timeout - elapsed
         return max(0.0, remaining)
 

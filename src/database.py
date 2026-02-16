@@ -8,7 +8,7 @@ import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -636,13 +636,17 @@ class Database:
             Migration record ID.
         """
         async with self._db_lock:
-            await self._connection.execute("UPDATE accounts SET status = ? WHERE id = ?", ("migrating", account_id))
+            # Guard: don't start if already migrating (prevents double-migration)
+            await self._connection.execute(
+                "UPDATE accounts SET status = ? WHERE id = ? AND status != ?",
+                ("migrating", account_id, "migrating"),
+            )
             async with self._connection.execute(
                 """
                 INSERT INTO migrations (account_id, started_at)
                 VALUES (?, ?)
                 """,
-                (account_id, datetime.now().isoformat()),
+                (account_id, datetime.now(timezone.utc).isoformat()),
             ) as cursor:
                 migration_id = cursor.lastrowid
             await self._commit_with_retry()
@@ -825,10 +829,10 @@ class Database:
         async with self._db_lock:
             # FIX D3: Auto-close orphaned batches from previous crashes
             await self._connection.execute(
-                "UPDATE batches SET finished_at = ? WHERE finished_at IS NULL", (datetime.now().isoformat(),)
+                "UPDATE batches SET finished_at = ? WHERE finished_at IS NULL", (datetime.now(timezone.utc).isoformat(),)
             )
 
-            batch_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+            batch_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
 
             async with self._connection.execute(
                 """

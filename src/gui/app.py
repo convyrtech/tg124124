@@ -1283,7 +1283,7 @@ class TGWebAuthApp:
         """
         if not self._active_pool or self._active_pool == "pending":
             return
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_table_refresh >= 10.0:
             self._last_table_refresh = now
             self._refresh_table_async()
@@ -1520,7 +1520,7 @@ class TGWebAuthApp:
 
     def _throttled_refresh(self, completed: int, total: int, force: bool = False) -> None:
         """Refresh accounts table at most every 3s (last update always fires)."""
-        now = time.time()
+        now = time.monotonic()
         if force or completed >= total or (now - self._last_table_refresh >= 3.0):
             self._last_table_refresh = now
             self._schedule_ui(lambda: self._refresh_table_async())

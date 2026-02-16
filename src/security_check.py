@@ -14,7 +14,7 @@ import os
 import re
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # FIX: WINDOWS ENCODING
@@ -266,7 +266,7 @@ async def run_security_check(
             proxy_ip = proxy_parts[1] if len(proxy_parts) >= 3 else "unknown"
 
             result = SecurityCheckResult(
-                timestamp=datetime.now().isoformat(),
+                timestamp=datetime.now(timezone.utc).isoformat(),
                 proxy_ip=proxy_ip,
                 detected_ip=detected_ip,
                 webrtc_leak=webrtc_info.get("hasLeak", False),

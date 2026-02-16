@@ -546,11 +546,11 @@ class MigrationWorkerPool:
                 await self._update_fragment_status_safe(account_id, name, "authorized")
                 # Update last verified timestamp for fragment
                 try:
-                    from datetime import datetime
+                    from datetime import datetime, timezone
 
                     await self._db.update_account(
                         account_id,
-                        web_last_verified=datetime.now().isoformat(),
+                        web_last_verified=datetime.now(timezone.utc).isoformat(),
                     )
                 except Exception as exc:
                     logger.warning("DB update verified for %s: %s", name, exc)
@@ -571,11 +571,11 @@ class MigrationWorkerPool:
                         logger.warning("DB update username for %s: %s", name, exc)
                 # Record web_last_verified + auth_ttl_days on successful web migration
                 try:
-                    from datetime import datetime
+                    from datetime import datetime, timezone
 
                     await self._db.update_account(
                         account_id,
-                        web_last_verified=datetime.now().isoformat(),
+                        web_last_verified=datetime.now(timezone.utc).isoformat(),
                         auth_ttl_days=365,
                     )
                 except Exception as exc:
@@ -658,6 +658,8 @@ class MigrationWorkerPool:
         "2fa password",
         "unique constraint",
         "auth_key_duplicated",
+        "auth_restart",  # AuthRestartError — stale token, retry won't help
+        "session file corrupted",  # Corrupt .session file
     )
 
     def _is_retryable(self, error: str) -> bool:
