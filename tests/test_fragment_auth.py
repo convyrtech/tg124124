@@ -232,7 +232,7 @@ class TestFragmentAuth:
         assert popup == mock_popup
         page.expect_popup.assert_called_once_with(timeout=20000)
         page.click.assert_awaited_once_with('button.login-link')
-        mock_popup.wait_for_load_state.assert_awaited_once_with('domcontentloaded')
+        mock_popup.wait_for_load_state.assert_awaited_once_with('domcontentloaded', timeout=15000)
 
     # --- _submit_phone_on_popup tests ---
 

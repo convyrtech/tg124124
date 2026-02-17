@@ -1686,7 +1686,11 @@ class TGWebAuthApp:
                         self._log(f"[Proxies] No free proxies left ({assigned} assigned)")
                         break
 
-                    await self._controller.db.assign_proxy(account.id, proxy.id)
+                    try:
+                        await self._controller.db.assign_proxy(account.id, proxy.id)
+                    except ValueError as ve:
+                        self._log(f"[Proxies] {account.name}: proxy conflict, skipping ({ve})")
+                        continue
                     assigned += 1
                     self._log(f"[Proxies] {account.name} <- {proxy.host}:{proxy.port}")
 

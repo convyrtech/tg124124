@@ -211,6 +211,7 @@ class ProxyRelay:
 
         if self._process.returncode is not None:
             stderr = await self._process.stderr.read()
+            await self._process.wait()  # Reap zombie, free transport
             self._process = None
             from .utils import sanitize_error
 

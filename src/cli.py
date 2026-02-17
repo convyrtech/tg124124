@@ -21,6 +21,7 @@ from typing import Optional
 import psutil
 
 from .logger import get_logger, setup_logging
+from .utils import sanitize_error
 
 logger = get_logger(__name__)
 
@@ -862,7 +863,7 @@ def health(account: str):
                 me = await client.get_me()
                 return me, None
             except Exception as e:
-                return None, str(e)
+                return None, sanitize_error(str(e))
             finally:
                 try:
                     await asyncio.wait_for(client.disconnect(), timeout=5)
@@ -883,7 +884,7 @@ def health(account: str):
             click.echo(f"    Username: @{me.username}" if me.username else "    Username: нет")
 
     except Exception as e:
-        click.echo(click.style(f"  ✗ Ошибка: {e}", fg="red"))
+        click.echo(click.style(f"  ✗ Ошибка: {sanitize_error(str(e))}", fg="red"))
 
     # 2. Проверка Web профиля
     click.echo("\n[2/3] Web профиль...")
@@ -1033,6 +1034,7 @@ def fragment(account: str | None, fragment_all: bool, retry_failed: bool, headed
         for i, account_dir in enumerate(account_dirs):
             click.echo(f"\n[{i + 1}/{len(account_dirs)}] {account_dir.name}")
             result = await _run_single(account_dir, browser_manager)
+            await _update_fragment_status(account_dir, result)
             results.append((account_dir.name, result))
 
             # Cooldown between accounts (skip after last)
@@ -1093,6 +1095,30 @@ def fragment(account: str | None, fragment_all: bool, retry_failed: bool, headed
         if total_fail > 0:
             click.echo("\nИспользуйте --retry-failed для повтора упавших")
 
+    async def _update_fragment_status(account_dir: Path, result: "FragmentResult | None") -> None:
+        """Persist fragment_status to DB after CLI fragment auth."""
+        if result is None:
+            return
+        from datetime import datetime
+
+        db = Database(DATA_DIR / "tgwebauth.db")
+        await db.initialize()
+        await db.connect()
+        try:
+            accounts = await db.list_accounts(search=account_dir.name)
+            for acc in accounts:
+                if acc.name == account_dir.name:
+                    fs = "authorized" if result.success else "error"
+                    kwargs: dict = {"fragment_status": fs}
+                    if result.success:
+                        kwargs["web_last_verified"] = datetime.now(UTC).isoformat()
+                    await db.update_account(acc.id, **kwargs)
+                    break
+        except Exception as e:
+            logger.warning("DB update fragment_status for %s: %s", account_dir.name, e)
+        finally:
+            await db.close()
+
     async def _run():
         # Fix #21: Shared BrowserManager with global LRU eviction
         browser_manager = BrowserManager()
@@ -1102,7 +1128,8 @@ def fragment(account: str | None, fragment_all: bool, retry_failed: bool, headed
                 if not account_dir:
                     click.echo(f"Аккаунт '{account}' не найден в {ACCOUNTS_DIR}/")
                     return
-                await _run_single(account_dir, browser_manager)
+                result = await _run_single(account_dir, browser_manager)
+                await _update_fragment_status(account_dir, result)
             elif fragment_all or retry_failed:
                 account_dirs = await _get_filtered_account_dirs()
                 if not account_dirs:

@@ -542,6 +542,11 @@ class BrowserManager:
         if pid:
             try:
                 proc = psutil.Process(pid)
+                # Guard against PID reuse: verify process is still a browser
+                pname = proc.name().lower()
+                if "camoufox" not in pname and "firefox" not in pname:
+                    logger.debug("PID %d reused by '%s', skipping kill", pid, proc.name())
+                    return
                 children = proc.children(recursive=True)
                 for child in children:
                     try:
@@ -845,6 +850,11 @@ class BrowserContext:
             return
         try:
             proc = psutil.Process(self._browser_pid)
+            # Guard against PID reuse: verify process is still a browser
+            pname = proc.name().lower()
+            if "camoufox" not in pname and "firefox" not in pname:
+                logger.debug("PID %d reused by '%s', skipping kill", self._browser_pid, proc.name())
+                return
             children = proc.children(recursive=True)
             for child in children:
                 try:

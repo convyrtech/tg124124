@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .database import Database, ProxyRecord
 from .proxy_health import check_proxy_telegram
-from .utils import mask_proxy_credentials
+from .utils import mask_proxy_credentials, sanitize_error
 
 logger = logging.getLogger(__name__)
 
@@ -401,7 +401,7 @@ class ProxyManager:
                     account_id=account_id,
                     operation="proxy_replace",
                     success=False,
-                    error_message=str(e),
+                    error_message=sanitize_error(str(e)),
                 )
 
         return counters

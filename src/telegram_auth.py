@@ -1894,7 +1894,7 @@ class TelegramAuth:
                         return AuthResult(
                             success=False,
                             profile_name=profile.name,
-                            error=f"Recovery reload failed (non-recoverable): {e}",
+                            error=f"Recovery reload failed (non-recoverable): {sanitize_error(str(e))}",
                         )
                     logger.warning("Recovery reload failed (will proceed to QR): %s", e)
 

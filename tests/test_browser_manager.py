@@ -543,6 +543,7 @@ class TestBrowserContextForceKill:
         """Should kill children first, then main process."""
         child = MagicMock()
         proc = MagicMock()
+        proc.name.return_value = "camoufox.exe"
         proc.children.return_value = [child]
         mock_process_cls.return_value = proc
 
@@ -551,6 +552,19 @@ class TestBrowserContextForceKill:
 
         child.kill.assert_called_once()
         proc.kill.assert_called_once()
+
+    @patch("src.browser_manager.psutil.Process")
+    def test_skips_kill_on_pid_reuse(self, mock_process_cls):
+        """Should NOT kill if PID was reused by a non-browser process."""
+        proc = MagicMock()
+        proc.name.return_value = "python.exe"  # Not a browser
+        mock_process_cls.return_value = proc
+
+        ctx = self._make_ctx(browser_pid=42)
+        ctx._force_kill_by_pid()
+
+        proc.kill.assert_not_called()
+        proc.children.assert_not_called()
 
     @patch("src.browser_manager.psutil.Process")
     def test_handles_already_gone(self, mock_process_cls):

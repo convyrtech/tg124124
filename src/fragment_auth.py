@@ -29,6 +29,7 @@ from telethon.errors import FloodWaitError
 
 from .browser_manager import BrowserManager
 from .telegram_auth import AccountConfig, AuthResult, parse_telethon_proxy
+from .utils import sanitize_error
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +284,7 @@ class FragmentAuth:
                 if not login_btn:
                     raise RuntimeError("Login button not found on fragment.com") from None
         popup = await popup_info.value
-        await popup.wait_for_load_state("domcontentloaded")
+        await popup.wait_for_load_state("domcontentloaded", timeout=15000)
         logger.info("OAuth popup opened: %s", popup.url)
         return popup
 
@@ -467,7 +468,7 @@ class FragmentAuth:
             # Check for error message
             error = await popup.evaluate("() => document.getElementById('login-alert')?.textContent || ''")
             if error:
-                logger.exception("OAuth phone error: %s", error)
+                logger.error("OAuth phone error: %s", error)
             return False
 
     def _create_confirmation_handler(self, client: TelegramClient, confirmed: asyncio.Event):
@@ -729,7 +730,7 @@ class FragmentAuth:
                 popup = await self._open_oauth_popup(page)
             except Exception as e:
                 return FragmentResult(
-                    success=False, account_name=self.account.name, error=f"Failed to open OAuth popup: {e}"
+                    success=False, account_name=self.account.name, error=f"Failed to open OAuth popup: {sanitize_error(str(e))}"
                 )
 
             await self._human_delay(0.5, 1.0)
@@ -812,7 +813,7 @@ class FragmentAuth:
             return FragmentResult(success=False, account_name=self.account.name, error=f"FloodWait: {e.seconds}s")
         except Exception as e:
             logger.error("Fragment auth error: %s", e, exc_info=True)
-            return FragmentResult(success=False, account_name=self.account.name, error=str(e))
+            return FragmentResult(success=False, account_name=self.account.name, error=sanitize_error(str(e)))
         finally:
             # Restore original exception handler only when last worker finishes
             cls._suppressor_refcount -= 1

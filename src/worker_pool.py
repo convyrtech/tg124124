@@ -318,7 +318,7 @@ class MigrationWorkerPool:
                     # FIX: Mark account as error in DB so it doesn't stay as "migrating"
                     try:
                         await self._db.update_account(
-                            account_id, status="error", error_message=f"Internal error: {exc}"
+                            account_id, status="error", error_message=sanitize_error(f"Internal error: {exc}")
                         )
                     except Exception as db_err:
                         logger.warning("Failed to mark account %d as error: %s", account_id, db_err)
@@ -329,7 +329,7 @@ class MigrationWorkerPool:
                         account_id=account_id,
                         account_name=f"id={account_id}",
                         success=False,
-                        error=f"Internal error: {exc}",
+                        error=sanitize_error(f"Internal error: {exc}"),
                     )
 
                 # Record result (only count non-retry results)
@@ -607,7 +607,7 @@ class MigrationWorkerPool:
                 retries_used=retries,
             )
         else:
-            error_msg = auth_result.error or "Unknown error"
+            error_msg = sanitize_error(auth_result.error) if auth_result.error else "Unknown error"
             if migration_id is not None:
                 await self._complete_migration_safe(migration_id, name, success=False, error_message=error_msg)
             elif self._mode == "fragment":
