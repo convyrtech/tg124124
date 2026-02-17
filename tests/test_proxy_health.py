@@ -115,7 +115,7 @@ class TestCheckProxyTelegram:
 
     @pytest.mark.asyncio
     async def test_deep_batch_check(self, tmp_path):
-        """Batch check with deep=True uses check_proxy_telegram."""
+        """Batch check with deep=True uses check_proxy_smart."""
         db = Database(tmp_path / "deep.db")
         await db.initialize()
         await db.connect()
@@ -123,12 +123,12 @@ class TestCheckProxyTelegram:
             await db.add_proxy(host="good.example.com", port=1080, username="u", password="p")
             await db.add_proxy(host="bad.example.com", port=1080, username="u", password="p")
 
-            async def mock_tg_check(host, port, username=None, password=None, timeout=10.0):
+            async def mock_smart_check(host, port, username=None, password=None, protocol="socks5", timeout=10.0):
                 if "good" in host:
                     return True, None
                 return False, "Connection not allowed by ruleset"
 
-            with patch("src.proxy_health.check_proxy_telegram", side_effect=mock_tg_check):
+            with patch("src.proxy_health.check_proxy_smart", side_effect=mock_smart_check):
                 result = await check_proxy_batch(db, deep=True, timeout=10.0)
 
             assert result["alive"] == 1

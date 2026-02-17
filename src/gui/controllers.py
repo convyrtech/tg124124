@@ -66,8 +66,17 @@ class AppController:
         return await self.db.list_accounts(search=query if query else None)
 
     async def check_proxy(self, proxy: ProxyRecord, timeout: float = 5.0) -> bool:
-        """Check if proxy is alive."""
-        return await check_proxy_connection(proxy.host, proxy.port, timeout)
+        """Check if proxy is alive (protocol-aware: SOCKS5 or HTTP CONNECT)."""
+        from ..proxy_health import check_proxy_smart
+
+        alive, _error = await check_proxy_smart(
+            proxy.host, proxy.port,
+            username=proxy.username,
+            password=proxy.password,
+            protocol=proxy.protocol or "socks5",
+            timeout=timeout,
+        )
+        return alive
 
     async def import_sessions(
         self, source_dir: Path, on_progress: Callable[[int, int, str], None] | None = None
@@ -131,6 +140,14 @@ class AppController:
                 account_dir = session_path.parent
                 base_name = account_dir.name
 
+                # Lolz flat format: "123456_telethon.session" in shared dir
+                # If session filename != "session.session", use stem as account name
+                is_flat = session_path.name != "session.session"
+                if is_flat:
+                    # Extract user ID from filename like "191797833_telethon.session"
+                    stem = session_path.stem  # "191797833_telethon"
+                    base_name = stem.split("_")[0] if "_" in stem else stem
+
                 # Parse config first to determine final name
                 config_json = account_dir / "___config.json"
                 proxy_str = None
@@ -175,23 +192,41 @@ class AppController:
                 dest_dir = self.sessions_dir / base_name
                 dest_session = dest_dir / "session.session"
 
-                def _copy_files(src_session, src_dir, dst_dir, dst_session):
+                # Default API credentials (Telegram Desktop) for sessions without api.json
+                _DEFAULT_API = {
+                    "api_id": 2040,
+                    "api_hash": "b18441a1ff607e10a989891a5462e627",
+                    "device_model": "Desktop",
+                    "system_version": "Windows 10",
+                    "app_version": "5.5.2 x64",
+                    "lang_code": "en",
+                    "system_lang_code": "en-US",
+                }
+
+                def _copy_files(src_session, src_dir, dst_dir, dst_session, flat):
                     dst_dir.mkdir(exist_ok=True)
                     # Skip copy if source and destination are the same file
                     if not (dst_session.exists() and os.path.samefile(src_session, dst_session)):
                         shutil.copy2(src_session, dst_session)
+                    # Copy api.json (from same dir for structured, or create default for flat)
                     api_json = src_dir / "api.json"
+                    dst_api = dst_dir / "api.json"
                     if api_json.exists():
-                        dst_api = dst_dir / "api.json"
                         if not (dst_api.exists() and os.path.samefile(api_json, dst_api)):
                             shutil.copy2(api_json, dst_api)
+                    elif not dst_api.exists():
+                        # No api.json — create with default Telegram Desktop credentials
+                        with open(dst_api, "w", encoding="utf-8") as f:
+                            json_mod.dump(_DEFAULT_API, f, indent=2)
                     cfg_json = src_dir / "___config.json"
                     if cfg_json.exists():
                         dst_cfg = dst_dir / "___config.json"
                         if not (dst_cfg.exists() and os.path.samefile(cfg_json, dst_cfg)):
                             shutil.copy2(cfg_json, dst_cfg)
 
-                await loop.run_in_executor(None, _copy_files, session_path, account_dir, dest_dir, dest_session)
+                await loop.run_in_executor(
+                    None, _copy_files, session_path, account_dir, dest_dir, dest_session, is_flat
+                )
 
                 # Add to database — cleanup dest_dir on failure
                 from ..paths import to_relative_path
@@ -211,18 +246,24 @@ class AppController:
                 existing_base_names.add(base_name)
 
                 # Auto-link proxy from config if available
+                proxy_ok = False
                 if proxy_str and proxy_str.strip() and account_id:
                     try:
                         proxy_id = await self._find_or_create_proxy(proxy_str)
                         if proxy_id:
                             await self.db.assign_proxy(account_id, proxy_id)
+                            proxy_ok = True
                     except Exception as proxy_err:
-                        logger.warning("Proxy assignment failed for %s: %s", name, proxy_err)
+                        logger.warning(
+                            "Proxy assignment skipped for %s: %s (account imported without proxy)",
+                            name, proxy_err,
+                        )
 
                 imported += 1
 
                 if on_progress:
-                    on_progress(i + 1, total, f"ok: {name}")
+                    suffix = "" if proxy_ok or not proxy_str else " (без прокси)"
+                    on_progress(i + 1, total, f"ok: {name}{suffix}")
 
             except Exception as e:
                 skipped += 1
@@ -233,12 +274,23 @@ class AppController:
         logger.info("Import complete: %d imported, %d skipped", imported, skipped)
         return imported, skipped
 
+    # Ports that typically indicate HTTP/HTTPS proxies, not SOCKS5
+    _HTTP_PROXY_PORTS = {80, 8080, 8888, 3128, 3129}
+
     async def _find_or_create_proxy(self, proxy_str: str) -> int | None:
         """Find existing proxy or create new one from config string. Returns proxy ID."""
         try:
             host, port, username, password, protocol = self._parse_proxy_line(proxy_str)
             if not host or not port:
                 return None
+
+            # Warn if port suggests HTTP proxy but protocol defaulted to socks5
+            if port in self._HTTP_PROXY_PORTS and protocol == "socks5":
+                logger.warning(
+                    "Proxy %s:%d looks like HTTP (port %d) but will be used as SOCKS5. "
+                    "If migration fails, specify protocol explicitly: http:%s:%d:user:pass",
+                    host, port, port, host, port,
+                )
 
             # O(1) lookup via UNIQUE(host, port) index
             existing_id = await self.db.find_proxy_by_host_port(host, port)

@@ -1699,7 +1699,7 @@ class TGWebAuthApp:
             self._schedule_ui(lambda: self._reset_stop_button())
 
     def _auto_assign_proxies(self, sender=None, app_data=None) -> None:
-        """Auto-assign free proxies to accounts without proxies."""
+        """Auto-assign free proxies to accounts without proxies or with dead proxies."""
         if "auto_assign" in self._busy_ops:
             self._log("[Proxies] Auto-assign already in progress")
             return
@@ -1708,39 +1708,65 @@ class TGWebAuthApp:
 
         async def do_assign():
             try:
-                # Get accounts without proxies
                 all_accounts = await self._controller.db.list_accounts()
-                accounts_without_proxy = [a for a in all_accounts if a.proxy_id is None]
+                all_proxies = await self._controller.db.list_proxies()
+                proxy_map = {p.id: p for p in all_proxies}
 
-                if not accounts_without_proxy:
-                    self._log("[Proxies] All accounts have proxies assigned")
+                # Accounts needing proxy: no proxy OR dead proxy
+                needs_proxy = []
+                for a in all_accounts:
+                    if a.proxy_id is None:
+                        needs_proxy.append((a, "нет прокси"))
+                    elif a.proxy_id in proxy_map:
+                        p = proxy_map[a.proxy_id]
+                        if p.status == "dead":
+                            needs_proxy.append((a, f"dead прокси {p.host}:{p.port}"))
+
+                if not needs_proxy:
+                    self._log("[Proxies] Все аккаунты имеют рабочие прокси")
                     return
 
+                self._log(f"[Proxies] Нужно назначить прокси: {len(needs_proxy)} аккаунтов")
+
                 assigned = 0
-                for account in accounts_without_proxy:
-                    # Get free proxy
+                for account, reason in needs_proxy:
+                    # Unlink old dead proxy first
+                    if account.proxy_id is not None:
+                        old_proxy = proxy_map.get(account.proxy_id)
+                        # Unassign dead proxy from account
+                        await self._controller.db.update_account(account.id, proxy_id=None)
+                        if old_proxy:
+                            await self._controller.db.update_proxy(
+                                old_proxy.id, assigned_account_id=None
+                            )
+
+                    # Get free active proxy
                     proxy = await self._controller.db.get_free_proxy()
                     if not proxy:
-                        self._log(f"[Proxies] No free proxies left ({assigned} assigned)")
+                        self._log(f"[Proxies] Нет свободных прокси ({assigned} назначено)")
                         break
 
                     try:
                         await self._controller.db.assign_proxy(account.id, proxy.id)
                     except ValueError as ve:
-                        self._log(f"[Proxies] {account.name}: proxy conflict, skipping ({ve})")
+                        self._log(f"[Proxies] {account.name}: конфликт, пропуск ({ve})")
                         continue
                     assigned += 1
-                    self._log(f"[Proxies] {account.name} <- {proxy.host}:{proxy.port}")
+                    self._log(
+                        f"[Proxies] {account.name} <- {proxy.host}:{proxy.port} ({reason})"
+                    )
 
-                self._log(f"[Proxies] Assigned {assigned} proxies")
+                self._log(f"[Proxies] Назначено {assigned} прокси")
 
                 # Refresh UI
                 accounts = await self._controller.search_accounts("")
                 stats = await self._controller.get_stats()
-                proxies = await self._controller.db.list_proxies()
-                proxies_map = {p.id: p for p in proxies}
+                proxies_list = await self._controller.db.list_proxies()
+                proxies_ui_map = {p.id: p for p in proxies_list}
                 self._schedule_ui(lambda: self._update_stats_sync(stats))
-                self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
+                self._schedule_ui(
+                    lambda: self._update_accounts_table_sync(accounts, proxies_ui_map)
+                )
 
             except Exception as e:
                 logger.exception("Auto-assign error: %s", e)

@@ -161,6 +161,122 @@ async def check_proxy_telegram(
                 pass
 
 
+async def check_proxy_http(
+    host: str,
+    port: int,
+    username: str | None = None,
+    password: str | None = None,
+    timeout: float = 10.0,
+) -> tuple[bool, str | None]:
+    """Check if an HTTP proxy can route traffic to Telegram via HTTP CONNECT.
+
+    Sends an HTTP CONNECT request to the proxy targeting Telegram DC2.
+    Supports Basic auth via Proxy-Authorization header.
+
+    Args:
+        host: HTTP proxy host.
+        port: HTTP proxy port.
+        username: Optional proxy username.
+        password: Optional proxy password.
+        timeout: Total timeout in seconds.
+
+    Returns:
+        Tuple of (success, error_message). success=True means Telegram is reachable.
+    """
+    import base64
+
+    reader = None
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout
+        )
+
+        # Build HTTP CONNECT request
+        target = f"{_TG_DC2_IP}:{_TG_DC2_PORT}"
+        request = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+
+        if username and password:
+            creds = base64.b64encode(f"{username}:{password}".encode()).decode()
+            request += f"Proxy-Authorization: Basic {creds}\r\n"
+
+        request += "\r\n"
+        writer.write(request.encode())
+        await writer.drain()
+
+        # Read HTTP response (first line is status)
+        response_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        response_str = response_line.decode("utf-8", errors="replace").strip()
+
+        if not response_str:
+            return False, "Empty response from proxy"
+
+        # Parse status code: "HTTP/1.1 200 Connection established"
+        parts = response_str.split(" ", 2)
+        if len(parts) < 2:
+            return False, f"Invalid HTTP response: {response_str}"
+
+        try:
+            status_code = int(parts[1])
+        except ValueError:
+            return False, f"Invalid status code: {parts[1]}"
+
+        if status_code == 200:
+            return True, None  # Tunnel established — Telegram DC reachable
+
+        reason = parts[2] if len(parts) > 2 else "Unknown"
+        if status_code == 407:
+            return False, "Proxy auth required (HTTP 407)"
+        if status_code == 403:
+            return False, "Proxy forbidden (HTTP 403)"
+        return False, f"HTTP proxy error: {status_code} {reason}"
+
+    except TimeoutError:
+        return False, "Timeout"
+    except ConnectionRefusedError:
+        return False, "Connection refused"
+    except OSError as e:
+        return False, f"Network error: {e}"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+async def check_proxy_smart(
+    host: str,
+    port: int,
+    username: str | None = None,
+    password: str | None = None,
+    protocol: str = "socks5",
+    timeout: float = 10.0,
+) -> tuple[bool, str | None]:
+    """Protocol-aware proxy health check.
+
+    Routes to check_proxy_telegram (SOCKS5) or check_proxy_http (HTTP)
+    based on the proxy protocol.
+
+    Args:
+        host: Proxy host.
+        port: Proxy port.
+        username: Optional auth username.
+        password: Optional auth password.
+        protocol: Proxy protocol ("socks5", "socks4", "http", "https").
+        timeout: Timeout in seconds.
+
+    Returns:
+        Tuple of (success, error_message).
+    """
+    if protocol.lower() in ("http", "https"):
+        return await check_proxy_http(host, port, username, password, timeout)
+    return await check_proxy_telegram(host, port, username, password, timeout)
+
+
 async def check_proxy_batch(
     db: Database,
     concurrency: int = 50,
@@ -194,11 +310,12 @@ async def check_proxy_batch(
     async def _check_one(proxy: ProxyRecord) -> None:
         async with sem:
             if deep:
-                alive, error = await check_proxy_telegram(
+                alive, error = await check_proxy_smart(
                     proxy.host,
                     proxy.port,
                     username=proxy.username,
                     password=proxy.password,
+                    protocol=proxy.protocol or "socks5",
                     timeout=timeout,
                 )
             else:

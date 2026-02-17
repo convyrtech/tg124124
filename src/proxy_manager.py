@@ -7,10 +7,14 @@ import tempfile
 from pathlib import Path
 
 from .database import Database, ProxyRecord
-from .proxy_health import check_proxy_telegram
+from .proxy_health import check_proxy_smart
 from .utils import mask_proxy_credentials, sanitize_error
 
 logger = logging.getLogger(__name__)
+
+
+# Ports that typically indicate HTTP/HTTPS proxies rather than SOCKS5
+_HTTP_PROXY_PORTS = frozenset({80, 8080, 8888, 3128, 3129})
 
 
 def parse_proxy_line(line: str) -> tuple[str | None, int | None, str | None, str | None, str]:
@@ -18,9 +22,13 @@ def parse_proxy_line(line: str) -> tuple[str | None, int | None, str | None, str
 
     Supported formats:
     - socks5:host:port:user:pass
+    - http:host:port:user:pass
     - host:port:user:pass
     - host:port
     - user:pass@host:port
+
+    When no explicit protocol prefix is given, auto-detects HTTP proxies
+    by port number (80, 8080, 3128, etc.). Otherwise defaults to socks5.
 
     Args:
         line: Raw proxy string.
@@ -29,9 +37,11 @@ def parse_proxy_line(line: str) -> tuple[str | None, int | None, str | None, str
         Tuple of (host, port, username, password, protocol).
     """
     protocol = "socks5"
+    explicit_protocol = False
 
     # Remove protocol prefix if present
     if line.startswith(("socks5:", "socks4:", "http:", "https:", "https://")):
+        explicit_protocol = True
         if "://" in line:
             protocol, rest = line.split("://", 1)
             line = rest
@@ -59,6 +69,10 @@ def parse_proxy_line(line: str) -> tuple[str | None, int | None, str | None, str
         else:
             return (None, None, None, None, protocol)
 
+        # Auto-detect HTTP by port when no explicit protocol
+        if not explicit_protocol and port in _HTTP_PROXY_PORTS:
+            protocol = "http"
+
         return (host, port, username, password, protocol)
 
     # Handle host:port:user:pass format
@@ -73,6 +87,11 @@ def parse_proxy_line(line: str) -> tuple[str | None, int | None, str | None, str
             return (None, None, None, None, protocol)
         username = parts[2] if len(parts) > 2 and parts[2] else None
         password = parts[3] if len(parts) > 3 and parts[3] else None
+
+        # Auto-detect HTTP by port when no explicit protocol
+        if not explicit_protocol and port in _HTTP_PROXY_PORTS:
+            protocol = "http"
+
         return (host, port, username, password, protocol)
 
     return (None, None, None, None, protocol)
@@ -281,12 +300,13 @@ class ProxyManager:
 
         async def _check_one(account, proxy):
             async with sem:
-                # FIX: Use deep SOCKS5+Telegram check instead of TCP-only
-                alive, _error = await check_proxy_telegram(
+                # Protocol-aware check: SOCKS5 or HTTP CONNECT
+                alive, _error = await check_proxy_smart(
                     proxy.host,
                     proxy.port,
                     username=proxy.username,
                     password=proxy.password,
+                    protocol=proxy.protocol or "socks5",
                     timeout=timeout,
                 )
             new_status = "active" if alive else "dead"

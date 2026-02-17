@@ -235,11 +235,29 @@ class AccountConfig:
         except json.JSONDecodeError as e:
             raise json.JSONDecodeError(f"Invalid JSON in {api_path}: {e.msg}", e.doc, e.pos) from e
 
+        # Normalize field names: support app_id/app_hash aliases
+        _FIELD_ALIASES = {
+            "api_id": ["app_id", "API_ID", "appId"],
+            "api_hash": ["app_hash", "API_HASH", "appHash"],
+        }
+        for canonical, aliases in _FIELD_ALIASES.items():
+            if canonical not in api_config:
+                for alias in aliases:
+                    if alias in api_config:
+                        api_config[canonical] = api_config[alias]
+                        break
+
         # Проверяем обязательные поля
         if "api_id" not in api_config:
-            raise KeyError(f"'api_id' not found in {api_path}")
+            raise KeyError(
+                f"'api_id' not found in {api_path}. "
+                f"Expected 'api_id' (or app_id). Keys found: {list(api_config.keys())}"
+            )
         if "api_hash" not in api_config:
-            raise KeyError(f"'api_hash' not found in {api_path}")
+            raise KeyError(
+                f"'api_hash' not found in {api_path}. "
+                f"Expected 'api_hash' (or app_hash). Keys found: {list(api_config.keys())}"
+            )
 
         # Извлекаем device конфигурацию (FIX #3: DEVICE SYNC)
         device = DeviceConfig(
@@ -731,6 +749,14 @@ class TelegramAuth:
         proxy_info = ""
         if proxy and isinstance(proxy, list | tuple) and len(proxy) >= 3:
             proxy_info = f" [proxy: {proxy[1]}:{proxy[2]}]"
+            # Warn if port looks like HTTP but used as SOCKS5
+            _HTTP_PORTS = {80, 8080, 8888, 3128, 3129}
+            if proxy[2] in _HTTP_PORTS:
+                logger.warning(
+                    "Proxy %s:%s uses port %s which is typically HTTP, not SOCKS5. "
+                    "This may cause authentication failures.",
+                    proxy[1], proxy[2], proxy[2],
+                )
         elif not proxy:
             proxy_info = " [no proxy]"
 
