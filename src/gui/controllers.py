@@ -36,6 +36,7 @@ class AppController:
         self.sessions_dir = ACCOUNTS_DIR
         self.db: Database | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._import_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Initialize database and directories."""
@@ -82,6 +83,17 @@ class AppController:
         FIX #11: Heavy file I/O (glob, stat, copy2, json.load) is offloaded
         to a thread executor so the asyncio event loop is not blocked.
         """
+        # Serialize concurrent calls to prevent duplicate imports
+        if self._import_lock.locked():
+            logger.warning("import_sessions already running, skipping")
+            return 0, 0
+        async with self._import_lock:
+            return await self._import_sessions_inner(source_dir, on_progress)
+
+    async def _import_sessions_inner(
+        self, source_dir: Path, on_progress: Callable[[int, int, str], None] | None = None
+    ) -> tuple[int, int]:
+        """Inner import logic, called under _import_lock."""
         import json as json_mod
 
         loop = asyncio.get_running_loop()
@@ -181,10 +193,18 @@ class AppController:
 
                 await loop.run_in_executor(None, _copy_files, session_path, account_dir, dest_dir, dest_session)
 
-                # Add to database
+                # Add to database — cleanup dest_dir on failure
                 from ..paths import to_relative_path
 
-                account_id = await self.db.add_account(name=name, session_path=to_relative_path(dest_session))
+                try:
+                    account_id = await self.db.add_account(name=name, session_path=to_relative_path(dest_session))
+                except Exception:
+                    # Rollback: remove copied files to prevent orphaned dirs
+                    try:
+                        shutil.rmtree(dest_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                    raise
 
                 # Track in dedup sets for this batch
                 existing_names.add(name)
@@ -225,10 +245,17 @@ class AppController:
             if existing_id is not None:
                 return existing_id
 
-            # Create new proxy
-            return await self.db.add_proxy(
-                host=host, port=port, username=username, password=password, protocol=protocol
-            )
+            # Create new proxy — retry lookup on UNIQUE constraint violation
+            try:
+                return await self.db.add_proxy(
+                    host=host, port=port, username=username, password=password, protocol=protocol
+                )
+            except Exception:
+                # Another coroutine may have created it between check and insert
+                existing_id = await self.db.find_proxy_by_host_port(host, port)
+                if existing_id is not None:
+                    return existing_id
+                raise
         except Exception as e:
             logger.warning("Failed to parse/create proxy from config: %s", e)
             return None
