@@ -3,6 +3,7 @@
 import asyncio
 import collections
 import logging
+import os
 import queue
 import sys
 import threading
@@ -314,7 +315,14 @@ class TGWebAuthApp:
         import signal
 
         atexit.register(self._shutdown)
-        signal.signal(signal.SIGINT, lambda *_: self._shutdown())
+        def _sigint_handler(*_):
+            if self._shutting_down.is_set():
+                # Second Ctrl+C: force-kill immediately
+                logger.warning("Force-kill on second SIGINT")
+                os._exit(1)
+            self._shutdown()
+
+        signal.signal(signal.SIGINT, _sigint_handler)
         # SIGTERM is not delivered on Windows, but register for POSIX compatibility
         if sys.platform != "win32":
             signal.signal(signal.SIGTERM, lambda *_: self._shutdown())

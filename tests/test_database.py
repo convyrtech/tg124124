@@ -648,3 +648,47 @@ class TestDatabase:
 
         finally:
             await db.close()
+
+    @pytest.mark.asyncio
+    async def test_delete_proxy_clears_account_proxy_id(self, db_path):
+        """delete_proxy must clear accounts.proxy_id to prevent IP leaks."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            acc_id = await db.add_account(name="ProxyTest", session_path="/s.session")
+            proxy_id = await db.add_proxy(host="10.0.0.1", port=1080)
+            await db.assign_proxy(acc_id, proxy_id)
+
+            # Verify proxy is assigned
+            acc = await db.get_account(acc_id)
+            assert acc.proxy_id == proxy_id
+
+            # Delete the proxy
+            await db.delete_proxy(proxy_id)
+
+            # Account's proxy_id should be cleared
+            acc = await db.get_account(acc_id)
+            assert acc.proxy_id is None, "delete_proxy must clear accounts.proxy_id"
+
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_foreign_keys_enabled(self, db_path):
+        """PRAGMA foreign_keys=ON should be set after connect."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            async with db._connection.execute("PRAGMA foreign_keys") as cursor:
+                row = await cursor.fetchone()
+                assert row[0] == 1, "foreign_keys PRAGMA should be ON"
+        finally:
+            await db.close()

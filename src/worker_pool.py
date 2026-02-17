@@ -541,7 +541,8 @@ class MigrationWorkerPool:
             elif self._mode == "fragment":
                 await self._update_fragment_status_safe(account_id, name, "error", error_msg)
             self._circuit_breaker.record_failure()
-            self._circuit_breaker.release_half_open_probe()  # FIX #4
+            if probe_acquired:
+                self._circuit_breaker.release_half_open_probe()
             return await self._maybe_retry(account_id, name, error_msg, retries)
         except Exception as exc:
             error_msg = sanitize_error(str(exc))
@@ -551,7 +552,8 @@ class MigrationWorkerPool:
             elif self._mode == "fragment":
                 await self._update_fragment_status_safe(account_id, name, "error", error_msg)
             self._circuit_breaker.record_failure()
-            self._circuit_breaker.release_half_open_probe()  # FIX #4
+            if probe_acquired:
+                self._circuit_breaker.release_half_open_probe()
             return await self._maybe_retry(account_id, name, error_msg, retries)
 
         # Process result
@@ -595,7 +597,8 @@ class MigrationWorkerPool:
                 except Exception as exc:
                     logger.warning("DB update verified/ttl for %s: %s", name, exc)
             self._circuit_breaker.record_success()
-            self._circuit_breaker.release_half_open_probe()  # FIX #4
+            if probe_acquired:
+                self._circuit_breaker.release_half_open_probe()
             self._log(f"[W{worker_id}] {name} - OK")
             return AccountResult(
                 account_id=account_id,
@@ -610,7 +613,8 @@ class MigrationWorkerPool:
             elif self._mode == "fragment":
                 await self._update_fragment_status_safe(account_id, name, "error", error_msg)
             self._circuit_breaker.record_failure()
-            self._circuit_breaker.release_half_open_probe()  # FIX #4
+            if probe_acquired:
+                self._circuit_breaker.release_half_open_probe()
             self._log(f"[W{worker_id}] {name} - FAILED: {humanize_error(error_msg)}")
             return await self._maybe_retry(account_id, name, error_msg, retries)
 

@@ -194,6 +194,7 @@ class Database:
         self._connection.row_factory = aiosqlite.Row
         await self._connection.execute("PRAGMA journal_mode=WAL")
         await self._connection.execute("PRAGMA busy_timeout=30000")
+        await self._connection.execute("PRAGMA foreign_keys=ON")
 
     async def close(self) -> None:
         """Close connection."""
@@ -207,6 +208,9 @@ class Database:
         With 5+ parallel workers, lock contention causes OperationalError.
         busy_timeout=30s handles most cases, but under heavy I/O (disk flush),
         a retry loop provides extra safety.
+
+        If all retries fail, rollback to prevent uncommitted data from leaking
+        into the next successful commit.
 
         Args:
             max_retries: Number of retry attempts (default 3).
@@ -226,6 +230,12 @@ class Database:
                     )
                     await asyncio.sleep(wait)
                     continue
+                # Exhausted retries or non-busy error: rollback to prevent
+                # uncommitted writes from leaking into the next commit
+                try:
+                    await self._connection.rollback()
+                except Exception as rollback_err:
+                    logger.warning("Rollback after commit failure also failed: %s", rollback_err)
                 raise
 
     async def add_account(
@@ -536,8 +546,16 @@ class Database:
             await self._commit_with_retry()
 
     async def delete_proxy(self, proxy_id: int) -> None:
-        """Delete proxy by ID."""
+        """Delete proxy by ID.
+
+        Also clears proxy_id on any account that references this proxy,
+        preventing dangling foreign key references and accidental
+        proxy-less migrations (which would leak the user's real IP).
+        """
         async with self._db_lock:
+            await self._connection.execute(
+                "UPDATE accounts SET proxy_id = NULL WHERE proxy_id = ?", (proxy_id,)
+            )
             await self._connection.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
             await self._commit_with_retry()
 

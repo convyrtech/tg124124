@@ -753,16 +753,22 @@ class TelegramAuth:
                 error_msg = f"Telethon connection failed: {e}{proxy_info}"
             raise RuntimeError(error_msg) from e
 
-        if not await client.is_user_authorized():
-            await asyncio.wait_for(client.disconnect(), timeout=5)
-            raise RuntimeError(
-                f"Session is not authorized (expired or revoked){proxy_info}. Re-login or get a fresh .session file."
-            )
+        try:
+            if not await client.is_user_authorized():
+                await asyncio.wait_for(client.disconnect(), timeout=5)
+                raise RuntimeError(
+                    f"Session is not authorized (expired or revoked){proxy_info}. Re-login or get a fresh .session file."
+                )
 
-        # Получаем инфо о текущем пользователе (без логирования sensitive data)
-        me = await client.get_me()
-        logger.info(f"Connected as: {me.first_name} (ID: {me.id})")
-        logger.debug(f"Device: {device.device_model} / {device.system_version}")
+            # Получаем инфо о текущем пользователе (без логирования sensitive data)
+            me = await client.get_me()
+            logger.info(f"Connected as: {me.first_name} (ID: {me.id})")
+            logger.debug(f"Device: {device.device_model} / {device.system_version}")
+        except RuntimeError:
+            raise  # Already handled above (not authorized)
+        except Exception as e:
+            await self._safe_disconnect(client)
+            raise RuntimeError(f"Telethon post-connect check failed: {e}{proxy_info}") from e
 
         return client
 

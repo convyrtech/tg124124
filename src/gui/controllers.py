@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -164,13 +165,19 @@ class AppController:
 
                 def _copy_files(src_session, src_dir, dst_dir, dst_session):
                     dst_dir.mkdir(exist_ok=True)
-                    shutil.copy2(src_session, dst_session)
+                    # Skip copy if source and destination are the same file
+                    if not (dst_session.exists() and os.path.samefile(src_session, dst_session)):
+                        shutil.copy2(src_session, dst_session)
                     api_json = src_dir / "api.json"
                     if api_json.exists():
-                        shutil.copy2(api_json, dst_dir / "api.json")
+                        dst_api = dst_dir / "api.json"
+                        if not (dst_api.exists() and os.path.samefile(api_json, dst_api)):
+                            shutil.copy2(api_json, dst_api)
                     cfg_json = src_dir / "___config.json"
                     if cfg_json.exists():
-                        shutil.copy2(cfg_json, dst_dir / "___config.json")
+                        dst_cfg = dst_dir / "___config.json"
+                        if not (dst_cfg.exists() and os.path.samefile(cfg_json, dst_cfg)):
+                            shutil.copy2(cfg_json, dst_cfg)
 
                 await loop.run_in_executor(None, _copy_files, session_path, account_dir, dest_dir, dest_session)
 
@@ -185,9 +192,12 @@ class AppController:
 
                 # Auto-link proxy from config if available
                 if proxy_str and proxy_str.strip() and account_id:
-                    proxy_id = await self._find_or_create_proxy(proxy_str)
-                    if proxy_id:
-                        await self.db.assign_proxy(account_id, proxy_id)
+                    try:
+                        proxy_id = await self._find_or_create_proxy(proxy_str)
+                        if proxy_id:
+                            await self.db.assign_proxy(account_id, proxy_id)
+                    except Exception as proxy_err:
+                        logger.warning("Proxy assignment failed for %s: %s", name, proxy_err)
 
                 imported += 1
 
