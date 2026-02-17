@@ -8,7 +8,6 @@ import queue
 import sys
 import threading
 import time
-import traceback
 from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
@@ -138,7 +137,7 @@ class TGWebAuthApp:
         try:
             future.result()
         except Exception as e:
-            logger.exception("Async task failed: %s\n%s", e, traceback.format_exc())
+            logger.exception("Async task failed: %s", e)
             self._log(f"[Error] Background task failed: {_se(str(e))}")
 
     def _schedule_ui(self, func: Callable) -> None:
@@ -615,7 +614,7 @@ class TGWebAuthApp:
                     pass
 
         except Exception as e:
-            logger.exception("Collect diagnostics error: %s\n%s", e, traceback.format_exc())
+            logger.exception("Collect diagnostics error: %s", e)
             self._log(f"[Error] Diagnostics: {_se(str(e))}")
             self._schedule_ui(lambda: dpg.set_value("diagnostics_status", "Error!"))
         finally:
@@ -656,7 +655,7 @@ class TGWebAuthApp:
             dpg.delete_item("2fa_dialog")
             self._initial_load()
         except Exception as e:
-            logger.exception("2FA submit error: %s\n%s", e, traceback.format_exc())
+            logger.exception("2FA submit error: %s", e)
             self._log(f"[Error] 2FA: {_se(str(e))}")
 
     def _on_2fa_skip(self, sender=None, app_data=None) -> None:
@@ -759,7 +758,7 @@ class TGWebAuthApp:
                     self._schedule_ui(lambda: self._update_accounts_table_sync(accounts, proxies_map))
 
                 except Exception as e:
-                    logger.exception("Import error: %s\n%s", e, traceback.format_exc())
+                    logger.exception("Import error: %s", e)
                     self._log(f"[Error] Import failed: {_se(str(e))}")
                 finally:
                     self._busy_ops.discard("import_sessions")
@@ -767,7 +766,7 @@ class TGWebAuthApp:
             self._run_async(do_import())
 
         except Exception as e:
-            logger.exception("Import dialog error: %s\n%s", e, traceback.format_exc())
+            logger.exception("Import dialog error: %s", e)
             self._log(f"[Error] Import: {_se(str(e))}")
             self._busy_ops.discard("import_sessions")
 
@@ -868,7 +867,7 @@ class TGWebAuthApp:
                         dpg.configure_item(btn_tag, enabled=False)
 
         except Exception as e:
-            logger.exception("Update accounts table error: %s\n%s", e, traceback.format_exc())
+            logger.exception("Update accounts table error: %s", e)
             self._log(f"[Error] Table update: {_se(str(e))}")
 
     def _update_proxies_table_sync(self, proxies: list, accounts_map: dict = None) -> None:
@@ -908,7 +907,7 @@ class TGWebAuthApp:
 
             self._log(f"[UI] Loaded {len(proxies)} proxies")
         except Exception as e:
-            logger.exception("Update proxies table error: %s\n%s", e, traceback.format_exc())
+            logger.exception("Update proxies table error: %s", e)
             self._log(f"[Error] Proxies table: {_se(str(e))}")
 
     def _delete_proxy(self, sender, app_data, user_data) -> None:
@@ -1035,7 +1034,7 @@ class TGWebAuthApp:
                     await manager.close_all()
                     raise
             except Exception as e:
-                logger.exception("Open profile error: %s\n%s", e, traceback.format_exc())
+                logger.exception("Open profile error: %s", e)
                 self._log(f"[Error] Open: {_se(str(e))}")
             finally:
                 self._busy_ops.discard(op_key)
@@ -1127,7 +1126,7 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._refresh_table_async())
 
             except Exception as e:
-                logger.exception("Migrate error: %s\n%s", e, traceback.format_exc())
+                logger.exception("Migrate error: %s", e)
                 self._log(f"[Error] Migrate: {_se(str(e))}")
                 try:
                     await self._controller.db.update_account(account_id, status="error")
@@ -1214,7 +1213,7 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._refresh_table_async())
 
             except Exception as e:
-                logger.exception("Fragment error: %s\n%s", e, traceback.format_exc())
+                logger.exception("Fragment error: %s", e)
                 self._log(f"[Error] Fragment: {_se(str(e))}")
             finally:
                 self._busy_ops.discard(op_key)
@@ -1458,7 +1457,7 @@ class TGWebAuthApp:
                 self._log(f"[Migrate] {len(ids)} accounts to migrate...")
                 await self._batch_migrate(ids)
             except Exception as e:
-                logger.exception("get_pending_ids error: %s\n%s", e, traceback.format_exc())
+                logger.exception("get_pending_ids error: %s", e)
                 self._log(f"[Error] get_pending_ids: {_se(str(e))}")
                 self._active_pool = None
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
@@ -1509,7 +1508,7 @@ class TGWebAuthApp:
                 self._log(f"[Retry] {len(ids)} аккаунтов на повтор...")
                 await self._batch_migrate(ids)
             except Exception as e:
-                logger.exception("get_error_ids error: %s\n%s", e, traceback.format_exc())
+                logger.exception("get_error_ids error: %s", e)
                 self._log(f"[Error] get_error_ids: {_se(str(e))}")
                 self._active_pool = None
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
@@ -1547,6 +1546,23 @@ class TGWebAuthApp:
 
     async def _batch_migrate(self, account_ids: list) -> None:
         """Batch migrate accounts using parallel worker pool."""
+        # FIX: Filter out accounts with active single-migrate/fragment ops
+        # to prevent AUTH_KEY_DUPLICATED from concurrent session access
+        busy_ids = {
+            int(op.split("_", 1)[1])
+            for op in self._busy_ops
+            if op.startswith(("migrate_", "fragment_")) and op.split("_", 1)[1].isdigit()
+        }
+        if busy_ids:
+            original_count = len(account_ids)
+            account_ids = [aid for aid in account_ids if aid not in busy_ids]
+            if original_count != len(account_ids):
+                self._log(f"[Migrate] Skipped {original_count - len(account_ids)} accounts with active single ops")
+        if not account_ids:
+            self._log("[Migrate] No accounts to migrate")
+            self._active_pool = None
+            self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+            return
         self._schedule_ui(lambda: self._set_batch_buttons_enabled(False))
         try:
             from ..worker_pool import MigrationWorkerPool
@@ -1577,7 +1593,7 @@ class TGWebAuthApp:
             self._schedule_ui(lambda: self._refresh_table_async())
 
         except BaseException as e:
-            logger.exception("Batch migrate error: %s\n%s", e, traceback.format_exc())
+            logger.exception("Batch migrate error: %s", e)
             self._log(f"[Error] Batch migrate: {_se(str(e))}")
         finally:
             # P0 FIX: Always reset pool in finally for clean state
@@ -1611,7 +1627,7 @@ class TGWebAuthApp:
                 self._log(f"[Fragment] {len(ids)} аккаунтов для авторизации на fragment.com...")
                 await self._batch_fragment(ids)
             except Exception as e:
-                logger.exception("get_healthy_ids error: %s\n%s", e, traceback.format_exc())
+                logger.exception("get_healthy_ids error: %s", e)
                 self._log(f"[Error] get_healthy_ids: {_se(str(e))}")
                 self._active_pool = None
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
@@ -1652,7 +1668,7 @@ class TGWebAuthApp:
             self._schedule_ui(lambda: self._refresh_table_async())
 
         except BaseException as e:
-            logger.exception("Batch fragment error: %s\n%s", e, traceback.format_exc())
+            logger.exception("Batch fragment error: %s", e)
             self._log(f"[Error] Batch fragment: {_se(str(e))}")
         finally:
             # P0 FIX: Always reset pool in finally for clean state
@@ -1747,7 +1763,7 @@ class TGWebAuthApp:
                     self._schedule_ui(lambda: self._update_stats_sync(stats))
                     self._schedule_ui(lambda: self._update_proxies_table_sync(proxies, accounts_map))
                 except Exception as e:
-                    logger.exception("Proxy import error: %s\n%s", e, traceback.format_exc())
+                    logger.exception("Proxy import error: %s", e)
                     self._log(f"[Error] Proxy import: {_se(str(e))}")
                 finally:
                     self._busy_ops.discard("import_proxies")
@@ -1755,7 +1771,7 @@ class TGWebAuthApp:
             self._run_async(do_import())
 
         except Exception as e:
-            logger.exception("Show proxy import dialog error: %s\n%s", e, traceback.format_exc())
+            logger.exception("Show proxy import dialog error: %s", e)
             self._log(f"[Error] Proxy import: {_se(str(e))}")
             self._busy_ops.discard("import_proxies")
 
@@ -1806,7 +1822,7 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._update_stats_sync(stats))
 
             except Exception as e:
-                logger.exception("Check proxies error: %s\n%s", e, traceback.format_exc())
+                logger.exception("Check proxies error: %s", e)
                 self._log(f"[Error] Proxy check: {_se(str(e))}")
             finally:
                 self._busy_ops.discard("check_proxies")
