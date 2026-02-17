@@ -303,6 +303,13 @@ class Database:
             dup_ids = [r["id"] for r in dup_rows]
             placeholders = ",".join("?" * len(dup_ids))
 
+            # Clean up related records before deleting accounts (foreign keys may not CASCADE)
+            await self._connection.execute(
+                f"DELETE FROM migrations WHERE account_id IN ({placeholders})", dup_ids
+            )
+            await self._connection.execute(
+                f"DELETE FROM operation_log WHERE account_id IN ({placeholders})", dup_ids
+            )
             # Delete duplicates (keeping first occurrence)
             await self._connection.execute(f"DELETE FROM accounts WHERE id IN ({placeholders})", dup_ids)
             await self._commit_with_retry()
@@ -663,10 +670,22 @@ class Database:
         """
         async with self._db_lock:
             # Guard: don't start if already migrating (prevents double-migration)
-            await self._connection.execute(
+            cursor = await self._connection.execute(
                 "UPDATE accounts SET status = ? WHERE id = ? AND status != ?",
                 ("migrating", account_id, "migrating"),
             )
+            if cursor.rowcount == 0:
+                # Account already migrating or doesn't exist — skip INSERT
+                # to avoid orphaned migration records
+                logger.debug("start_migration skipped for account %d (already migrating)", account_id)
+                await self._commit_with_retry()
+                # Return existing incomplete migration ID if available
+                async with self._connection.execute(
+                    "SELECT id FROM migrations WHERE account_id = ? AND completed_at IS NULL ORDER BY id DESC LIMIT 1",
+                    (account_id,),
+                ) as c:
+                    row = await c.fetchone()
+                    return row[0] if row else 0
             async with self._connection.execute(
                 """
                 INSERT INTO migrations (account_id, started_at)
@@ -819,7 +838,7 @@ class Database:
 
             if count > 0:
                 await self._commit_with_retry()
-                logger.info(f"Reset {count} interrupted migrations")
+                logger.info("Reset %d interrupted migrations", count)
 
         return count
 
