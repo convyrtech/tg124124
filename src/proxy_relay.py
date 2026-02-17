@@ -295,6 +295,7 @@ class ProxyRelayManager:
 
     def __init__(self):
         self._relays: dict[str, ProxyRelay] = {}
+        self._lock = asyncio.Lock()
 
     async def get_or_create(self, socks5_proxy: str) -> ProxyRelay:
         """
@@ -303,17 +304,19 @@ class ProxyRelayManager:
 
         FIX #12: Check if cached relay is still running (may have been
         stopped by stop_all()). If stopped, create a fresh one.
+        Uses asyncio.Lock to prevent duplicate relay creation under concurrency.
         """
-        existing = self._relays.get(socks5_proxy)
-        if existing and existing._started:
-            return existing
+        async with self._lock:
+            existing = self._relays.get(socks5_proxy)
+            if existing and existing._started:
+                return existing
 
-        # Create new relay (replace stopped one in cache)
-        relay = ProxyRelay(socks5_proxy)
-        await relay.start()
-        self._relays[socks5_proxy] = relay
+            # Create new relay (replace stopped one in cache)
+            relay = ProxyRelay(socks5_proxy)
+            await relay.start()
+            self._relays[socks5_proxy] = relay
 
-        return relay
+            return relay
 
     async def stop_all(self):
         """Останавливает все relay"""
