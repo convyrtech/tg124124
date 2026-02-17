@@ -26,6 +26,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+from .paths import PROFILES_DIR
 from typing import TYPE_CHECKING, Any, Optional
 
 # Logger for this module
@@ -754,14 +756,14 @@ class TelegramAuth:
             raise RuntimeError(error_msg) from e
 
         try:
-            if not await client.is_user_authorized():
+            if not await asyncio.wait_for(client.is_user_authorized(), timeout=15):
                 await asyncio.wait_for(client.disconnect(), timeout=5)
                 raise RuntimeError(
                     f"Session is not authorized (expired or revoked){proxy_info}. Re-login or get a fresh .session file."
                 )
 
             # Получаем инфо о текущем пользователе (без логирования sensitive data)
-            me = await client.get_me()
+            me = await asyncio.wait_for(client.get_me(), timeout=15)
             logger.info(f"Connected as: {me.first_name} (ID: {me.id})")
             logger.debug(f"Device: {device.device_model} / {device.system_version}")
         except RuntimeError:
@@ -777,7 +779,7 @@ class TelegramAuth:
         FIX #2: Проверяет что Telethon сессия всё ещё работает после авторизации браузера.
         """
         try:
-            me = await client.get_me()
+            me = await asyncio.wait_for(client.get_me(), timeout=15)
             if me:
                 logger.info(f"Session verified: {me.first_name} still authorized")
                 return True
@@ -798,7 +800,10 @@ class TelegramAuth:
             True if TTL was set successfully
         """
         try:
-            result = await client(SetAuthorizationTTLRequest(authorization_ttl_days=self.AUTH_TTL_DAYS))
+            result = await asyncio.wait_for(
+                client(SetAuthorizationTTLRequest(authorization_ttl_days=self.AUTH_TTL_DAYS)),
+                timeout=15,
+            )
             logger.info("Authorization TTL set to %d days", self.AUTH_TTL_DAYS)
             return bool(result)
         except Exception as e:
@@ -1294,7 +1299,7 @@ class TelegramAuth:
         """
         # Clean up old debug screenshots (keep only last 10)
         try:
-            debug_dir = Path("profiles")
+            debug_dir = PROFILES_DIR
             for pattern in ["debug_qr_*.png", "debug_2fa_*.png"]:
                 files = sorted(debug_dir.glob(pattern), key=lambda f: f.stat().st_mtime)
                 for f in files[:-10]:  # Keep last 10
@@ -1358,7 +1363,7 @@ class TelegramAuth:
                     logger.warning(f"Failed to decode QR from screenshot (attempt {retry + 1})")
                     # FIX-009: Сохраняем debug скриншот с timestamp
                     timestamp = datetime.now().strftime("%H%M%S")
-                    debug_path = Path("profiles") / f"debug_qr_{profile_name}_{timestamp}_r{retry}.png"
+                    debug_path = PROFILES_DIR / f"debug_qr_{profile_name}_{timestamp}_r{retry}.png"
                     debug_path.parent.mkdir(parents=True, exist_ok=True)
                     with open(debug_path, "wb") as f:
                         f.write(result)
@@ -1542,7 +1547,7 @@ class TelegramAuth:
         if not password_input or not found_selector:
             # Debug screenshot с timestamp
             timestamp = datetime.now().strftime("%H%M%S")
-            debug_path = Path("profiles") / f"debug_2fa_notfound_{timestamp}.png"
+            debug_path = PROFILES_DIR / f"debug_2fa_notfound_{timestamp}.png"
             debug_path.parent.mkdir(parents=True, exist_ok=True)
             await page.screenshot(path=str(debug_path))
             logger.error(f"Password input not found! Screenshot: {debug_path}")
@@ -1569,7 +1574,7 @@ class TelegramAuth:
             logger.exception(f"Password input failed: {error_msg}")
             # Debug screenshot
             timestamp = datetime.now().strftime("%H%M%S")
-            debug_path = Path("profiles") / f"debug_2fa_error_{timestamp}.png"
+            debug_path = PROFILES_DIR / f"debug_2fa_error_{timestamp}.png"
             await page.screenshot(path=str(debug_path))
             return False
 
@@ -1602,7 +1607,7 @@ class TelegramAuth:
 
         # Debug screenshot
         timestamp = datetime.now().strftime("%H%M%S")
-        debug_path = Path("profiles") / f"debug_2fa_after_{timestamp}.png"
+        debug_path = PROFILES_DIR / f"debug_2fa_after_{timestamp}.png"
         await page.screenshot(path=str(debug_path))
         logger.debug(f"Debug screenshot: {debug_path}")
 
@@ -1992,9 +1997,16 @@ class TelegramAuth:
                     telethon_alive=telethon_alive,
                 )
 
-        except Exception as e:
-            logger.error("Authorization failed for '%s': %s", profile.name, sanitize_error(str(e)), exc_info=True)
-            return AuthResult(success=False, profile_name=profile.name, error=sanitize_error(str(e)))
+        except BaseException as e:
+            # BaseException catches CancelledError (Python 3.11+) for proper cleanup
+            if isinstance(e, asyncio.CancelledError):
+                logger.warning("authorize() cancelled for '%s'", profile.name)
+            else:
+                logger.error("Authorization failed for '%s': %s", profile.name, sanitize_error(str(e)))
+            result = AuthResult(success=False, profile_name=profile.name, error=sanitize_error(str(e)))
+            if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt)):
+                raise  # re-raise after finally cleanup
+            return result
 
         finally:
             # Cancel watchdog first (before cleanup attempts that might also hang)
