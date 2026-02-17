@@ -916,6 +916,12 @@ class TGWebAuthApp:
 
         async def do_delete():
             try:
+                # Unlink any account that references this proxy before deletion
+                # (prevents dangling proxy_id → account running without proxy)
+                accounts = await self._controller.db.list_accounts()
+                for acc in accounts:
+                    if acc.proxy_id == proxy_id:
+                        await self._controller.db.update_account(acc.id, proxy_id=None)
                 await self._controller.db.delete_proxy(proxy_id)
                 self._log(f"[Proxies] Deleted proxy {proxy_id}")
 
@@ -1193,7 +1199,7 @@ class TGWebAuthApp:
                 browser_manager = BrowserManager()
                 try:
                     auth = FragmentAuth(config, browser_manager)
-                    result = await asyncio.wait_for(auth.connect(headless=False), timeout=300)
+                    result = await asyncio.wait_for(auth.connect(headless=True), timeout=300)
 
                     if result.success:
                         from datetime import datetime
