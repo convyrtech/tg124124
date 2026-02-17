@@ -310,7 +310,8 @@ class FragmentAuth:
 
         # Check for ACCEPT button (already logged in flow)
         body_text = await popup.evaluate("() => document.body.innerText")
-        if "ACCEPT" in body_text and "DECLINE" in body_text:
+        body_lower = body_text.lower()
+        if "accept" in body_lower and "decline" in body_lower:
             logger.info("Popup shows already-logged-in form (ACCEPT/DECLINE)")
             return True
 
@@ -382,7 +383,7 @@ class FragmentAuth:
             # Debug: log popup HTML for investigation
             try:
                 html = await popup.evaluate("document.body.innerHTML")
-                logger.warning("Could not find ACCEPT button. HTML: %s", html[:500])
+                logger.debug("Could not find ACCEPT button. HTML: %s", html[:500])
             except Exception:
                 pass
             return False
@@ -471,7 +472,7 @@ class FragmentAuth:
             # Check for error message
             error = await popup.evaluate("() => document.getElementById('login-alert')?.textContent || ''")
             if error:
-                logger.error("OAuth phone error: %s", error)
+                logger.error("OAuth phone error: %s", sanitize_error(error))
             return False
 
     def _create_confirmation_handler(self, client: TelegramClient, confirmed: asyncio.Event):

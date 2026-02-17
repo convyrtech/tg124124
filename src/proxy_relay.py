@@ -278,6 +278,7 @@ class ProxyRelay:
                 self._process = None
 
         self._started = False
+        self.local_port = None
         logger.info("Stopped")
 
     async def __aenter__(self) -> "ProxyRelay":
