@@ -1637,6 +1637,22 @@ class TGWebAuthApp:
 
     async def _batch_fragment(self, account_ids: list) -> None:
         """Batch fragment auth using parallel worker pool."""
+        # FIX: Filter out accounts with active single ops (same as _batch_migrate)
+        busy_ids = {
+            int(op.split("_", 1)[1])
+            for op in self._busy_ops
+            if op.startswith(("migrate_", "fragment_")) and op.split("_", 1)[1].isdigit()
+        }
+        if busy_ids:
+            original_count = len(account_ids)
+            account_ids = [aid for aid in account_ids if aid not in busy_ids]
+            if original_count != len(account_ids):
+                self._log(f"[Fragment] Skipped {original_count - len(account_ids)} accounts with active single ops")
+        if not account_ids:
+            self._log("[Fragment] No accounts to process")
+            self._active_pool = None
+            self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+            return
         self._schedule_ui(lambda: self._set_batch_buttons_enabled(False))
         try:
             from ..worker_pool import MigrationWorkerPool
