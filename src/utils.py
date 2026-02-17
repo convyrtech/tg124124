@@ -66,14 +66,17 @@ def parse_proxy_for_telethon(proxy_str: str) -> tuple | None:
         raise ImportError("PySocks not installed. Run: pip install PySocks") from e
 
     parts = proxy_str.split(":", 4)
-    if len(parts) == 5:
-        proto, host, port, user, pwd = parts
-        proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
-        return (proxy_type, host, int(port), True, user, pwd)
-    elif len(parts) == 3:
-        proto, host, port = parts
-        proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
-        return (proxy_type, host, int(port))
+    try:
+        if len(parts) == 5:
+            proto, host, port, user, pwd = parts
+            proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
+            return (proxy_type, host, int(port), True, user, pwd)
+        elif len(parts) == 3:
+            proto, host, port = parts
+            proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
+            return (proxy_type, host, int(port))
+    except (ValueError, TypeError):
+        return None
 
     return None
 
@@ -116,7 +119,7 @@ _PROXY_PATTERN = re.compile(
 _CREDENTIAL_URI_PATTERN = re.compile(
     r"://([^:@]+):([^@]+)@",
 )
-_PHONE_PATTERN = re.compile(r"\b(\+?\d{10,15})\b")
+_PHONE_PATTERN = re.compile(r"\+\d{10,14}\b")
 
 
 def sanitize_error(error_text: str) -> str:
@@ -140,5 +143,5 @@ def sanitize_error(error_text: str) -> str:
     # Mask credentials in URI format (user:pass@host)
     text = _CREDENTIAL_URI_PATTERN.sub(r"://***:***@", text)
     # Mask phone numbers
-    text = _PHONE_PATTERN.sub(r"[phone]", text)
+    text = _PHONE_PATTERN.sub("[phone]", text)
     return text

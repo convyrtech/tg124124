@@ -21,7 +21,7 @@ from typing import Optional
 import psutil
 
 from .logger import get_logger, setup_logging
-from .utils import sanitize_error
+from .utils import mask_proxy_credentials, sanitize_error
 
 logger = get_logger(__name__)
 
@@ -189,7 +189,7 @@ def migrate(
     from .database import Database
     from .telegram_auth import ParallelMigrationController, migrate_account, migrate_accounts_batch
 
-    DB_PATH = Path("data/tgwebauth.db")
+    DB_PATH = DATA_DIR / "tgwebauth.db"
 
     # FIX-5.2: Load password file for 2FA
     passwords_map: dict = {}
@@ -634,7 +634,7 @@ def migrate(
 
             click.echo("\nFailed accounts:")
             for result in failed:
-                click.echo(f"  - {result.profile_name}: {result.error}")
+                click.echo(f"  - {result.profile_name}: {sanitize_error(result.error or '')}")
             click.echo("\nИспользуйте --retry-failed для повтора упавших")
 
         # Show batch summary from DB
@@ -685,11 +685,7 @@ def open_profile(account: str, url: str):
     click.echo(f"Открываю профиль: {profile.name}")
     click.echo(f"URL: {url}")
     if profile.proxy:
-        # Маскируем credentials
-        proxy_parts = profile.proxy.split(":")
-        if len(proxy_parts) >= 3:
-            safe_proxy = f"{proxy_parts[0]}:{proxy_parts[1]}:{proxy_parts[2]}:***"
-            click.echo(f"Proxy: {safe_proxy}")
+        click.echo(f"Proxy: {mask_proxy_credentials(profile.proxy)}")
 
     async def run():
         ctx = None
@@ -759,11 +755,7 @@ def list_cmd():
             click.echo(f"    Path: {profile.browser_data_path}")
             click.echo(f"    Storage: {'✓' if storage_exists else '✗'}")
             if profile.proxy:
-                # Скрываем credentials (FIX #8)
-                proxy_parts = profile.proxy.split(":")
-                if len(proxy_parts) >= 3:
-                    safe_proxy = f"{proxy_parts[0]}:{proxy_parts[1]}:{proxy_parts[2]}:***"
-                    click.echo(f"    Proxy: {safe_proxy}")
+                click.echo(f"    Proxy: {mask_proxy_credentials(profile.proxy)}")
     else:
         click.echo("  (нет профилей)")
 
@@ -972,7 +964,7 @@ def fragment(account: str | None, fragment_all: bool, retry_failed: bool, headed
         try:
             config = AccountConfig.load(account_dir)
         except Exception as e:
-            click.echo(click.style(f"  SKIP {account_dir.name}: {e}", fg="yellow"))
+            click.echo(click.style(f"  SKIP {account_dir.name}: {sanitize_error(str(e))}", fg="yellow"))
             return None
 
         auth = FragmentAuth(config, browser_manager)
@@ -1089,7 +1081,7 @@ def fragment(account: str | None, fragment_all: bool, retry_failed: bool, headed
                 click.echo(f"    Таймауты ({len(fail_timeout)}): {', '.join(fail_timeout)}")
             if fail_other:
                 for name, err in fail_other:
-                    click.echo(f"    {name}: {err}")
+                    click.echo(f"    {name}: {sanitize_error(err or '')}")
         if skipped:
             click.echo(click.style(f"  SKIP: {len(skipped)}", fg="yellow"))
         if total_fail > 0:
@@ -1147,14 +1139,14 @@ def fragment(account: str | None, fragment_all: bool, retry_failed: bool, headed
 @cli.command("check-proxies")
 @click.option("--concurrency", "-j", default=50, type=int, help="Concurrent checks")
 @click.option("--timeout", "-t", default=5.0, type=float, help="Timeout per check (seconds)")
-@click.option("--db-path", default="data/tgwebauth.db", help="Database path")
-def check_proxies(concurrency: int, timeout: float, db_path: str):
+@click.option("--db-path", default=None, help="Database path (default: data/tgwebauth.db)")
+def check_proxies(concurrency: int, timeout: float, db_path: str | None):
     """Batch check all proxies for connectivity."""
     from .database import Database
     from .proxy_health import check_proxy_batch
 
     async def _run() -> None:
-        db = Database(Path(db_path))
+        db = Database(Path(db_path) if db_path else DATA_DIR / "tgwebauth.db")
         await db.initialize()
         await db.connect()
         try:
@@ -1197,14 +1189,14 @@ def check_proxies(concurrency: int, timeout: float, db_path: str):
 )
 @click.option("--auto", is_flag=True, help="Без подтверждения (для автоматизации)")
 @click.option("--check-only", is_flag=True, help="Только проверить, не заменять")
-@click.option("--db-path", default="data/tgwebauth.db", help="Путь к базе данных")
-def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str):
+@click.option("--db-path", default=None, help="Путь к базе данных (default: data/tgwebauth.db)")
+def proxy_refresh(proxy_file: str, auto: bool, check_only: bool, db_path: str | None):
     """Проверить прокси аккаунтов и заменить мёртвые из файла."""
     from .database import Database
     from .proxy_manager import ProxyManager
 
     async def _run() -> None:
-        db = Database(Path(db_path))
+        db = Database(Path(db_path) if db_path else DATA_DIR / "tgwebauth.db")
         await db.initialize()
         await db.connect()
         try:
@@ -1315,7 +1307,7 @@ def preflight():
 
     from .database import Database
 
-    DB_PATH = Path("data/tgwebauth.db")
+    DB_PATH = DATA_DIR / "tgwebauth.db"
 
     async def _run_preflight():
         click.echo("=" * 50)
