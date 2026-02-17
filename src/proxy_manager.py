@@ -52,6 +52,8 @@ def parse_proxy_line(line: str) -> tuple[str | None, int | None, str | None, str
             host, port_str = host_part.split(":", 1)
             try:
                 port = int(port_str)
+                if not (1 <= port <= 65535):
+                    return (None, None, None, None, protocol)
             except ValueError:
                 return (None, None, None, None, protocol)
         else:
@@ -65,6 +67,8 @@ def parse_proxy_line(line: str) -> tuple[str | None, int | None, str | None, str
         host = parts[0]
         try:
             port = int(parts[1])
+            if not (1 <= port <= 65535):
+                return (None, None, None, None, protocol)
         except ValueError:
             return (None, None, None, None, protocol)
         username = parts[2] if len(parts) > 2 and parts[2] else None

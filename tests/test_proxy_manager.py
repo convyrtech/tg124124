@@ -79,6 +79,21 @@ class TestParseProxyLine:
         assert port == 1080
         assert proto == "https"
 
+    def test_port_zero_rejected(self):
+        """Port 0 is invalid."""
+        host, port, *_ = parse_proxy_line("1.2.3.4:0:user:pass")
+        assert host is None
+
+    def test_port_too_large_rejected(self):
+        """Port > 65535 is invalid."""
+        host, port, *_ = parse_proxy_line("1.2.3.4:70000:user:pass")
+        assert host is None
+
+    def test_negative_port_rejected(self):
+        """Negative port is invalid (int parse succeeds but range check fails)."""
+        host, port, *_ = parse_proxy_line("1.2.3.4:-1:user:pass")
+        assert host is None
+
 
 # ==================== proxy_record_to_string ====================
 

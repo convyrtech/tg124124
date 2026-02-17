@@ -692,3 +692,25 @@ class TestDatabase:
                 assert row[0] == 1, "foreign_keys PRAGMA should be ON"
         finally:
             await db.close()
+
+    @pytest.mark.asyncio
+    async def test_list_accounts_escapes_like_wildcards(self, db_path):
+        """LIKE wildcards (%, _) in search must be treated as literals."""
+        from src.database import Database
+
+        db = Database(db_path)
+        await db.initialize()
+        await db.connect()
+
+        try:
+            await db.add_account(name="test_user", session_path="/t1.session")
+            await db.add_account(name="testXuser", session_path="/t2.session")
+
+            # Search for literal underscore — should NOT match "testXuser"
+            results = await db.list_accounts(search="test_user")
+            names = [a.name for a in results]
+            assert "test_user" in names
+            assert "testXuser" not in names
+
+        finally:
+            await db.close()

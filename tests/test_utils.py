@@ -36,10 +36,10 @@ class TestParseProxyForCamoufox:
         with pytest.raises(ValueError, match="Invalid proxy format"):
             parse_proxy_for_camoufox("socks5:proxy.com")
 
-    def test_invalid_format_too_many_parts(self):
-        """Test that too many parts raises ValueError."""
-        with pytest.raises(ValueError, match="Invalid proxy format"):
-            parse_proxy_for_camoufox("socks5:host:port:user:pass:extra")
+    def test_extra_colons_in_password(self):
+        """Extra colons are part of password (maxsplit=4)."""
+        result = parse_proxy_for_camoufox("socks5:host:1080:user:pass:extra")
+        assert result["password"] == "pass:extra"
 
     def test_empty_string(self):
         """Test that empty string raises ValueError."""
@@ -47,16 +47,14 @@ class TestParseProxyForCamoufox:
             parse_proxy_for_camoufox("")
 
     def test_special_characters_in_password(self):
-        """Test proxy with special characters in password.
+        """Test proxy with special characters in password."""
+        # Password with colons now works (maxsplit=4)
+        result = parse_proxy_for_camoufox("socks5:host:1080:user:p@ss:w0rd")
+        assert result["password"] == "p@ss:w0rd"
+        assert result["username"] == "user"
+        assert result["server"] == "socks5://host:1080"
 
-        Known limitation: Passwords with colons break parsing.
-        This test documents the behavior.
-        """
-        # Password with colon breaks the parser (6 parts instead of 5)
-        with pytest.raises(ValueError, match="Invalid proxy format"):
-            parse_proxy_for_camoufox("socks5:host:1080:user:p@ss:w0rd")
-
-        # But @ and other chars without colon work fine
+        # @ and other chars without colon work fine
         result = parse_proxy_for_camoufox("socks5:host:1080:user:p@ssw0rd!")
         assert result["password"] == "p@ssw0rd!"
 
@@ -124,3 +122,29 @@ class TestMaskProxyCredentials:
         """Test None-like input."""
         result = mask_proxy_credentials(None)
         assert result == ""
+
+    def test_mask_password_with_colons(self):
+        """Password with colons should still be masked."""
+        result = mask_proxy_credentials("socks5:proxy.com:1080:user:pass:w0rd")
+        assert result == "socks5:proxy.com:1080:***:***"
+        assert "pass:w0rd" not in result
+
+    def test_mask_password_with_at_sign(self):
+        """Password with @ in colon format is masked via colon branch."""
+        result = mask_proxy_credentials("socks5:proxy.com:1080:user:p@ss")
+        assert result == "socks5:proxy.com:1080:***:***"
+
+
+class TestPasswordWithColons:
+    """Cross-function tests: passwords containing colons must work everywhere."""
+
+    def test_camoufox_parser(self):
+        result = parse_proxy_for_camoufox("socks5:host:1080:user:a:b:c")
+        assert result["password"] == "a:b:c"
+        assert result["username"] == "user"
+
+    def test_telethon_parser(self):
+        result = parse_proxy_for_telethon("socks5:host:1080:user:a:b:c")
+        assert result is not None
+        assert result[4] == "user"
+        assert result[5] == "a:b:c"

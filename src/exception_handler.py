@@ -8,7 +8,7 @@ Hooks into sys.excepthook and asyncio exception handler to:
 import logging
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .paths import LOGS_DIR
 from .utils import sanitize_error
@@ -29,7 +29,7 @@ def _write_crash_file(exc_type, exc_value, exc_tb) -> None:
             pass
         with open(crash_path, "a", encoding="utf-8") as f:
             f.write(f"\n{'=' * 60}\n")
-            f.write(f"Crash at: {datetime.now().isoformat()}\n")
+            f.write(f"Crash at: {datetime.now(timezone.utc).isoformat()}\n")
             f.write(f"Exception: {exc_type.__name__}: {sanitize_error(str(exc_value))}\n\n")
             # Format traceback but sanitize each line
             tb_lines = traceback.format_exception(exc_type, exc_value, exc_tb)

@@ -64,6 +64,13 @@ class TestProxyConfig:
         with pytest.raises(ValueError):
             ProxyConfig.parse("socks5:host:1080:user")  # Missing password
 
+    def test_password_with_colons(self):
+        """Password containing colons should be preserved (maxsplit=4)."""
+        config = ProxyConfig.parse("socks5:host:1080:user:p@ss:w0rd:extra")
+        assert config.username == "user"
+        assert config.password == "p@ss:w0rd:extra"
+        assert config.to_pproxy_uri() == "socks5://host:1080#user:p@ss:w0rd:extra"
+
 
 class TestNeedsRelay:
     """Tests for needs_relay function"""

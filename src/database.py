@@ -341,8 +341,10 @@ class Database:
             params.append(status)
 
         if search:
-            query += " AND (name LIKE ? OR username LIKE ? OR phone LIKE ?)"
-            pattern = f"%{search}%"
+            query += " AND (name LIKE ? ESCAPE '\\' OR username LIKE ? ESCAPE '\\' OR phone LIKE ? ESCAPE '\\')"
+            # Escape LIKE wildcards in user input
+            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
             params.extend([pattern, pattern, pattern])
 
         query += " ORDER BY name"

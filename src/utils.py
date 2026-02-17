@@ -28,7 +28,7 @@ def parse_proxy_for_camoufox(proxy_str: str) -> dict[str, Any]:
     if not proxy_str:
         raise ValueError("Proxy string cannot be empty")
 
-    parts = proxy_str.split(":")
+    parts = proxy_str.split(":", 4)
     if len(parts) == 5:
         proto, host, port, user, pwd = parts
         return {
@@ -65,7 +65,7 @@ def parse_proxy_for_telethon(proxy_str: str) -> tuple | None:
     except ImportError as e:
         raise ImportError("PySocks not installed. Run: pip install PySocks") from e
 
-    parts = proxy_str.split(":")
+    parts = proxy_str.split(":", 4)
     if len(parts) == 5:
         proto, host, port, user, pwd = parts
         proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
@@ -95,15 +95,17 @@ def mask_proxy_credentials(proxy_str: str) -> str:
     if not proxy_str:
         return ""
 
+    # Try colon-delimited format first: proto:host:port:user:pass
+    parts = proxy_str.split(":", 4)
+    if len(parts) == 5:
+        proto, host, port, _, _ = parts
+        return f"{proto}:{host}:{port}:***:***"
+
     # Handle user:pass@host:port format
     if "@" in proxy_str:
         at_idx = proxy_str.index("@")
         return "***:***@" + proxy_str[at_idx + 1 :]
 
-    parts = proxy_str.split(":")
-    if len(parts) == 5:
-        proto, host, port, _, _ = parts
-        return f"{proto}:{host}:{port}:***:***"
     return proxy_str
 
 

@@ -38,13 +38,19 @@ class ProxyConfig:
         Парсит строку прокси.
         Форматы: socks5:host:port:user:pass или socks5:host:port
         """
-        parts = proxy_str.split(":")
+        parts = proxy_str.split(":", 4)
         if len(parts) == 5:
-            proto, host, port, user, pwd = parts
-            return cls(proto, host, int(port), user, pwd)
+            proto, host, port_s, user, pwd = parts
+            port = int(port_s)
+            if not (1 <= port <= 65535):
+                raise ValueError(f"Port out of range: {port}")
+            return cls(proto, host, port, user, pwd)
         elif len(parts) == 3:
-            proto, host, port = parts
-            return cls(proto, host, int(port))
+            proto, host, port_s = parts
+            port = int(port_s)
+            if not (1 <= port <= 65535):
+                raise ValueError(f"Port out of range: {port}")
+            return cls(proto, host, port)
         raise ValueError("Invalid proxy format (expected protocol:host:port[:user:pass])")
 
     @property
