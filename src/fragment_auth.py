@@ -304,16 +304,23 @@ class FragmentAuth:
         Returns:
             True if already-logged-in form is shown (no phone input needed)
         """
-        has_phone = await popup.evaluate("() => !!document.getElementById('login-phone')")
-        if has_phone:
+        if popup.is_closed():
+            logger.warning("OAuth popup closed before login check")
             return False
 
-        # Check for ACCEPT button (already logged in flow)
-        body_text = await popup.evaluate("() => document.body.innerText")
-        body_lower = body_text.lower()
-        if "accept" in body_lower and "decline" in body_lower:
-            logger.info("Popup shows already-logged-in form (ACCEPT/DECLINE)")
-            return True
+        try:
+            has_phone = await popup.evaluate("() => !!document.getElementById('login-phone')")
+            if has_phone:
+                return False
+
+            # Check for ACCEPT button (already logged in flow)
+            body_text = await popup.evaluate("() => document.body.innerText")
+            body_lower = body_text.lower()
+            if "accept" in body_lower and "decline" in body_lower:
+                logger.info("Popup shows already-logged-in form (ACCEPT/DECLINE)")
+                return True
+        except Exception as e:
+            logger.debug("Popup check failed (may be closed): %s", e)
 
         return False
 
@@ -865,14 +872,23 @@ async def fragment_account(
     account = AccountConfig.load(Path(account_dir))
     if proxy_override is not None:
         account.proxy = proxy_override
-    auth = FragmentAuth(account, browser_manager or BrowserManager())
-    if on_status:
-        on_status("Connecting...")
-    result = await auth.connect(headless=headless)
+    own_bm = browser_manager is None
+    bm = browser_manager or BrowserManager()
+    try:
+        auth = FragmentAuth(account, bm)
+        if on_status:
+            on_status("Connecting...")
+        result = await auth.connect(headless=headless)
 
-    return AuthResult(
-        success=result.success,
-        profile_name=account.name,
-        error=result.error,
-        user_info={"already_authorized": result.already_authorized} if result.success else None,
-    )
+        return AuthResult(
+            success=result.success,
+            profile_name=account.name,
+            error=result.error,
+            user_info={"already_authorized": result.already_authorized} if result.success else None,
+        )
+    finally:
+        if own_bm:
+            try:
+                await bm.close_all()
+            except Exception:
+                pass

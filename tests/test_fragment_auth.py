@@ -301,6 +301,7 @@ class TestFragmentAuth:
     async def test_check_popup_already_logged_in_true(self, fragment_auth):
         """Test detecting already-logged-in oauth popup (ACCEPT/DECLINE)."""
         popup = AsyncMock()
+        popup.is_closed = MagicMock(return_value=False)
         popup.evaluate = AsyncMock(side_effect=[
             False,  # no login-phone element
             "LOG OUT\nfragment.com requests access\nDECLINE\nACCEPT",
@@ -312,6 +313,7 @@ class TestFragmentAuth:
     async def test_check_popup_already_logged_in_false(self, fragment_auth):
         """Test normal phone-input popup is not flagged as already logged in."""
         popup = AsyncMock()
+        popup.is_closed = MagicMock(return_value=False)
         popup.evaluate = AsyncMock(return_value=True)  # has login-phone
         result = await fragment_auth._check_popup_already_logged_in(popup)
         assert result is False
