@@ -4,16 +4,14 @@
 **Step 1**: Activate Serena project: `activate_project("tg-web-auth")`
 **Step 2**: Read Serena memory `session-state` — contains CURRENT task, git state, what to do next
 **Step 3**: Read other memories as needed: `project-architecture`, `audit-results`
-**Step 4**: Read `.claude/MASTER_PROMPT.md` only if memories are insufficient
+**Step 4**: Read other memories as needed: `instrumental-audit-results`, `phase-d-qa-findings`, `work-rules`
 
 **IMPORTANT**: After completing major milestones, UPDATE the `session-state` memory via `edit_memory` or `write_memory`.
 
 **Key documents:**
 - Serena memories (`list_memories`) - **CURRENT STATE** (survives compaction!)
-- `.claude/MASTER_PROMPT.md` - Master operating guide (architecture, phases)
-- `docs/plans/2026-02-09-production-1000-design.md` - Production plan
-- `docs/plans/2026-02-10-full-audit-plan.md` - Audit findings
-- `docs/plans/2026-02-11-exe-packaging-plan.md` - EXE packaging plan
+- `docs/plans/2026-02-09-production-1000-design.md` - Production architecture plan
+- `docs/plans/2026-02-16-final-qa-plan.md` - Final QA plan
 
 ## Project Goal
 Автоматическая миграция Telegram session файлов (Telethon) в браузерные профили для:
