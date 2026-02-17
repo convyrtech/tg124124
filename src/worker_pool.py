@@ -45,6 +45,11 @@ _ERROR_MAP = {
     "Browser launch timeout": "Браузер не запустился — попробуйте снова",
     "Proxy relay not responding": "Прокси-релей не отвечает — проверьте прокси",
     "Session file corrupted": "Файл сессии повреждён — нужен новый .session файл",
+    "proxy lib error": "Ошибка прокси-библиотеки — проверьте тип/логин прокси (Python 3.13+ несовместим с некоторыми SOCKS-библиотеками)",
+    "not found in": "Некорректный формат аккаунта — проверьте api.json",
+    "api.json not found": "Файл api.json не найден в папке аккаунта",
+    "no .session file": "Файл .session не найден в папке аккаунта",
+    "must be integer": "api_id должен быть числом — проверьте api.json",
 }
 
 
@@ -547,7 +552,11 @@ class MigrationWorkerPool:
                 await self._complete_migration_safe(migration_id, name, success=False, error_message=error_msg)
             elif self._mode == "fragment":
                 await self._update_fragment_status_safe(account_id, name, "error", error_msg)
-            self._circuit_breaker.record_failure()
+            # Only record infrastructure failures in circuit breaker.
+            # Config errors (bad api.json, missing session) are per-account
+            # and must NOT open the circuit breaker for healthy accounts.
+            if self._is_retryable(error_msg):
+                self._circuit_breaker.record_failure()
             if probe_acquired:
                 self._circuit_breaker.release_half_open_probe()
             return await self._maybe_retry(account_id, name, error_msg, retries)
@@ -613,7 +622,9 @@ class MigrationWorkerPool:
                 await self._complete_migration_safe(migration_id, name, success=False, error_message=error_msg)
             elif self._mode == "fragment":
                 await self._update_fragment_status_safe(account_id, name, "error", error_msg)
-            self._circuit_breaker.record_failure()
+            # Only infrastructure failures should trigger circuit breaker
+            if self._is_retryable(error_msg):
+                self._circuit_breaker.record_failure()
             if probe_acquired:
                 self._circuit_breaker.release_half_open_probe()
             self._log(f"[W{worker_id}] {name} - FAILED: {humanize_error(error_msg)}")
@@ -679,6 +690,11 @@ class MigrationWorkerPool:
         "auth_key_duplicated",
         "authrestart",  # AuthRestartError — stale token, retry won't help
         "session file corrupted",  # Corrupt .session file
+        "not found in",  # KeyError: 'api_id' not found in api.json
+        "api.json not found",  # FileNotFoundError: api.json missing
+        "no .session file",  # FileNotFoundError: no session file in dir
+        "must be integer",  # ValueError: api_id must be integer
+        "proxy lib error",  # TypeError in python-socks on Python 3.13+
     )
 
     def _is_retryable(self, error: str) -> bool:

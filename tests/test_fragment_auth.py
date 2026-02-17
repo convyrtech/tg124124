@@ -834,6 +834,20 @@ class TestFragmentAuth:
             assert not result.success
             assert "phone" in result.error.lower()
 
+    @pytest.mark.asyncio
+    async def test_connect_proxy_type_error(self, fragment_auth):
+        """Test connect handles python-socks TypeError (Python 3.13+)."""
+        with patch.object(
+            fragment_auth, '_create_telethon_client',
+            side_effect=RuntimeError(
+                "Telethon connection failed (proxy lib error): "
+                "ConnectionError() takes no keyword arguments"
+            )
+        ):
+            result = await fragment_auth.connect(headless=True)
+            assert not result.success
+            assert "proxy lib error" in result.error
+
 
 class TestCodeExtraction:
     """Additional tests for code extraction edge cases."""

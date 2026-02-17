@@ -146,6 +146,13 @@ class FragmentAuth:
             except Exception:
                 pass
             raise RuntimeError("Telethon connect timeout after 30s") from None
+        except TypeError as e:
+            # python-socks on Python 3.13+ raises TypeError instead of ConnectionError
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=5)
+            except Exception:
+                pass
+            raise RuntimeError(f"Telethon connection failed (proxy lib error): {e}") from e
         except (ConnectionError, OSError) as e:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=5)

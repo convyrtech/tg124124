@@ -790,3 +790,133 @@ class TestCircuitBreakerHalfOpen:
         breaker._half_open_probing = True
         breaker.reset()
         assert breaker._half_open_probing is False
+
+
+class TestCircuitBreakerSkipOnConfigError:
+    """Circuit breaker must NOT trigger for non-retryable config errors."""
+
+    @pytest.mark.asyncio
+    async def test_config_error_does_not_open_circuit_breaker(self, tmp_path):
+        """Non-retryable error (api_id not found) must NOT call record_failure."""
+        accounts = {}
+        for i in range(1, 7):
+            d = tmp_path / f"account_{i}"
+            d.mkdir()
+            (d / "session.session").touch()
+            accounts[i] = _make_account(i, name=f"Acc{i}", session_dir=d)
+
+        db = _mock_db(accounts)
+        breaker = CircuitBreaker(failure_threshold=5, reset_timeout=0.1)
+
+        with patch("src.worker_pool.migrate_account", new_callable=AsyncMock) as mock_migrate:
+            # Simulate config error: KeyError('api_id') not found in api.json
+            mock_migrate.side_effect = KeyError("'api_id' not found in api.json")
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                max_retries=0,
+                resource_monitor=_always_can_launch(),
+                circuit_breaker=breaker,
+                on_log=lambda m: None,
+            )
+            await pool.run([1, 2, 3, 4, 5, 6])
+
+        # 6 config errors must NOT open circuit breaker
+        assert breaker.consecutive_failures == 0
+        assert not breaker.is_open
+
+    @pytest.mark.asyncio
+    async def test_retryable_error_opens_circuit_breaker(self, tmp_path):
+        """Retryable (infrastructure) errors DO trigger circuit breaker."""
+        accounts = {}
+        for i in range(1, 7):
+            d = tmp_path / f"account_{i}"
+            d.mkdir()
+            (d / "session.session").touch()
+            accounts[i] = _make_account(i, name=f"Acc{i}", session_dir=d)
+
+        db = _mock_db(accounts)
+        breaker = CircuitBreaker(failure_threshold=5, reset_timeout=0.1)
+
+        with patch("src.worker_pool.migrate_account", new_callable=AsyncMock) as mock_migrate:
+            mock_migrate.return_value = _make_auth_result(
+                success=False, error="connection_error: proxy refused"
+            )
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                max_retries=0,
+                resource_monitor=_always_can_launch(),
+                circuit_breaker=breaker,
+                on_log=lambda m: None,
+            )
+            await pool.run([1, 2, 3, 4, 5, 6])
+
+        # Infrastructure failures MUST open circuit breaker
+        assert breaker.consecutive_failures >= 5
+        assert breaker.is_open
+
+    @pytest.mark.asyncio
+    async def test_auth_result_non_retryable_skips_breaker(self, tmp_path):
+        """auth_result with non-retryable error (banned) must NOT trigger breaker."""
+        d = tmp_path / "account_1"
+        d.mkdir()
+        (d / "session.session").touch()
+        accounts = {1: _make_account(1, name="Banned", session_dir=d)}
+
+        db = _mock_db(accounts)
+        breaker = CircuitBreaker(failure_threshold=5, reset_timeout=60)
+
+        with patch("src.worker_pool.migrate_account", new_callable=AsyncMock) as mock_migrate:
+            mock_migrate.return_value = _make_auth_result(
+                success=False, error="PhoneNumberBanned"
+            )
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=1,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                max_retries=0,
+                resource_monitor=_always_can_launch(),
+                circuit_breaker=breaker,
+                on_log=lambda m: None,
+            )
+            await pool.run([1])
+
+        assert breaker.consecutive_failures == 0
+
+
+class TestHumanizeError:
+    """humanize_error returns Russian messages for known patterns."""
+
+    def test_proxy_lib_error(self):
+        from src.worker_pool import humanize_error
+        msg = humanize_error("Telethon connection failed (proxy lib error): ConnectionError()")
+        assert "прокси" in msg.lower()
+
+    def test_api_id_not_found(self):
+        from src.worker_pool import humanize_error
+        msg = humanize_error("'api_id' not found in api.json")
+        assert "api.json" in msg.lower()
+
+    def test_session_file_corrupted(self):
+        from src.worker_pool import humanize_error
+        msg = humanize_error("Session file corrupted: database disk image")
+        assert "повреждён" in msg.lower()
+
+    def test_unknown_error_passthrough(self):
+        from src.worker_pool import humanize_error
+        msg = humanize_error("some random error xyz")
+        assert msg == "some random error xyz"
+
+    def test_none_returns_default(self):
+        from src.worker_pool import humanize_error
+        msg = humanize_error(None)
+        assert msg == "Неизвестная ошибка"

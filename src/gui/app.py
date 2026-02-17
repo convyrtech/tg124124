@@ -512,17 +512,25 @@ class TGWebAuthApp:
                     if db_file.exists():
                         tmp_path = None
                         try:
-                            import shutil
                             import sqlite3
                             import tempfile
 
                             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
                                 tmp_path = tmp.name
-                            shutil.copy2(db_file, tmp_path)
-                            conn = sqlite3.connect(tmp_path)
-                            conn.execute("UPDATE proxies SET username=NULL, password=NULL")
-                            conn.commit()
-                            conn.close()
+                            # Use SQLite backup API instead of file copy:
+                            # - handles WAL mode correctly (no WinError 32)
+                            # - produces a consistent snapshot even with active connections
+                            src_conn = sqlite3.connect(db_file)
+                            dst_conn = sqlite3.connect(tmp_path)
+                            src_conn.backup(dst_conn)
+                            src_conn.close()
+                            # Sanitize proxy credentials (table may not exist if DB is fresh)
+                            try:
+                                dst_conn.execute("UPDATE proxies SET username=NULL, password=NULL")
+                                dst_conn.commit()
+                            except sqlite3.OperationalError:
+                                pass  # Table doesn't exist yet — OK
+                            dst_conn.close()
                             zf.write(tmp_path, "tgwebauth_sanitized.db")
                         except Exception as e:
                             logger.warning("DB copy for diagnostics failed: %s", e)
