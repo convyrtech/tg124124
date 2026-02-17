@@ -154,7 +154,10 @@ class FragmentAuth:
             raise RuntimeError(f"Telethon connection failed: {e}") from e
 
         if not await client.is_user_authorized():
-            await client.disconnect()
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=5)
+            except Exception:
+                pass
             raise RuntimeError("Session is not authorized.")
 
         me = await client.get_me()
