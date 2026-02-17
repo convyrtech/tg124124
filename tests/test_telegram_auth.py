@@ -279,6 +279,62 @@ class TestParseTelethonProxy:
         assert result[4] == "user"
         assert result[5] == "pa:ss:word"
 
+    def test_socks4_with_auth(self):
+        """socks4 proxy must map to socks.SOCKS4, not socks.HTTP."""
+        import socks
+
+        result = parse_telethon_proxy("socks4:proxy.com:1080:user:pass")
+        assert result is not None
+        assert result[0] == socks.SOCKS4
+        assert result[1] == "proxy.com"
+        assert result[2] == 1080
+        assert result[4] == "user"
+
+    def test_socks4_no_auth(self):
+        """socks4 proxy without auth."""
+        import socks
+
+        result = parse_telethon_proxy("socks4:proxy.com:1080")
+        assert result is not None
+        assert result[0] == socks.SOCKS4
+        assert result[1] == "proxy.com"
+        assert result[2] == 1080
+
+    def test_http_proxy_with_auth(self):
+        """HTTP proxy must map to socks.HTTP."""
+        import socks
+
+        result = parse_telethon_proxy("http:proxy.com:8080:user:pass")
+        assert result is not None
+        assert result[0] == socks.HTTP
+        assert result[1] == "proxy.com"
+        assert result[2] == 8080
+        assert result[4] == "user"
+
+    def test_http_proxy_no_auth(self):
+        """HTTP proxy without auth."""
+        import socks
+
+        result = parse_telethon_proxy("http:proxy.com:3128")
+        assert result is not None
+        assert result[0] == socks.HTTP
+        assert result[2] == 3128
+
+    def test_https_proxy(self):
+        """HTTPS proxy maps to socks.HTTP (HTTP CONNECT)."""
+        import socks
+
+        result = parse_telethon_proxy("https:proxy.com:443:user:pass")
+        assert result is not None
+        assert result[0] == socks.HTTP
+
+    def test_socks5_explicit_type(self):
+        """Verify socks5 still maps correctly after refactor."""
+        import socks
+
+        result = parse_telethon_proxy("socks5:proxy.com:1080:user:pass")
+        assert result[0] == socks.SOCKS5
+
 
 class TestTelegramAuthIntegration:
     """Integration-style tests for TelegramAuth (without actual network)."""

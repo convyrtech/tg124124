@@ -251,12 +251,20 @@ class AccountConfig:
         if "api_id" not in api_config:
             raise KeyError(
                 f"'api_id' not found in {api_path}. "
-                f"Expected 'api_id' (or app_id). Keys found: {list(api_config.keys())}"
+                f"Expected 'api_id' (or app_id/appId). Found {len(api_config)} keys."
             )
         if "api_hash" not in api_config:
             raise KeyError(
                 f"'api_hash' not found in {api_path}. "
-                f"Expected 'api_hash' (or app_hash). Keys found: {list(api_config.keys())}"
+                f"Expected 'api_hash' (or app_hash/appHash). Found {len(api_config)} keys."
+            )
+
+        # Ensure api_id is int (some configs store it as string)
+        try:
+            api_config["api_id"] = int(api_config["api_id"])
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"'api_id' must be integer in {api_path}, got: {type(api_config['api_id']).__name__}"
             )
 
         # Извлекаем device конфигурацию (FIX #3: DEVICE SYNC)
@@ -639,15 +647,24 @@ def parse_telethon_proxy(proxy_str: str) -> tuple | None:
 
     # Split with maxsplit=4 to handle passwords containing colons
     parts = proxy_str.split(":", 4)
+
+    def _resolve_proxy_type(proto_str: str) -> int:
+        """Map protocol string to PySocks constant."""
+        p = proto_str.lower()
+        if "socks5" in p:
+            return socks.SOCKS5
+        if "socks4" in p:
+            return socks.SOCKS4
+        # http, https, or anything else → HTTP CONNECT
+        return socks.HTTP
+
     try:
         if len(parts) == 5:
             proto, host, port, user, pwd = parts
-            proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
-            return (proxy_type, host, int(port), True, user, pwd)
+            return (_resolve_proxy_type(proto), host, int(port), True, user, pwd)
         elif len(parts) == 3:
             proto, host, port = parts
-            proxy_type = socks.SOCKS5 if "socks5" in proto.lower() else socks.HTTP
-            return (proxy_type, host, int(port))
+            return (_resolve_proxy_type(proto), host, int(port))
     except (ValueError, AttributeError):
         return None
 

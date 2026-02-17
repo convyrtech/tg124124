@@ -94,6 +94,57 @@ class TestParseProxyLine:
         host, port, *_ = parse_proxy_line("1.2.3.4:-1:user:pass")
         assert host is None
 
+    # --- HTTP port auto-detect tests ---
+
+    def test_autodetect_http_by_port_8080(self):
+        """Port 8080 without explicit protocol → auto-detect http."""
+        host, port, user, pwd, proto = parse_proxy_line("1.2.3.4:8080:user:pass")
+        assert proto == "http"
+        assert host == "1.2.3.4"
+        assert port == 8080
+
+    def test_autodetect_http_by_port_3128(self):
+        """Port 3128 (Squid default) without explicit protocol → auto-detect http."""
+        host, port, user, pwd, proto = parse_proxy_line("1.2.3.4:3128:user:pass")
+        assert proto == "http"
+
+    def test_autodetect_http_by_port_80(self):
+        """Port 80 without explicit protocol → auto-detect http."""
+        host, port, user, pwd, proto = parse_proxy_line("1.2.3.4:80")
+        assert proto == "http"
+
+    def test_autodetect_http_by_port_8888(self):
+        """Port 8888 without explicit protocol → auto-detect http."""
+        _, _, _, _, proto = parse_proxy_line("1.2.3.4:8888:u:p")
+        assert proto == "http"
+
+    def test_no_autodetect_on_socks_port(self):
+        """Port 1080 (SOCKS default) stays socks5."""
+        _, _, _, _, proto = parse_proxy_line("1.2.3.4:1080:user:pass")
+        assert proto == "socks5"
+
+    def test_explicit_socks5_overrides_http_port(self):
+        """Explicit socks5: prefix keeps socks5 even on HTTP-like port."""
+        _, _, _, _, proto = parse_proxy_line("socks5:1.2.3.4:8080:user:pass")
+        assert proto == "socks5"
+
+    def test_explicit_http_on_socks_port(self):
+        """Explicit http: prefix stays http even on non-HTTP port."""
+        _, _, _, _, proto = parse_proxy_line("http:1.2.3.4:1080:user:pass")
+        assert proto == "http"
+
+    def test_autodetect_http_url_style(self):
+        """user:pass@host:port with HTTP port → auto-detect http."""
+        host, port, user, pwd, proto = parse_proxy_line("user:pass@1.2.3.4:8080")
+        assert proto == "http"
+        assert host == "1.2.3.4"
+        assert port == 8080
+
+    def test_no_autodetect_url_style_socks_port(self):
+        """user:pass@host:port with SOCKS port → stays socks5."""
+        _, _, _, _, proto = parse_proxy_line("user:pass@1.2.3.4:1080")
+        assert proto == "socks5"
+
 
 # ==================== proxy_record_to_string ====================
 
