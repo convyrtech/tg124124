@@ -293,17 +293,14 @@ class MigrationWorkerPool:
 
             account_id = await self._queue.get()
 
-            if account_id == _STOP_SENTINEL:
-                self._queue.task_done()
-                break
-
-            if self._shutdown_event.is_set():
-                self._queue.task_done()
-                continue  # Drain queue without processing
-
-            # FIX-D: task_done() in finally block — prevents queue.join() deadlock
-            # if any exception occurs in result recording, progress callback, or cooldown.
+            # FIX: task_done() in finally for ALL paths after get() — prevents
+            # queue.join() deadlock if CancelledError hits between get() and try.
             try:
+                if account_id == _STOP_SENTINEL:
+                    break
+
+                if self._shutdown_event.is_set():
+                    continue  # Drain queue without processing
                 try:
                     account_result = await self._process_account(worker_id, total, account_id)
                 except BaseException as exc:
@@ -334,21 +331,20 @@ class MigrationWorkerPool:
 
                 # Record result (only count non-retry results)
                 is_retry = account_result.error and account_result.error.startswith("RETRY:")
+                completed = 0
+                should_pause = False
                 if not is_retry:
-                    result.results.append(account_result)
-                    if account_result.success:
-                        result.success_count += 1
-                    elif account_result.error and account_result.error.startswith("SKIP"):
-                        result.skipped_count += 1
-                    else:
-                        result.error_count += 1
-
-                    # Update completed count only for final results (not retries).
-                    # Counting retries inflates progress and triggers batch pause
-                    # too frequently (every 3-4 accounts instead of every 10).
-                    # FIX BUG-1/5: Lock prevents two workers from both triggering
-                    # batch pause when they increment _completed_count concurrently.
+                    # FIX BUG-1/5: Lock protects all shared counters to prevent
+                    # concurrent increment races and batch pause double-trigger.
                     async with self._count_lock:
+                        result.results.append(account_result)
+                        if account_result.success:
+                            result.success_count += 1
+                        elif account_result.error and account_result.error.startswith("SKIP"):
+                            result.skipped_count += 1
+                        else:
+                            result.error_count += 1
+
                         self._completed_count += 1
                         completed = self._completed_count
                         should_pause = (
@@ -412,7 +408,7 @@ class MigrationWorkerPool:
 
         # FIX #4: In half-open state, only one worker probes.
         # acquire_half_open_probe() returns False if another worker is already probing.
-        # FIX: Track probe acquisition to release on ALL exit paths (not just success/fail).
+        # FIX: Track probe acquisition to release on ALL exit paths including CancelledError.
         probe_acquired = False
         if self._circuit_breaker.is_open:
             if not await self._circuit_breaker.acquire_half_open_probe():
@@ -555,6 +551,11 @@ class MigrationWorkerPool:
             if probe_acquired:
                 self._circuit_breaker.release_half_open_probe()
             return await self._maybe_retry(account_id, name, error_msg, retries)
+        except BaseException:
+            # CancelledError/KeyboardInterrupt — release probe before propagating
+            if probe_acquired:
+                self._circuit_breaker.release_half_open_probe()
+            raise
 
         # Process result
         if auth_result.success:
