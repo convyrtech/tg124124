@@ -97,6 +97,8 @@ async def check_proxy_telegram(
                 return False, "Proxy requires auth but no credentials provided"
             user_bytes = username.encode("utf-8")
             pass_bytes = password.encode("utf-8")
+            if len(user_bytes) > 255 or len(pass_bytes) > 255:
+                return False, "Username or password exceeds SOCKS5 limit (255 bytes)"
             auth_msg = b"\x01" + bytes([len(user_bytes)]) + user_bytes + bytes([len(pass_bytes)]) + pass_bytes
             writer.write(auth_msg)
             await writer.drain()

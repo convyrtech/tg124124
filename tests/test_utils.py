@@ -148,3 +148,58 @@ class TestPasswordWithColons:
         assert result is not None
         assert result[4] == "user"
         assert result[5] == "a:b:c"
+
+
+class TestSanitizeError:
+    """Tests for sanitize_error credential masking."""
+
+    def test_masks_api_hash_with_quotes(self):
+        """UTIL-4: api_hash in traceback should be masked."""
+        from src.utils import sanitize_error
+
+        text = "TelegramClient(api_id=12345, api_hash='b18441a1ff607e10a989891a5462e627')"
+        result = sanitize_error(text)
+        assert "b18441a1ff607e10a989891a5462e627" not in result
+        assert "api_hash=[MASKED]" in result
+
+    def test_masks_api_hash_no_quotes(self):
+        """UTIL-4: api_hash without quotes should be masked."""
+        from src.utils import sanitize_error
+
+        text = "api_hash=abcdef1234567890abcdef1234567890"
+        result = sanitize_error(text)
+        assert "abcdef1234567890abcdef1234567890" not in result
+
+    def test_masks_phone_without_plus(self):
+        """UTIL-5: Russian phone without + prefix should be masked."""
+        from src.utils import sanitize_error
+
+        text = "Error for user 79991234567: auth failed"
+        result = sanitize_error(text)
+        assert "79991234567" not in result
+        assert "[phone]" in result
+
+    def test_masks_phone_with_plus(self):
+        """Existing: phone with + should still be masked."""
+        from src.utils import sanitize_error
+
+        text = "FloodWait for +79991234567"
+        result = sanitize_error(text)
+        assert "+79991234567" not in result
+        assert "[phone]" in result
+
+    def test_preserves_normal_text(self):
+        """Normal error text without credentials should pass through."""
+        from src.utils import sanitize_error
+
+        text = "Connection refused by host"
+        assert sanitize_error(text) == text
+
+    def test_masks_proxy_uri_format(self):
+        """URI format credentials should be masked."""
+        from src.utils import sanitize_error
+
+        text = "Cannot connect to socks5://admin:secret@proxy.com:1080"
+        result = sanitize_error(text)
+        assert "admin" not in result
+        assert "secret" not in result

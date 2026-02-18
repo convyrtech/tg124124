@@ -335,6 +335,19 @@ class TestParseTelethonProxy:
         result = parse_telethon_proxy("socks5:proxy.com:1080:user:pass")
         assert result[0] == socks.SOCKS5
 
+    def test_parse_4_parts_user_no_password(self):
+        """BUG-T1: 4-part format proto:host:port:user should work (empty password)."""
+        import socks
+
+        result = parse_telethon_proxy("socks5:proxy.com:1080:admin")
+        assert result is not None
+        assert result[0] == socks.SOCKS5
+        assert result[1] == "proxy.com"
+        assert result[2] == 1080
+        assert result[3] is True  # auth enabled
+        assert result[4] == "admin"
+        assert result[5] == ""  # empty password
+
 
 class TestTelegramAuthIntegration:
     """Integration-style tests for TelegramAuth (without actual network)."""

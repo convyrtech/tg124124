@@ -662,6 +662,9 @@ def parse_telethon_proxy(proxy_str: str) -> tuple | None:
         if len(parts) == 5:
             proto, host, port, user, pwd = parts
             return (_resolve_proxy_type(proto), host, int(port), True, user, pwd)
+        elif len(parts) == 4:
+            proto, host, port, user = parts
+            return (_resolve_proxy_type(proto), host, int(port), True, user, "")
         elif len(parts) == 3:
             proto, host, port = parts
             return (_resolve_proxy_type(proto), host, int(port))

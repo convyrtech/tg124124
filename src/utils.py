@@ -120,6 +120,10 @@ _CREDENTIAL_URI_PATTERN = re.compile(
     r"://([^:@]+):([^@]+)@",
 )
 _PHONE_PATTERN = re.compile(r"\+\d{10,14}\b")
+# Russian phone numbers without + prefix (79991234567)
+_PHONE_NO_PLUS_PATTERN = re.compile(r"\b7[0-9]{10}\b")
+# api_hash in tracebacks: api_hash='b18441a1ff607e10a989891a5462e627'
+_API_HASH_PATTERN = re.compile(r"api_hash\s*[=:]\s*['\"]?[0-9a-fA-F]{32}['\"]?", re.IGNORECASE)
 
 
 def sanitize_error(error_text: str) -> str:
@@ -142,6 +146,9 @@ def sanitize_error(error_text: str) -> str:
     text = _PROXY_PATTERN.sub(r"\1\2\3:***:***", text)
     # Mask credentials in URI format (user:pass@host)
     text = _CREDENTIAL_URI_PATTERN.sub(r"://***:***@", text)
+    # Mask api_hash (32-char hex in tracebacks)
+    text = _API_HASH_PATTERN.sub("api_hash=[MASKED]", text)
     # Mask phone numbers
     text = _PHONE_PATTERN.sub("[phone]", text)
+    text = _PHONE_NO_PLUS_PATTERN.sub("[phone]", text)
     return text

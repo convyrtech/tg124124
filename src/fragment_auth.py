@@ -840,11 +840,13 @@ class FragmentAuth:
                 cls._original_exception_handler = None
 
             # Close browser
+            _cancelled = None
             if browser_ctx:
                 try:
                     await browser_ctx.close()
                 except BaseException as e:
-                    # BaseException catches CancelledError (Python 3.11+)
+                    if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt)):
+                        _cancelled = e
                     logger.warning("Error closing browser: %s", e)
 
             # Disconnect Telethon
@@ -852,7 +854,13 @@ class FragmentAuth:
                 try:
                     await asyncio.wait_for(client.disconnect(), timeout=5)
                 except BaseException as e:
+                    if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt)) and _cancelled is None:
+                        _cancelled = e
                     logger.debug("Error disconnecting Telethon: %s", e)
+
+            # Re-raise CancelledError after cleanup is complete
+            if _cancelled is not None:
+                raise _cancelled
 
 
 async def fragment_account(

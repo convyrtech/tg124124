@@ -522,15 +522,18 @@ class TGWebAuthApp:
                             # - produces a consistent snapshot even with active connections
                             src_conn = sqlite3.connect(db_file)
                             dst_conn = sqlite3.connect(tmp_path)
-                            src_conn.backup(dst_conn)
-                            src_conn.close()
+                            try:
+                                src_conn.backup(dst_conn)
+                            finally:
+                                src_conn.close()
                             # Sanitize proxy credentials (table may not exist if DB is fresh)
                             try:
                                 dst_conn.execute("UPDATE proxies SET username=NULL, password=NULL")
                                 dst_conn.commit()
                             except sqlite3.OperationalError:
                                 pass  # Table doesn't exist yet — OK
-                            dst_conn.close()
+                            finally:
+                                dst_conn.close()
                             zf.write(tmp_path, "tgwebauth_sanitized.db")
                         except Exception as e:
                             logger.warning("DB copy for diagnostics failed: %s", e)

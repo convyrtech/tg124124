@@ -136,6 +136,43 @@ class TestCheckProxyTelegram:
         finally:
             await db.close()
 
+    @pytest.mark.asyncio
+    async def test_long_username_rejected(self):
+        """PH-1: Username > 255 bytes UTF-8 should fail gracefully, not crash."""
+        long_user = "a" * 256  # 256 ASCII bytes > 255 limit
+        with patch("asyncio.open_connection") as mock_conn:
+            reader = AsyncMock()
+            writer = AsyncMock()
+            mock_conn.return_value = (reader, writer)
+
+            # Proxy greeting: choose username/password auth
+            reader.readexactly = AsyncMock(return_value=b"\x05\x02")
+
+            success, error = await check_proxy_telegram(
+                "127.0.0.1", 1080, username=long_user, password="pass", timeout=5
+            )
+
+            assert success is False
+            assert "255" in error
+
+    @pytest.mark.asyncio
+    async def test_long_password_rejected(self):
+        """PH-1: Password > 255 bytes UTF-8 should fail gracefully."""
+        long_pass = "п" * 128  # Cyrillic 'п' is 2 bytes UTF-8, 128*2 = 256 bytes
+        with patch("asyncio.open_connection") as mock_conn:
+            reader = AsyncMock()
+            writer = AsyncMock()
+            mock_conn.return_value = (reader, writer)
+
+            reader.readexactly = AsyncMock(return_value=b"\x05\x02")
+
+            success, error = await check_proxy_telegram(
+                "127.0.0.1", 1080, username="user", password=long_pass, timeout=5
+            )
+
+            assert success is False
+            assert "255" in error
+
 
 class TestCheckProxyBatch:
     @pytest_asyncio.fixture

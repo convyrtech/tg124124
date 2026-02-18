@@ -602,7 +602,7 @@ class BrowserManager:
             logger.warning("Profile '%s' has stale active browser, closing first", profile.name)
             try:
                 await asyncio.wait_for(old_ctx.close(), timeout=20)
-            except Exception as e:
+            except BaseException as e:
                 logger.warning("Force-closing stale browser for '%s': %s", profile.name, e)
                 # FIX: Stop zombie relay if browser close failed
                 if old_ctx._proxy_relay:
@@ -611,6 +611,9 @@ class BrowserManager:
                     except Exception:
                         pass
                 self._active_browsers.pop(profile.name, None)
+                # Re-raise CancelledError — outer except BaseException handles cleanup
+                if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt)):
+                    raise
 
         # Hot/cold lifecycle: decompress if needed, evict LRU if at capacity
         # Protected set includes active browsers AND the current profile being launched
@@ -756,14 +759,19 @@ class BrowserManager:
 
     async def close_all(self):
         """Закрывает все активные браузеры"""
+        _cancelled = None
         for name, ctx in list(self._active_browsers.items()):
             try:
                 await ctx.close()
-            except Exception as e:
+            except BaseException as e:
+                if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt)) and _cancelled is None:
+                    _cancelled = e
                 logger.warning("Error closing %s: %s", name, e)
         self._active_browsers.clear()
         # Prune profile locks to prevent unbounded memory growth over 1000+ accounts
         self._profile_locks.clear()
+        if _cancelled is not None:
+            raise _cancelled
 
 
 class BrowserContext:

@@ -541,7 +541,9 @@ class MigrationWorkerPool:
                 await self._complete_migration_safe(migration_id, name, success=False, error_message=error_msg)
             elif self._mode == "fragment":
                 await self._update_fragment_status_safe(account_id, name, "error", error_msg)
-            self._circuit_breaker.record_failure()
+            # Only record infrastructure failures in circuit breaker.
+            if self._is_retryable(error_msg):
+                self._circuit_breaker.record_failure()
             if probe_acquired:
                 self._circuit_breaker.release_half_open_probe()
             return await self._maybe_retry(account_id, name, error_msg, retries)
