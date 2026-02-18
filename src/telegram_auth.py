@@ -1422,9 +1422,12 @@ class TelegramAuth:
 
         return None
 
-    async def _accept_token(self, client: TelegramClient, token: bytes) -> bool:
+    async def _accept_token(self, client: TelegramClient, token: bytes) -> tuple[bool, str | None]:
         """
         Отправляет acceptLoginToken для авторизации браузера с FloodWaitError handling.
+
+        Returns:
+            Tuple (success, error_reason). error_reason is None on success.
 
         Реализует:
         - FloodWaitError handling: returns False so outer loop fetches fresh QR
@@ -1441,7 +1444,7 @@ class TelegramAuth:
                 logger.info(f"Accepting login token (attempt {attempt + 1}/{max_retries})...")
                 result = await client(AcceptLoginTokenRequest(token=token))
                 logger.info(f"Token accepted! Authorization: {type(result).__name__}")
-                return True
+                return True, None
 
             except FloodWaitError as e:
                 wait_time = e.seconds
@@ -1454,7 +1457,7 @@ class TelegramAuth:
                 # QR tokens expire in ~30s. After any FloodWait, the token is
                 # definitely stale. Return False so the outer retry loop
                 # (_extract_qr_token_with_retry) fetches a fresh QR code.
-                return False
+                return False, f"FloodWait: Telegram requires waiting {wait_time}s before next attempt"
 
             except Exception as e:
                 error_str = str(e).upper()
@@ -1463,7 +1466,7 @@ class TelegramAuth:
                 non_retryable = ("EXPIRED", "ALREADY_ACCEPTED", "INVALID")
                 if any(keyword in error_str for keyword in non_retryable):
                     logger.warning("Token error (non-retryable): %s — need fresh QR", e)
-                    return False
+                    return False, f"Token error: {e}"
 
                 # Exponential backoff для других ошибок
                 delay = base_delay * (2**attempt) + random.uniform(0, 3)
@@ -1475,7 +1478,7 @@ class TelegramAuth:
                     await asyncio.sleep(delay)
 
         logger.error("Failed to accept token after all retries")
-        return False
+        return False, "Failed to accept token after all retries"
 
     async def _wait_for_auth_complete(self, page, timeout: int = AUTH_WAIT_TIMEOUT) -> tuple[bool, bool]:
         """
@@ -1982,10 +1985,14 @@ class TelegramAuth:
 
             # 5. Подтверждаем токен через Telethon
             self._status("[5/6] Accepting login token...")
-            accepted = await self._accept_token(client, token)
+            accepted, accept_error = await self._accept_token(client, token)
 
             if not accepted:
-                return AuthResult(success=False, profile_name=profile.name, error="Failed to accept login token")
+                return AuthResult(
+                    success=False,
+                    profile_name=profile.name,
+                    error=accept_error or "Failed to accept login token",
+                )
 
             # Обновляем страницу чтобы браузер увидел авторизацию
             await asyncio.sleep(2)  # Даём время на синхронизацию

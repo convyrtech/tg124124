@@ -349,9 +349,19 @@ async def check_proxy_batch(
         if progress_callback:
             progress_callback(counters["completed"], total, result)
 
-    # FIX: return_exceptions=True prevents one failed check (e.g. DB error)
+    # return_exceptions=True prevents one failed check (e.g. DB error)
     # from aborting all remaining proxy checks.
-    await asyncio.gather(*[_check_one(p) for p in proxies], return_exceptions=True)
+    results = await asyncio.gather(*[_check_one(p) for p in proxies], return_exceptions=True)
+
+    # Log any exceptions that were silently captured by gather
+    errors = 0
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            errors += 1
+            if errors <= 5:  # Limit log spam
+                logger.warning("Proxy check error for proxy #%d: %s", proxies[i].id, result)
+    if errors > 5:
+        logger.warning("... and %d more proxy check errors", errors - 5)
 
     return {
         "total": total,

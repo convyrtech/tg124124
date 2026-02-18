@@ -193,11 +193,19 @@ class Database:
 
     async def connect(self) -> None:
         """Open async connection."""
-        self._connection = await aiosqlite.connect(self.db_path)
-        self._connection.row_factory = aiosqlite.Row
-        await self._connection.execute("PRAGMA journal_mode=WAL")
-        await self._connection.execute("PRAGMA busy_timeout=30000")
-        await self._connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            self._connection = await aiosqlite.connect(self.db_path)
+            self._connection.row_factory = aiosqlite.Row
+            await self._connection.execute("PRAGMA journal_mode=WAL")
+            await self._connection.execute("PRAGMA busy_timeout=30000")
+            await self._connection.execute("PRAGMA foreign_keys=ON")
+        except Exception as e:
+            logger.error("Failed to connect to database %s: %s", self.db_path, e)
+            self._connection = None
+            raise RuntimeError(
+                f"Cannot open database: {e}. "
+                "Check disk space, file permissions, and that the path contains only ASCII characters."
+            ) from e
 
     async def close(self) -> None:
         """Close connection."""

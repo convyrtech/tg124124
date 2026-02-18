@@ -682,9 +682,10 @@ class TestFloodWaitHandling:
         # Use side_effect on AsyncMock - this is how to control async callable behavior
         mock_client = AsyncMock(side_effect=create_side_effect)
 
-        result = await auth._accept_token(mock_client, b"test_token")
+        success, error = await auth._accept_token(mock_client, b"test_token")
 
-        assert result is True
+        assert success is True
+        assert error is None
         assert call_count[0] == 2  # First failed, second succeeded
 
     @pytest.mark.asyncio
@@ -702,10 +703,11 @@ class TestFloodWaitHandling:
 
         mock_client = AsyncMock(side_effect=raise_long_flood)
 
-        result = await auth._accept_token(mock_client, b"test_token")
+        success, error = await auth._accept_token(mock_client, b"test_token")
 
         # Should abort, not wait 1 hour
-        assert result is False
+        assert success is False
+        assert error is not None
 
 
 class TestSetAuthorizationTTL:
@@ -910,9 +912,10 @@ class TestAcceptTokenNonRetryable:
             raise Exception("AUTH_TOKEN_EXPIRED")
 
         mock_client = AsyncMock(side_effect=raise_expired)
-        result = await auth._accept_token(mock_client, b"test_token")
+        success, error = await auth._accept_token(mock_client, b"test_token")
 
-        assert result is False
+        assert success is False
+        assert error is not None
         assert call_count[0] == 1  # Only 1 attempt, no retries
 
     @pytest.mark.asyncio
@@ -928,9 +931,10 @@ class TestAcceptTokenNonRetryable:
             raise Exception("AUTH_TOKEN_ALREADY_ACCEPTED")
 
         mock_client = AsyncMock(side_effect=raise_already)
-        result = await auth._accept_token(mock_client, b"test_token")
+        success, error = await auth._accept_token(mock_client, b"test_token")
 
-        assert result is False
+        assert success is False
+        assert error is not None
         assert call_count[0] == 1
 
     @pytest.mark.asyncio
@@ -946,9 +950,10 @@ class TestAcceptTokenNonRetryable:
             raise Exception("AUTH_TOKEN_INVALID")
 
         mock_client = AsyncMock(side_effect=raise_invalid)
-        result = await auth._accept_token(mock_client, b"test_token")
+        success, error = await auth._accept_token(mock_client, b"test_token")
 
-        assert result is False
+        assert success is False
+        assert error is not None
         assert call_count[0] == 1
 
     @pytest.mark.asyncio
@@ -966,9 +971,10 @@ class TestAcceptTokenNonRetryable:
             return MagicMock()
 
         mock_client = AsyncMock(side_effect=raise_then_succeed)
-        result = await auth._accept_token(mock_client, b"test_token")
+        success, error = await auth._accept_token(mock_client, b"test_token")
 
-        assert result is True
+        assert success is True
+        assert error is None
         assert call_count[0] == 3  # 2 failures + 1 success
 
 

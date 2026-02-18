@@ -81,6 +81,8 @@ class TGWebAuthApp:
         self._controller = AppController(self.data_dir)
         self._async_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._async_ready = threading.Event()  # Signals async loop is ready
+        self._async_init_error: str | None = None  # Stores init failure reason
         # Thread-safe queue for UI updates from async code
         self._ui_queue: queue.Queue = queue.Queue()
         # Track active browser contexts for cleanup
@@ -103,19 +105,25 @@ class TGWebAuthApp:
 
     def _start_async_loop(self) -> None:
         """Start async event loop in background thread."""
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
 
-        # Install asyncio crash handler on this loop
-        from ..exception_handler import install_asyncio_handler
+            # Install asyncio crash handler on this loop
+            from ..exception_handler import install_asyncio_handler
 
-        install_asyncio_handler(self._loop)
+            install_asyncio_handler(self._loop)
 
-        # Initialize controller
-        self._loop.run_until_complete(self._controller.initialize())
+            # Initialize controller
+            self._loop.run_until_complete(self._controller.initialize())
+            self._async_ready.set()
 
-        # Keep loop running
-        self._loop.run_forever()
+            # Keep loop running
+            self._loop.run_forever()
+        except Exception as e:
+            logger.critical("Async loop init failed: %s", e, exc_info=True)
+            self._async_init_error = str(e)
+            self._async_ready.set()  # Unblock main thread even on failure
 
     def _run_async(self, coro) -> None:
         """Schedule coroutine on async loop."""
@@ -244,8 +252,14 @@ class TGWebAuthApp:
         self._async_thread = threading.Thread(target=self._start_async_loop, daemon=True)
         self._async_thread.start()
 
-        # Give it time to initialize
-        time.sleep(0.5)
+        # Wait for async loop to initialize (up to 10s)
+        self._async_ready.wait(timeout=10)
+        if self._async_init_error:
+            from ..utils import sanitize_error
+            err = sanitize_error(self._async_init_error)
+            logger.critical("Cannot start: async init failed: %s", err)
+            print(f"FATAL: Failed to initialize: {err}", file=sys.stderr)
+            # Continue to show GUI with error message displayed to user
 
         dpg.create_context()
 
@@ -485,18 +499,29 @@ class TGWebAuthApp:
                 zip_path = APP_ROOT / zip_name
 
                 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    # app.log (last 5000 lines)
+                    # app.log (last 5000 lines) + rotated logs
+                    from ..utils import sanitize_error
+
                     log_file = LOGS_DIR / "app.log"
                     if log_file.exists():
                         try:
-                            from ..utils import sanitize_error
-
                             lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
                             sanitized_lines = [sanitize_error(line) for line in lines[-5000:]]
                             zf.writestr("app.log", "\n".join(sanitized_lines))
                         except Exception as e:
                             logger.warning("Diagnostics: failed to collect app.log: %s", e)
                             zf.writestr("app.log.error", f"Could not include app.log: {e}")
+
+                    # Include rotated log files (app.log.1 .. app.log.5)
+                    for i in range(1, 6):
+                        rotated = LOGS_DIR / f"app.log.{i}"
+                        if rotated.exists():
+                            try:
+                                rot_lines = rotated.read_text(encoding="utf-8", errors="replace").splitlines()
+                                sanitized_rot = [sanitize_error(line) for line in rot_lines[-5000:]]
+                                zf.writestr(f"app.log.{i}", "\n".join(sanitized_rot))
+                            except Exception as e:
+                                logger.warning("Diagnostics: failed to collect app.log.%d: %s", i, e)
 
                     # last_crash.txt (sanitized)
                     crash_file = LOGS_DIR / "last_crash.txt"
@@ -678,9 +703,15 @@ class TGWebAuthApp:
             self._initial_load()
         except Exception as e:
             logger.exception("2FA skip error: %s", e)
+            self._log(f"[Error] 2FA skip: {_se(str(e))}")
 
     def _initial_load(self) -> None:
         """Load accounts, proxies, and stats on startup."""
+        if self._async_init_error:
+            from ..utils import sanitize_error
+            self._log(f"[FATAL] Initialization failed: {sanitize_error(self._async_init_error)}")
+            self._log("[FATAL] Check disk space, permissions, and antivirus settings")
+            return
 
         async def do_load():
             try:
@@ -1136,6 +1167,7 @@ class TGWebAuthApp:
                 except Exception as e:
                     from ..utils import sanitize_error as _sanitize
 
+                    logger.exception("Migration error for %s: %s", account.name, _sanitize(str(e)))
                     await self._controller.db.update_account(
                         account_id, status="error", error_message=_sanitize(str(e))
                     )
@@ -1225,14 +1257,23 @@ class TGWebAuthApp:
                         )
                     else:
                         self._log(f"[Fragment] {account.name} - FAILED: {_se(result.error)}")
+                        await self._controller.db.update_account(
+                            account_id, fragment_status="error", error_message=_se(result.error)
+                        )
                 finally:
                     await browser_manager.close_all()
 
                 self._schedule_ui(lambda: self._refresh_table_async())
 
             except Exception as e:
-                logger.exception("Fragment error: %s", e)
+                logger.exception("Fragment error for %s: %s", account.name, e)
                 self._log(f"[Error] Fragment: {_se(str(e))}")
+                try:
+                    await self._controller.db.update_account(
+                        account_id, fragment_status="error", error_message=_se(str(e))
+                    )
+                except Exception as db_err:
+                    logger.warning("Failed to mark fragment_status=error for %d: %s", account_id, db_err)
             finally:
                 self._busy_ops.discard(op_key)
 
