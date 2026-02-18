@@ -894,6 +894,7 @@ class BrowserContext:
         else:
             logger.debug("Skipping storage state save for '%s' (save_state_on_close=False)", self.profile.name)
 
+        _cancelled = None
         try:
             await asyncio.wait_for(self._camoufox.__aexit__(None, None, None), timeout=self.CLOSE_TIMEOUT)
         except TimeoutError:
@@ -903,9 +904,11 @@ class BrowserContext:
                 self._browser_pid,
             )
             self._force_kill_by_pid()
-        except Exception as e:
+        except BaseException as e:
             logger.warning("Error during browser exit: %s — force killing PID %s", e, self._browser_pid)
             self._force_kill_by_pid()
+            if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt)):
+                _cancelled = e
 
         if self._proxy_relay:
             try:
@@ -917,6 +920,9 @@ class BrowserContext:
             self._manager._active_browsers.pop(self.profile.name, None)
 
         logger.info("Browser closed for '%s'", self.profile.name)
+
+        if _cancelled is not None:
+            raise _cancelled
 
     async def __aenter__(self):
         return self

@@ -523,15 +523,16 @@ class TGWebAuthApp:
                             src_conn = sqlite3.connect(db_file)
                             dst_conn = sqlite3.connect(tmp_path)
                             try:
-                                src_conn.backup(dst_conn)
-                            finally:
-                                src_conn.close()
-                            # Sanitize proxy credentials (table may not exist if DB is fresh)
-                            try:
-                                dst_conn.execute("UPDATE proxies SET username=NULL, password=NULL")
-                                dst_conn.commit()
-                            except sqlite3.OperationalError:
-                                pass  # Table doesn't exist yet — OK
+                                try:
+                                    src_conn.backup(dst_conn)
+                                finally:
+                                    src_conn.close()
+                                # Sanitize proxy credentials (table may not exist if DB is fresh)
+                                try:
+                                    dst_conn.execute("UPDATE proxies SET username=NULL, password=NULL")
+                                    dst_conn.commit()
+                                except sqlite3.OperationalError:
+                                    pass  # Table doesn't exist yet — OK
                             finally:
                                 dst_conn.close()
                             zf.write(tmp_path, "tgwebauth_sanitized.db")
@@ -1129,8 +1130,8 @@ class TGWebAuthApp:
                         if result.user_info:
                             self._log(f"[Migrate] Username: @{result.user_info.get('username', 'N/A')}")
                     else:
-                        await self._controller.db.update_account(account_id, status="error", error_message=result.error)
-                        self._log(f"[Migrate] {account.name} - FAILED: {result.error}")
+                        await self._controller.db.update_account(account_id, status="error", error_message=_se(result.error))
+                        self._log(f"[Migrate] {account.name} - FAILED: {_se(result.error)}")
 
                 except Exception as e:
                     from ..utils import sanitize_error as _sanitize
@@ -1223,7 +1224,7 @@ class TGWebAuthApp:
                             web_last_verified=datetime.now(UTC).isoformat(),
                         )
                     else:
-                        self._log(f"[Fragment] {account.name} - FAILED: {result.error}")
+                        self._log(f"[Fragment] {account.name} - FAILED: {_se(result.error)}")
                 finally:
                     await browser_manager.close_all()
 
