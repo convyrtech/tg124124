@@ -1137,6 +1137,9 @@ class TGWebAuthApp:
                 # Build proxy string from DB if available
                 proxy_str = await self._build_proxy_string(account)
 
+                if proxy_str is None and account.proxy_id is None:
+                    self._log(f"[Warning] {account.name}: прокси не назначен — миграция пойдёт с реальным IP!")
+
                 # Call migrate_account directly (not via CLI!)
                 try:
                     result = await migrate_account(
@@ -1603,6 +1606,91 @@ class TGWebAuthApp:
             self._last_table_refresh = now
             self._schedule_ui(lambda: self._refresh_table_async())
 
+
+    async def _preflight_check_proxies(self, account_ids: list[int], mode: str = "Migrate") -> bool:
+        """Pre-flight check: ensure all batch accounts have live proxies.
+
+        Args:
+            account_ids: IDs of accounts to check.
+            mode: "Migrate" or "Fragment" for log prefix.
+
+        Returns:
+            True if all clear, False if batch should be aborted.
+        """
+        all_accounts = await self._controller.db.list_accounts()
+        all_proxies = await self._controller.db.list_proxies()
+        proxy_map = {p.id: p for p in all_proxies}
+
+        batch_set = set(account_ids)
+        batch_accounts = [a for a in all_accounts if a.id in batch_set]
+
+        no_proxy: list[str] = []
+        dead_proxy: list[str] = []
+
+        for a in batch_accounts:
+            if a.proxy_id is None:
+                no_proxy.append(a.name)
+            elif a.proxy_id in proxy_map:
+                if proxy_map[a.proxy_id].status == "dead":
+                    dead_proxy.append(a.name)
+            else:
+                # proxy_id references missing proxy record
+                no_proxy.append(a.name)
+
+        if not no_proxy and not dead_proxy:
+            return True
+
+        if no_proxy:
+            names_preview = ", ".join(no_proxy[:5])
+            suffix = f" и ещё {len(no_proxy) - 5}" if len(no_proxy) > 5 else ""
+            self._log(
+                f"[{mode}] ОСТАНОВЛЕНО: {len(no_proxy)} аккаунтов без прокси: {names_preview}{suffix}"
+            )
+
+        if dead_proxy:
+            names_preview = ", ".join(dead_proxy[:5])
+            suffix = f" и ещё {len(dead_proxy) - 5}" if len(dead_proxy) > 5 else ""
+            self._log(
+                f"[{mode}] ОСТАНОВЛЕНО: {len(dead_proxy)} аккаунтов с мёртвым прокси: {names_preview}{suffix}"
+            )
+
+        self._log(f"[{mode}] Нажмите 'Auto-Assign Proxies' или импортируйте прокси перед запуском")
+        return False
+
+    async def _quick_auto_assign(self, account_ids: list[int], mode: str = "Migrate") -> int:
+        """Quick auto-assign free proxies to batch accounts without proxies.
+
+        Unlike _auto_assign_proxies (button handler), this is a lightweight
+        pre-batch step: no UI refresh, no dead-proxy unlinking.
+
+        Args:
+            account_ids: IDs of accounts to check and assign.
+            mode: "Migrate" or "Fragment" for log prefix.
+
+        Returns:
+            Number of proxies assigned.
+        """
+        all_accounts = await self._controller.db.list_accounts()
+        batch_set = set(account_ids)
+
+        needs_proxy = [a for a in all_accounts if a.id in batch_set and a.proxy_id is None]
+        if not needs_proxy:
+            return 0
+
+        assigned = 0
+        for a in needs_proxy:
+            proxy = await self._controller.db.get_free_proxy()
+            if not proxy:
+                break  # No more free proxies available
+            try:
+                await self._controller.db.assign_proxy(a.id, proxy.id)
+                assigned += 1
+                self._log(f"[{mode}] Авто-назначен прокси: {a.name} <- {proxy.host}:{proxy.port}")
+            except ValueError:
+                continue  # Proxy race — skip
+
+        return assigned
+
     async def _batch_migrate(self, account_ids: list) -> None:
         """Batch migrate accounts using parallel worker pool."""
         # FIX: Filter out accounts with active single-migrate/fragment ops
@@ -1622,6 +1710,27 @@ class TGWebAuthApp:
             self._active_pool = None
             self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
             return
+
+        # Auto-assign free proxies to accounts without them
+        auto_count = await self._quick_auto_assign(account_ids, mode="Migrate")
+        if auto_count > 0:
+            self._log(f"[Migrate] Автоматически назначено {auto_count} прокси")
+
+        # Pre-flight: verify all accounts have live proxies
+        preflight_ok = await self._preflight_check_proxies(account_ids, mode="Migrate")
+        if not preflight_ok:
+            self._active_pool = None
+            self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+            return
+
+        # Canary warning for large batches
+        if len(account_ids) > 100:
+            self._log(
+                f"[Migrate] Внимание: {len(account_ids)} аккаунтов в батче. "
+                "Рекомендуется сначала запустить пробный прогон на 50 аккаунтах "
+                "через 'Migrate Selected', чтобы убедиться что всё работает."
+            )
+
         self._schedule_ui(lambda: self._set_batch_buttons_enabled(False))
         try:
             from ..worker_pool import MigrationWorkerPool
@@ -1712,6 +1821,19 @@ class TGWebAuthApp:
             self._active_pool = None
             self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
             return
+
+        # Auto-assign free proxies to accounts without them
+        auto_count = await self._quick_auto_assign(account_ids, mode="Fragment")
+        if auto_count > 0:
+            self._log(f"[Fragment] Автоматически назначено {auto_count} прокси")
+
+        # Pre-flight: verify all accounts have live proxies
+        preflight_ok = await self._preflight_check_proxies(account_ids, mode="Fragment")
+        if not preflight_ok:
+            self._active_pool = None
+            self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
+            return
+
         self._schedule_ui(lambda: self._set_batch_buttons_enabled(False))
         try:
             from ..worker_pool import MigrationWorkerPool
