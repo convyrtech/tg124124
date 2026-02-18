@@ -20,7 +20,7 @@
 
 Масштаб: **1000 аккаунтов**, переносимость между ПК.
 
-## Current Status (2026-02-16)
+## Current Status (2026-02-18)
 
 ### Что работает
 - Programmatic QR Login (без ручного сканирования)
@@ -58,8 +58,11 @@
 - web_last_verified + auth_ttl_days written on successful migration
 - Empty state UX in GUI table ("Нет аккаунтов. Нажмите Import Sessions")
 - Corrupt session handling (sqlite3.DatabaseError → readable Russian message)
-- Error sanitization in diagnostics ZIP and GUI error messages
-- 457 тестов проходят
+- Error sanitization in diagnostics ZIP and GUI error messages (all `{e}` wrapped in sanitize_error)
+- Non-blocking DB init and storage_state save (run_in_executor)
+- sanitize_error catches pproxy `#` format and bare `user:pass@host`
+- CancelledError handled in all 5 finally blocks (BaseException, not Exception)
+- 463 теста проходят
 
 ### Pre-production Audit (2026-02-12, commit ee5957b)
 6 критических багов найдены и исправлены:
@@ -113,8 +116,20 @@ P1 portability + data integrity fixes:
 - **exception_handler.py** — sanitize_error() in _excepthook + _asyncio_exception_handler
 - 9 new tests (proxy parser, SOCKS5 limits, sanitize patterns ×6)
 
+### Final Bug Sweep Phase 4 (2026-02-18, commit b7498b8)
+All P0 and P1 bugs resolved (463 tests):
+- **P0-4: CancelledError in 5 finally blocks** — `except Exception` → `except BaseException` in authorize() ×2, _check_page_state, ParallelMigrationController.run, migrate_accounts_parallel
+- **P1-8: sanitize_error() regex gaps** — added `_PPROXY_HASH_PATTERN` (socks5://h:p#u:p) and `_BARE_CRED_AT_PATTERN` (u:p@host)
+- **P1-7: 7 raw {e} in GUI/CLI** — all wrapped in sanitize_error()/_se()
+- **P1-11: Blocking json.dump** — save_storage_state() → run_in_executor
+- **P1-12: Blocking sqlite3.connect(30s)** — Database.initialize() → run_in_executor
+- **P1-2, P1-5 verified already fixed** in previous phases
+- 6 new tests (double-cancel ×3, sanitize pproxy/bare/hostname)
+
 ### Что НЕ работает / НЕ доделано
 - **FIX-005** - 2FA selector hardcoded (P2)
+- **P1-3** - Mixed local/UTC timestamps (cosmetic, timestamps used for display only)
+- **P1-10** - Blocking socket.connect() in ProxyRelay (1s, mitigated by retry)
 - **psutil.cpu_percent** - первый вызов возвращает 0.0 (P3, cosmetic)
 - **find_free_port TOCTOU** — порт может быть занят между bind и pproxy startup (P3, retry handles it)
 
@@ -200,7 +215,7 @@ tg-web-auth/
 │       ├── app.py           # DearPyGui main window + diagnostics (1999 строк)
 │       ├── controllers.py   # GUI business logic (299 строк)
 │       └── theme.py         # Hacker dark green theme (99 строк)
-├── tests/                   # 425 тестов
+├── tests/                   # 463 теста
 │   ├── test_telegram_auth.py
 │   ├── test_fragment_auth.py
 │   ├── test_browser_manager.py
