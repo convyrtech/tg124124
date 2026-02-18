@@ -51,7 +51,12 @@ def _excepthook(exc_type, exc_value, exc_tb) -> None:
         sys.__excepthook__(exc_type, exc_value, exc_tb)
         return
 
-    logger.critical("Unhandled exception: %s: %s", exc_type.__name__, exc_value, exc_info=(exc_type, exc_value, exc_tb))
+    logger.critical(
+        "Unhandled exception: %s: %s",
+        exc_type.__name__,
+        sanitize_error(str(exc_value)),
+        exc_info=(exc_type, exc_value, exc_tb),
+    )
     _write_crash_file(exc_type, exc_value, exc_tb)
 
 
@@ -64,7 +69,7 @@ def _asyncio_exception_handler(loop, context) -> None:
         logger.error(
             "Asyncio unhandled: %s — %s",
             message,
-            exception,
+            sanitize_error(str(exception)),
             exc_info=(type(exception), exception, exception.__traceback__),
         )
         _write_crash_file(type(exception), exception, exception.__traceback__)

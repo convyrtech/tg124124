@@ -913,7 +913,9 @@ class BrowserContext:
         if self._proxy_relay:
             try:
                 await self._proxy_relay.stop()
-            except Exception as e:
+            except BaseException as e:
+                if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt)) and _cancelled is None:
+                    _cancelled = e
                 logger.warning("Error stopping proxy relay: %s", e)
 
         if self._manager:
