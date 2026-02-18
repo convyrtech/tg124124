@@ -59,7 +59,7 @@
 - Empty state UX in GUI table ("Нет аккаунтов. Нажмите Import Sessions")
 - Corrupt session handling (sqlite3.DatabaseError → readable Russian message)
 - Error sanitization in diagnostics ZIP and GUI error messages
-- 425 тестов проходят
+- 457 тестов проходят
 
 ### Pre-production Audit (2026-02-12, commit ee5957b)
 6 критических багов найдены и исправлены:
@@ -168,7 +168,7 @@ Camoufox → fragment.com → Click "Log in"
 Browser ──HTTP──> pproxy (localhost:random) ──SOCKS5+auth──> Remote Proxy
 ```
 
-## File Structure (12488 строк src/, 425 тестов)
+## File Structure (12488 строк src/, 457 тестов)
 ```
 tg-web-auth/
 ├── accounts/                # Исходные session файлы (.gitignore)
@@ -289,7 +289,7 @@ python -m src.gui.app                                  # Запуск GUI
 
 ### Тесты
 ```bash
-pytest                    # Все 425 тестов
+pytest                    # Все 457 тестов
 pytest -v                 # Verbose
 pytest tests/test_proxy_manager.py -v  # Конкретный файл
 ```
@@ -346,7 +346,7 @@ operation_log (id, account_id, operation, success, error_message,
 ## Quality Gates
 
 ### Перед завершением любой задачи
-1. [ ] `pytest` проходит без ошибок (425 тестов)
+1. [ ] `pytest` проходит без ошибок (457 тестов)
 2. [ ] Self-review на типичные ошибки
 3. [ ] Нет секретов в логах
 4. [ ] Все ресурсы закрываются (async with, try/finally)

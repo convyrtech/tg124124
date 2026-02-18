@@ -1217,3 +1217,402 @@ class TestSafeDisconnect:
 
         # Should return within ~5s timeout, not hang
         await TelegramAuth._safe_disconnect(mock_client)
+
+
+# ============================================================================
+# Tests for _check_page_state() — DOM state detection (10 tests)
+# ============================================================================
+
+
+class TestCheckPageState:
+    """Tests for TelegramAuth._check_page_state DOM state detection.
+
+    This method is ~190 lines with 10+ branches. Tests verify each
+    return path: dead, authorized (5 methods), 2fa_required, qr_login,
+    loading, unknown.
+    """
+
+    @pytest.fixture
+    def auth_instance(self, tmp_path):
+        """Create a TelegramAuth instance with mocked dependencies."""
+        from src.telegram_auth import TelegramAuth, AccountConfig
+
+        account_dir = tmp_path / "test_account"
+        account_dir.mkdir()
+        (account_dir / "session.session").write_bytes(b"fake")
+        (account_dir / "api.json").write_text('{"api_id": 123, "api_hash": "abc"}')
+        account = AccountConfig.load(account_dir)
+        auth = TelegramAuth(account, browser_manager=MagicMock())
+        return auth
+
+    def _make_page(self, *, url="https://web.telegram.org/k/", evaluate_ok=True,
+                   query_results=None, inner_text="", js_session=False):
+        """Build a mock Playwright page object.
+
+        Args:
+            url: page.url value.
+            evaluate_ok: if False, evaluate("1") raises "target closed".
+            query_results: dict mapping CSS selector substrings to mock elements.
+                           Use True for a visible element, False for None.
+            inner_text: text returned by page.inner_text("body").
+            js_session: value returned by JS session check evaluate.
+        """
+        page = AsyncMock()
+        page.url = url
+
+        if not evaluate_ok:
+            async def _eval(expr):
+                if expr == "1":
+                    raise Exception("target closed")
+                return js_session
+            page.evaluate = AsyncMock(side_effect=_eval)
+        else:
+            async def _eval(expr):
+                if expr == "1":
+                    return 1
+                # JS session check returns js_session
+                return js_session
+            page.evaluate = AsyncMock(side_effect=_eval)
+
+        # Build query_selector behavior
+        query_results = query_results or {}
+
+        async def _query_selector(selector):
+            for key, value in query_results.items():
+                if key in selector:
+                    if value is True:
+                        elem = AsyncMock()
+                        elem.is_visible = AsyncMock(return_value=True)
+                        return elem
+                    elif value is False:
+                        return None
+                    else:
+                        return value  # Custom mock element
+            return None
+
+        page.query_selector = AsyncMock(side_effect=_query_selector)
+        page.inner_text = AsyncMock(return_value=inner_text)
+        page.content = AsyncMock(return_value="<html></html>")
+        return page
+
+    @pytest.mark.asyncio
+    async def test_dead_browser_target_closed(self, auth_instance):
+        """Browser crash (target closed) returns 'dead'."""
+        page = self._make_page(evaluate_ok=False)
+        result = await auth_instance._check_page_state(page)
+        assert result == "dead"
+
+    @pytest.mark.asyncio
+    async def test_authorized_chat_items_visible(self, auth_instance):
+        """Visible chat items (data-peer-id) → authorized."""
+        page = self._make_page(query_results={"data-peer-id": True})
+        result = await auth_instance._check_page_state(page)
+        assert result == "authorized"
+
+    @pytest.mark.asyncio
+    async def test_authorized_columns_sidebar(self, auth_instance):
+        """Visible sidebar/columns → authorized."""
+        page = self._make_page(query_results={"#column-left": True})
+        result = await auth_instance._check_page_state(page)
+        assert result == "authorized"
+
+    @pytest.mark.asyncio
+    async def test_authorized_url_pattern_at(self, auth_instance):
+        """URL containing @ → authorized."""
+        page = self._make_page(url="https://web.telegram.org/k/#@username")
+        result = await auth_instance._check_page_state(page)
+        assert result == "authorized"
+
+    @pytest.mark.asyncio
+    async def test_authorized_js_session_check(self, auth_instance):
+        """JS evaluate returns True → authorized."""
+        page = self._make_page(js_session=True)
+        result = await auth_instance._check_page_state(page)
+        assert result == "authorized"
+
+    @pytest.mark.asyncio
+    async def test_2fa_password_input_visible(self, auth_instance):
+        """Visible password input → 2fa_required."""
+        page = self._make_page(query_results={"input[type=\"password\"]": True})
+        result = await auth_instance._check_page_state(page)
+        assert result == "2fa_required"
+
+    @pytest.mark.asyncio
+    async def test_2fa_text_content(self, auth_instance):
+        """Body text containing 'Enter Your Password' → 2fa_required."""
+        page = self._make_page(inner_text="Please Enter Your Password to continue")
+        result = await auth_instance._check_page_state(page)
+        assert result == "2fa_required"
+
+    @pytest.mark.asyncio
+    async def test_qr_login_canvas_with_text(self, auth_instance):
+        """Visible canvas + QR-related text → qr_login."""
+        page = self._make_page(
+            query_results={"canvas": True},
+            inner_text="Scan this QR code to log in",
+        )
+        result = await auth_instance._check_page_state(page)
+        assert result == "qr_login"
+
+    @pytest.mark.asyncio
+    async def test_loading_spinner_visible(self, auth_instance):
+        """Visible spinner → loading."""
+        page = self._make_page(query_results={"spinner": True})
+        result = await auth_instance._check_page_state(page)
+        assert result == "loading"
+
+    @pytest.mark.asyncio
+    async def test_unknown_nothing_found(self, auth_instance):
+        """No elements found → unknown."""
+        page = self._make_page()
+        result = await auth_instance._check_page_state(page)
+        assert result == "unknown"
+
+
+# ============================================================================
+# Tests for authorize() — branch coverage (11 tests)
+# ============================================================================
+
+
+class TestAuthorizeFlow:
+    """Tests for TelegramAuth.authorize() branching logic.
+
+    This is the main 400-line method (~20 branches). Tests mock internal
+    methods (_create_telethon_client, _check_page_state, etc.) to exercise
+    each major code path and verify the returned AuthResult.
+    """
+
+    @pytest.fixture
+    def auth_setup(self, tmp_path):
+        """Create TelegramAuth with all internal methods mocked.
+
+        Returns (auth, mocks_dict) where mocks_dict contains all mocked methods
+        for fine-grained control in individual tests.
+        """
+        from src.telegram_auth import TelegramAuth, AccountConfig
+
+        account_dir = tmp_path / "test_account"
+        account_dir.mkdir()
+        (account_dir / "session.session").write_bytes(b"fake")
+        (account_dir / "api.json").write_text('{"api_id": 123, "api_hash": "abc"}')
+        account = AccountConfig.load(account_dir)
+
+        browser_manager = MagicMock()
+        profile = MagicMock()
+        profile.name = "test_profile"
+        profile.path = tmp_path / "profile"
+        profile.path.mkdir()
+        browser_manager.get_profile.return_value = profile
+
+        auth = TelegramAuth(account, browser_manager=browser_manager)
+
+        # Pre-authorized check (default: not pre-authorized)
+        auth._is_profile_already_authorized = MagicMock(return_value=False)
+
+        # Telethon client mock
+        mock_client = AsyncMock()
+        mock_client.disconnect = AsyncMock()
+        auth._create_telethon_client = AsyncMock(return_value=mock_client)
+
+        # Browser context mock
+        mock_ctx = AsyncMock()
+        mock_ctx._browser_pid = 12345
+        mock_ctx._driver_pid = 12346
+        mock_ctx.save_state_on_close = False
+        mock_page = AsyncMock()
+        mock_page.url = "https://web.telegram.org/k/"
+        mock_page.set_viewport_size = AsyncMock()
+        mock_page.goto = AsyncMock()
+        mock_page.content = AsyncMock(return_value="<html>telegram</html>")
+        mock_page.query_selector = AsyncMock(return_value=MagicMock())
+        mock_page.reload = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_page)
+        mock_ctx.close = AsyncMock()
+        browser_manager.launch = AsyncMock(return_value=mock_ctx)
+
+        # Internal method mocks
+        auth._check_page_state = AsyncMock(return_value="qr_login")
+        auth._extract_qr_token_with_retry = AsyncMock(return_value=b"mock_token")
+        auth._accept_token = AsyncMock(return_value=(True, None))
+        auth._wait_for_auth_complete = AsyncMock(return_value=(True, False))
+        auth._handle_2fa = AsyncMock(return_value=True)
+        auth._set_authorization_ttl = AsyncMock(return_value=True)
+        auth._verify_telethon_session = AsyncMock(return_value=True)
+        auth._get_browser_user_info = AsyncMock(return_value={"name": "Test"})
+
+        mocks = {
+            "client": mock_client,
+            "ctx": mock_ctx,
+            "page": mock_page,
+            "profile": profile,
+        }
+        return auth, mocks
+
+    @pytest.mark.asyncio
+    async def test_pre_authorized_skips_browser(self, auth_setup):
+        """Profile with valid storage_state.json skips browser launch entirely."""
+        auth, mocks = auth_setup
+        auth._is_profile_already_authorized = MagicMock(return_value=True)
+
+        result = await auth.authorize()
+
+        assert result.success is True
+        assert result.profile_name == "test_profile"
+        assert result.required_2fa is False
+        # Browser should NOT be launched
+        auth.browser_manager.launch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_already_authorized_in_browser(self, auth_setup):
+        """Page state 'authorized' after load → success without QR."""
+        auth, mocks = auth_setup
+        auth._check_page_state = AsyncMock(return_value="authorized")
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize()
+
+        assert result.success is True
+        assert result.profile_name == "test_profile"
+        # QR extraction should NOT happen
+        auth._extract_qr_token_with_retry.assert_not_called()
+        # TTL should be set
+        auth._set_authorization_ttl.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dead_browser_returns_failure(self, auth_setup):
+        """Dead browser detected → returns failure."""
+        auth, mocks = auth_setup
+        auth._check_page_state = AsyncMock(return_value="dead")
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize()
+
+        assert result.success is False
+        assert "crash" in result.error.lower() or "closed" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_2fa_with_password_success(self, auth_setup):
+        """2FA required + password provided → handles 2FA → success."""
+        auth, mocks = auth_setup
+        auth._check_page_state = AsyncMock(return_value="2fa_required")
+        auth._handle_2fa = AsyncMock(return_value=True)
+        auth._wait_for_auth_complete = AsyncMock(return_value=(True, False))
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize(password_2fa="my2fapass")
+
+        assert result.success is True
+        assert result.required_2fa is True
+        auth._handle_2fa.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_2fa_wrong_password(self, auth_setup):
+        """2FA required + wrong password → handle_2fa returns False → failure."""
+        auth, mocks = auth_setup
+        auth._check_page_state = AsyncMock(return_value="2fa_required")
+        auth._handle_2fa = AsyncMock(return_value=False)
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize(password_2fa="wrong")
+
+        assert result.success is False
+        assert result.required_2fa is True
+        assert "incorrect" in result.error.lower() or "rejected" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_2fa_no_password_provided(self, auth_setup):
+        """2FA required but no password → waits for manual input."""
+        auth, mocks = auth_setup
+        auth._check_page_state = AsyncMock(return_value="2fa_required")
+        auth._wait_for_auth_complete = AsyncMock(return_value=(False, False))
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize()
+
+        assert result.success is False
+        assert result.required_2fa is True
+        assert "required" in result.error.lower() or "password" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_qr_flow_full_success(self, auth_setup):
+        """Full QR flow: extract → accept → auth complete → success."""
+        auth, mocks = auth_setup
+        # Default setup already has qr_login → token → accept → success
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize()
+
+        assert result.success is True
+        auth._extract_qr_token_with_retry.assert_called_once()
+        auth._accept_token.assert_called_once()
+        auth._set_authorization_ttl.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_qr_extraction_fails(self, auth_setup):
+        """QR token extraction returns None → failure."""
+        auth, mocks = auth_setup
+        auth._extract_qr_token_with_retry = AsyncMock(return_value=None)
+        # Post-QR check also returns qr_login (not authorized or 2fa)
+        auth._check_page_state = AsyncMock(return_value="qr_login")
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize()
+
+        assert result.success is False
+        assert "qr" in result.error.lower() or "token" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_token_rejected(self, auth_setup):
+        """AcceptLoginToken fails → returns error with reason."""
+        auth, mocks = auth_setup
+        auth._accept_token = AsyncMock(return_value=(False, "Token error: EXPIRED"))
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize()
+
+        assert result.success is False
+        assert "EXPIRED" in result.error or "token" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_fatal_proxy_error(self, auth_setup):
+        """Page load with proxy error → raises RuntimeError → failure."""
+        auth, mocks = auth_setup
+        mocks["page"].goto = AsyncMock(side_effect=Exception("net::ERR_PROXY_CONNECTION_FAILED"))
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize()
+
+        assert result.success is False
+        # Should contain proxy-related error message
+        assert "proxy" in result.error.lower() or "err_proxy" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_recovery_reload_then_authorized(self, auth_setup):
+        """Unknown state → recovery reload → authorized."""
+        auth, mocks = auth_setup
+        # First 10 calls return "unknown", then after recovery reload "authorized"
+        call_count = [0]
+
+        async def _check_state(page):
+            call_count[0] += 1
+            if call_count[0] <= 10:
+                return "unknown"
+            return "authorized"
+
+        auth._check_page_state = AsyncMock(side_effect=_check_state)
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize()
+
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_reraises(self, auth_setup):
+        """asyncio.CancelledError during auth → proper cleanup + re-raise."""
+        import asyncio
+        auth, mocks = auth_setup
+        auth._create_telethon_client = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            with pytest.raises(asyncio.CancelledError):
+                await auth.authorize()
