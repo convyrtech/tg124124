@@ -109,86 +109,89 @@ class Database:
         """Create database and tables if not exist."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Use sync sqlite3 for initial schema creation
-        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
-            # Enable WAL mode for better concurrency
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-            except sqlite3.OperationalError:
-                pass  # WAL might already be set or locked
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS accounts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    phone TEXT,
-                    username TEXT,
-                    session_path TEXT NOT NULL UNIQUE,
-                    proxy_id INTEGER REFERENCES proxies(id),
-                    status TEXT DEFAULT 'pending',
-                    last_check TIMESTAMP,
-                    error_message TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE TABLE IF NOT EXISTS proxies (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    host TEXT NOT NULL,
-                    port INTEGER NOT NULL,
-                    username TEXT,
-                    password TEXT,
-                    protocol TEXT DEFAULT 'socks5',
-                    status TEXT DEFAULT 'active',
-                    assigned_account_id INTEGER,
-                    last_check TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(host, port)
-                );
-
-                CREATE TABLE IF NOT EXISTS migrations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id INTEGER REFERENCES accounts(id),
-                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    completed_at TIMESTAMP,
-                    success INTEGER,
-                    error_message TEXT,
-                    profile_path TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
-                CREATE INDEX IF NOT EXISTS idx_proxies_status ON proxies(status);
-
-                CREATE TABLE IF NOT EXISTS batches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    batch_id TEXT UNIQUE NOT NULL,
-                    total_count INTEGER DEFAULT 0,
-                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    finished_at TIMESTAMP
-                );
-
-                CREATE TABLE IF NOT EXISTS operation_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id INTEGER REFERENCES accounts(id),
-                    operation TEXT NOT NULL,
-                    success INTEGER,
-                    error_message TEXT,
-                    details TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-
-            # Safe ALTER TABLE migrations (ignore if column already exists)
-            alter_statements = [
-                "ALTER TABLE accounts ADD COLUMN fragment_status TEXT DEFAULT NULL",
-                "ALTER TABLE accounts ADD COLUMN web_last_verified TIMESTAMP DEFAULT NULL",
-                "ALTER TABLE accounts ADD COLUMN auth_ttl_days INTEGER DEFAULT NULL",
-                "ALTER TABLE migrations ADD COLUMN batch_id INTEGER REFERENCES batches(id)",
-            ]
-            for stmt in alter_statements:
+        def _sync_init(db_path: Path) -> None:
+            # Use sync sqlite3 for initial schema creation
+            with sqlite3.connect(db_path, timeout=30.0) as conn:
+                # Enable WAL mode for better concurrency
                 try:
-                    conn.execute(stmt)
+                    conn.execute("PRAGMA journal_mode=WAL")
                 except sqlite3.OperationalError:
-                    pass  # Column already exists
+                    pass  # WAL might already be set or locked
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS accounts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        phone TEXT,
+                        username TEXT,
+                        session_path TEXT NOT NULL UNIQUE,
+                        proxy_id INTEGER REFERENCES proxies(id),
+                        status TEXT DEFAULT 'pending',
+                        last_check TIMESTAMP,
+                        error_message TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
 
+                    CREATE TABLE IF NOT EXISTS proxies (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        host TEXT NOT NULL,
+                        port INTEGER NOT NULL,
+                        username TEXT,
+                        password TEXT,
+                        protocol TEXT DEFAULT 'socks5',
+                        status TEXT DEFAULT 'active',
+                        assigned_account_id INTEGER,
+                        last_check TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(host, port)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS migrations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        account_id INTEGER REFERENCES accounts(id),
+                        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        completed_at TIMESTAMP,
+                        success INTEGER,
+                        error_message TEXT,
+                        profile_path TEXT
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
+                    CREATE INDEX IF NOT EXISTS idx_proxies_status ON proxies(status);
+
+                    CREATE TABLE IF NOT EXISTS batches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        batch_id TEXT UNIQUE NOT NULL,
+                        total_count INTEGER DEFAULT 0,
+                        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        finished_at TIMESTAMP
+                    );
+
+                    CREATE TABLE IF NOT EXISTS operation_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        account_id INTEGER REFERENCES accounts(id),
+                        operation TEXT NOT NULL,
+                        success INTEGER,
+                        error_message TEXT,
+                        details TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+
+                # Safe ALTER TABLE migrations (ignore if column already exists)
+                alter_statements = [
+                    "ALTER TABLE accounts ADD COLUMN fragment_status TEXT DEFAULT NULL",
+                    "ALTER TABLE accounts ADD COLUMN web_last_verified TIMESTAMP DEFAULT NULL",
+                    "ALTER TABLE accounts ADD COLUMN auth_ttl_days INTEGER DEFAULT NULL",
+                    "ALTER TABLE migrations ADD COLUMN batch_id INTEGER REFERENCES batches(id)",
+                ]
+                for stmt in alter_statements:
+                    try:
+                        conn.execute(stmt)
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _sync_init, self.db_path)
         logger.info("Database initialized: %s", self.db_path)
 
     async def connect(self) -> None:

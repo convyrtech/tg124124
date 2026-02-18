@@ -203,7 +203,7 @@ def migrate(
                 passwords_map = json.load(f)
             click.echo(f"Loaded {len(passwords_map)} passwords from {password_file}")
         except Exception as e:
-            click.echo(f"Error loading password file: {e}")
+            click.echo(f"Error loading password file: {sanitize_error(str(e))}")
             sys.exit(1)
 
     # FIX-2.4: --fresh flag is processed after _resolve_accounts() so we know which accounts failed
@@ -445,7 +445,7 @@ def migrate(
                             shutil.rmtree(profile_dir / "browser_data")
                             deleted += 1
                         except Exception as e:
-                            logger.warning(f"Failed to delete {profile_dir / 'browser_data'}: {e}")
+                            logger.warning(f"Failed to delete {profile_dir / 'browser_data'}: {sanitize_error(str(e))}")
             click.echo(f"Fresh mode: deleted {deleted} browser_data directories (of {len(failed_names)} failed)")
 
         # FIX #8: Безопасное получение пароля (CLI arg or env)
@@ -472,7 +472,7 @@ def migrate(
                 if proxy_map:
                     click.echo(f"DB прокси загружены для {len(proxy_map)} аккаунтов")
             except Exception as e:
-                logger.warning(f"Could not load proxy map from DB: {e}")
+                logger.warning(f"Could not load proxy map from DB: {sanitize_error(str(e))}")
 
         if parallel > 0 or auto_scale:
             # Параллельный режим
@@ -532,7 +532,7 @@ def migrate(
                                 batch_db_id, result.profile_name, result.error or "Unknown error"
                             )
                     except Exception as e:
-                        logger.warning(f"DB update error: {e}")
+                        logger.warning(f"DB update error: {sanitize_error(str(e))}")
 
             async def _run_parallel():
                 await _init_parallel_db()
@@ -579,7 +579,7 @@ def migrate(
                                         batch_db_id, result.profile_name, result.error or "Unknown error"
                                     )
                             except Exception as e:
-                                logger.warning(f"DB update error: {e}")
+                                logger.warning(f"DB update error: {sanitize_error(str(e))}")
 
                     # FIX #6: Используем batch функцию с cooldown
                     return await migrate_accounts_batch(
@@ -1417,7 +1417,7 @@ def preflight():
                             pass
                 except Exception as e:
                     dead_count += 1
-                    logger.debug(f"Preflight session check failed for {acct_dir.name}: {e}")
+                    logger.debug(f"Preflight session check failed for {acct_dir.name}: {sanitize_error(str(e))}")
 
             click.echo(f"  Alive:           {alive_count}/{len(sample_accounts)}")
             if dead_count:

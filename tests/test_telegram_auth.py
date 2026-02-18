@@ -1006,6 +1006,35 @@ class TestParallelMigrationControllerSharedBrowser:
         assert "browser_manager" in captured_kwargs[0]
         assert captured_kwargs[0]["browser_manager"] is not None
 
+    @pytest.mark.asyncio
+    async def test_controller_cleanup_cancelled_error_preserves_results(self, tmp_path):
+        """Lines 2587/2685 fix: CancelledError in browser_manager.close_all()
+        during finally must not lose migration results."""
+        import asyncio
+        from src.telegram_auth import ParallelMigrationController
+
+        controller = ParallelMigrationController(max_concurrent=2, cooldown=0)
+
+        async def mock_migrate(account_dir, **kwargs):
+            await asyncio.sleep(0.01)
+            return AuthResult(success=True, profile_name=account_dir.name)
+
+        dirs = [tmp_path / "acc_1"]
+        for d in dirs:
+            d.mkdir()
+
+        # BrowserManager.close_all() raises CancelledError in finally
+        mock_bm = AsyncMock()
+        mock_bm.close_all = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with patch('src.telegram_auth.migrate_account', side_effect=mock_migrate), \
+             patch('src.telegram_auth.BrowserManager', return_value=mock_bm):
+            results = await controller.run(dirs, headless=True)
+
+        # Results must be preserved despite CancelledError in cleanup
+        assert len(results) == 1
+        assert results[0].success is True
+
 
 class TestParallelMigrationControllerCooldownAfterCompletion:
     """FIX #16: Cooldown happens after migration, not between create_task."""
@@ -1616,3 +1645,52 @@ class TestAuthorizeFlow:
         with patch("src.telegram_auth.BrowserWatchdog"):
             with pytest.raises(asyncio.CancelledError):
                 await auth.authorize()
+
+    @pytest.mark.asyncio
+    async def test_double_cancel_in_finally_still_closes_browser(self, auth_setup):
+        """P0-4 fix: CancelledError during client.disconnect() in finally
+        must NOT prevent browser_ctx.close() from running.
+
+        Scenario:
+        1. authorize() body raises CancelledError → enters finally
+        2. client.disconnect() in finally ALSO raises CancelledError
+        3. With BaseException handler, it's caught → browser_ctx.close() runs
+        4. Original CancelledError re-raises to caller
+        """
+        import asyncio
+        auth, mocks = auth_setup
+
+        # Step 1: _check_page_state raises CancelledError (simulates task cancel)
+        auth._check_page_state = AsyncMock(side_effect=asyncio.CancelledError())
+
+        # Step 2: client.disconnect() also raises CancelledError (double cancel)
+        mocks["client"].disconnect = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            with pytest.raises(asyncio.CancelledError):
+                await auth.authorize()
+
+        # The critical assertion: browser_ctx.close() MUST be called
+        # despite CancelledError from client.disconnect()
+        mocks["ctx"].close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_preauth_cancel_in_disconnect_still_returns_result(self, auth_setup):
+        """Line 1725 fix: CancelledError in client.disconnect() during
+        pre-authorized path must not crash — AuthResult still returned."""
+        import asyncio
+        auth, mocks = auth_setup
+
+        # Pre-authorized path: skip browser, just verify telethon
+        auth._is_profile_already_authorized = MagicMock(return_value=True)
+        auth._verify_telethon_session = AsyncMock(return_value=True)
+        auth._set_authorization_ttl = AsyncMock(return_value=True)
+
+        # client.disconnect() raises CancelledError in finally
+        mocks["client"].disconnect = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with patch("src.telegram_auth.BrowserWatchdog"):
+            result = await auth.authorize()
+
+        # Must still return success despite CancelledError in cleanup
+        assert result.success is True

@@ -203,3 +203,32 @@ class TestSanitizeError:
         result = sanitize_error(text)
         assert "admin" not in result
         assert "secret" not in result
+
+    def test_masks_proxy_colon_format_hostname(self):
+        """P1-8: hostname-based proxy in colon format must be masked."""
+        from src.utils import sanitize_error
+
+        text = "Error: socks5:proxy.example.com:1080:admin:secret123"
+        result = sanitize_error(text)
+        assert "admin" not in result
+        assert "secret123" not in result
+        assert "proxy.example.com:1080" in result
+
+    def test_masks_pproxy_hash_format(self):
+        """P1-8: pproxy URI format with # separator must be masked."""
+        from src.utils import sanitize_error
+
+        text = "Failed relay: socks5://proxy.example.com:1080#admin:secret123"
+        result = sanitize_error(text)
+        assert "admin" not in result
+        assert "secret123" not in result
+        assert "proxy.example.com:1080" in result
+
+    def test_masks_bare_cred_at_host(self):
+        """P1-8: user:pass@host without protocol prefix must be masked."""
+        from src.utils import sanitize_error
+
+        text = "Connection to admin:secret@proxy.example.com:1080 failed"
+        result = sanitize_error(text)
+        assert "admin" not in result
+        assert "secret" not in result

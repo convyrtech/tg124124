@@ -510,7 +510,7 @@ class TGWebAuthApp:
                             zf.writestr("app.log", "\n".join(sanitized_lines))
                         except Exception as e:
                             logger.warning("Diagnostics: failed to collect app.log: %s", e)
-                            zf.writestr("app.log.error", f"Could not include app.log: {e}")
+                            zf.writestr("app.log.error", f"Could not include app.log: {_se(str(e))}")
 
                     # Include rotated log files (app.log.1 .. app.log.5)
                     for i in range(1, 6):

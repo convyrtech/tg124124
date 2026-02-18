@@ -843,11 +843,17 @@ class BrowserContext:
         """Сохраняет storage state (cookies, localStorage) atomically"""
         if self._page and self._page.context:
             state = await self._page.context.storage_state()
-            # Atomic write: write to .tmp, then rename to prevent truncated files
+            # Atomic write in executor to avoid blocking event loop
             tmp_path = Path(str(self.profile.storage_state_path) + ".tmp")
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
-            os.replace(tmp_path, self.profile.storage_state_path)
+            target_path = self.profile.storage_state_path
+
+            def _write_atomic():
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(state, f, indent=2)
+                os.replace(tmp_path, target_path)
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _write_atomic)
             logger.info("Storage state saved: %s", self.profile.storage_state_path)
 
     CLOSE_TIMEOUT = 15  # секунд на закрытие браузера

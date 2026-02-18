@@ -1722,7 +1722,7 @@ class TelegramAuth:
                 if client:
                     try:
                         await asyncio.wait_for(client.disconnect(), timeout=5)
-                    except Exception:
+                    except BaseException:
                         pass
             return AuthResult(
                 success=True,
@@ -2071,13 +2071,13 @@ class TelegramAuth:
                 try:
                     await asyncio.wait_for(client.disconnect(), timeout=5)
                     logger.debug("Telethon client disconnected")
-                except Exception as e:
+                except BaseException as e:
                     logger.warning(f"Error disconnecting client: {e}")
 
             if browser_ctx:
                 try:
                     await browser_ctx.close()
-                except Exception as e:
+                except BaseException as e:
                     logger.warning(f"Error closing browser: {e}")
 
     async def _get_browser_user_info(self, page) -> dict | None:
@@ -2584,7 +2584,7 @@ class ParallelMigrationController:
             # FIX #13: Always clean up shared BrowserManager
             try:
                 await browser_manager.close_all()
-            except Exception as e:
+            except BaseException as e:
                 logger.warning("BrowserManager cleanup error in ParallelMigrationController: %s", e)
 
         # Return results in order (only completed ones)
@@ -2682,7 +2682,7 @@ async def migrate_accounts_parallel(
         # Always clean up shared BrowserManager
         try:
             await shared_browser_manager.close_all()
-        except Exception as e:
+        except BaseException as e:
             logger.warning("BrowserManager cleanup error in migrate_accounts_parallel: %s", e)
 
     # Return results in original order

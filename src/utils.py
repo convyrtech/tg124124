@@ -119,6 +119,14 @@ _PROXY_PATTERN = re.compile(
 _CREDENTIAL_URI_PATTERN = re.compile(
     r"://([^:@]+):([^@]+)@",
 )
+# pproxy hash format: socks5://host:port#user:pass
+_PPROXY_HASH_PATTERN = re.compile(
+    r"((?:socks[45]?|https?|http)://[a-zA-Z0-9._-]+:\d+)#(\S+:\S+)", re.IGNORECASE
+)
+# Bare user:pass@host (without :// prefix)
+_BARE_CRED_AT_PATTERN = re.compile(
+    r"(\S+):(\S+)@([a-zA-Z0-9._-]+(?::\d+)?)",
+)
 _PHONE_PATTERN = re.compile(r"\+\d{10,14}\b")
 # Russian phone numbers without + prefix (79991234567)
 _PHONE_NO_PLUS_PATTERN = re.compile(r"\b7[0-9]{10}\b")
@@ -142,10 +150,14 @@ def sanitize_error(error_text: str) -> str:
         return ""
 
     text = str(error_text)
+    # Mask pproxy hash format first (protocol://host:port#user:pass)
+    text = _PPROXY_HASH_PATTERN.sub(r"\1#***:***", text)
     # Mask proxy credentials in protocol:host:port:user:pass format
     text = _PROXY_PATTERN.sub(r"\1\2\3:***:***", text)
     # Mask credentials in URI format (user:pass@host)
     text = _CREDENTIAL_URI_PATTERN.sub(r"://***:***@", text)
+    # Mask bare user:pass@host (without :// prefix)
+    text = _BARE_CRED_AT_PATTERN.sub(r"***:***@\3", text)
     # Mask api_hash (32-char hex in tracebacks)
     text = _API_HASH_PATTERN.sub("api_hash=[MASKED]", text)
     # Mask phone numbers
