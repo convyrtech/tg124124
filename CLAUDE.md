@@ -59,7 +59,7 @@
 - Empty state UX in GUI table ("Нет аккаунтов. Нажмите Import Sessions")
 - Corrupt session handling (sqlite3.DatabaseError → readable Russian message)
 - Error sanitization in diagnostics ZIP and GUI error messages
-- 354 тестов проходят
+- 425 тестов проходят
 
 ### Pre-production Audit (2026-02-12, commit ee5957b)
 6 критических багов найдены и исправлены:
@@ -99,6 +99,19 @@ P1 portability + data integrity fixes:
 - **P2: Error leak in diagnostics** — sanitize_error() in ZIP export + GUI single migrate
 - **SyntaxError fix** — elif inside else block in worker_pool.py
 - 15 new tests (path portability, auth age, corrupt session, probe lifecycle, error humanization)
+
+### sc:analyze Deep Audit Phase 3 (2026-02-18, commits ca679c9..d7e2221)
+12 P1 fixes across 8 files (72 findings analyzed, all P1s resolved):
+- **BUG-W1: TimeoutError circuit breaker** — record_failure() only for retryable errors
+- **BUG-T1: parse_telethon_proxy** — 4-part format (proto:host:port:user) support
+- **GUI-3: Diagnostics backup** — restructured try/finally for src_conn/dst_conn leak
+- **PH-1: SOCKS5 credential validation** — username/password 255-byte limit (RFC 1929)
+- **FA-13: fragment_auth CancelledError** — _cancelled tracking + reraise after cleanup
+- **BM-1/5: browser_manager CancelledError** — 4 locations: launch(), close_all(), BrowserContext.close(), proxy_relay.stop()
+- **UTIL-4/5: sanitize_error()** — masks api_hash (32-char hex) + Russian phones without +
+- **GUI sanitize gaps** — result.error wrapped in _se() for migrate/fragment single paths
+- **exception_handler.py** — sanitize_error() in _excepthook + _asyncio_exception_handler
+- 9 new tests (proxy parser, SOCKS5 limits, sanitize patterns ×6)
 
 ### Что НЕ работает / НЕ доделано
 - **FIX-005** - 2FA selector hardcoded (P2)
@@ -155,7 +168,7 @@ Camoufox → fragment.com → Click "Log in"
 Browser ──HTTP──> pproxy (localhost:random) ──SOCKS5+auth──> Remote Proxy
 ```
 
-## File Structure (12488 строк src/, 354 тестов)
+## File Structure (12488 строк src/, 425 тестов)
 ```
 tg-web-auth/
 ├── accounts/                # Исходные session файлы (.gitignore)
@@ -187,7 +200,7 @@ tg-web-auth/
 │       ├── app.py           # DearPyGui main window + diagnostics (1999 строк)
 │       ├── controllers.py   # GUI business logic (299 строк)
 │       └── theme.py         # Hacker dark green theme (99 строк)
-├── tests/                   # 354 тестов
+├── tests/                   # 425 тестов
 │   ├── test_telegram_auth.py
 │   ├── test_fragment_auth.py
 │   ├── test_browser_manager.py
@@ -276,7 +289,7 @@ python -m src.gui.app                                  # Запуск GUI
 
 ### Тесты
 ```bash
-pytest                    # Все 354 тестов
+pytest                    # Все 425 тестов
 pytest -v                 # Verbose
 pytest tests/test_proxy_manager.py -v  # Конкретный файл
 ```
@@ -333,7 +346,7 @@ operation_log (id, account_id, operation, success, error_message,
 ## Quality Gates
 
 ### Перед завершением любой задачи
-1. [ ] `pytest` проходит без ошибок (354 тестов)
+1. [ ] `pytest` проходит без ошибок (425 тестов)
 2. [ ] Self-review на типичные ошибки
 3. [ ] Нет секретов в логах
 4. [ ] Все ресурсы закрываются (async with, try/finally)
