@@ -630,7 +630,7 @@ def extract_token_from_tg_url(url_str: str) -> bytes | None:
             token_b64 += "=" * padding
         return base64.urlsafe_b64decode(token_b64)
     except Exception as e:
-        logger.debug(f"Error extracting token from URL: {e}")
+        logger.debug("Error extracting token from URL: %s", type(e).__name__)
         return None
 
 

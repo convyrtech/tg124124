@@ -16,6 +16,9 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# Sentinel for SQL datetime('now') — avoids magic string comparison
+_SQL_NOW = object()
+
 
 @dataclass
 class AccountRecord:
@@ -580,12 +583,12 @@ class Database:
 
         # Add last_check timestamp when status changes
         if "status" in kwargs:
-            kwargs["last_check"] = "datetime('now')"
+            kwargs["last_check"] = _SQL_NOW
 
         fields = []
         values = []
         for k, v in kwargs.items():
-            if v == "datetime('now')":
+            if v is _SQL_NOW:
                 fields.append(f"{k} = datetime('now')")
             else:
                 fields.append(f"{k} = ?")

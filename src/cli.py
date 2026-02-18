@@ -100,7 +100,11 @@ def find_account_dirs() -> list[Path]:
 def get_account_dir(name: str) -> Path | None:
     """Находит директорию аккаунта по имени"""
     # Точное совпадение
-    exact = ACCOUNTS_DIR / name
+    exact = (ACCOUNTS_DIR / name).resolve()
+    # Guard against path traversal
+    if not str(exact).startswith(str(ACCOUNTS_DIR.resolve())):
+        logger.warning("Path traversal attempt blocked: %s", name)
+        return None
     if exact.exists() and list(exact.glob("*.session")):
         return exact
 
