@@ -20,7 +20,7 @@
 
 Масштаб: **1000 аккаунтов**, переносимость между ПК.
 
-## Current Status (2026-02-18)
+## Current Status (2026-02-19)
 
 ### Что работает
 - Programmatic QR Login (без ручного сканирования)
@@ -62,7 +62,9 @@
 - Non-blocking DB init and storage_state save (run_in_executor)
 - sanitize_error catches pproxy `#` format and bare `user:pass@host`
 - CancelledError handled in all 5 finally blocks (BaseException, not Exception)
-- 463 теста проходят
+- **GUI pre-flight proxy guard** — batch migration/fragment blocked if accounts lack live proxies
+- Auto-assign free proxies + canary warning (>100 accounts) before batch start
+- 477 тестов проходят
 
 ### Pre-production Audit (2026-02-12, commit ee5957b)
 6 критических багов найдены и исправлены:
@@ -126,6 +128,15 @@ All P0 and P1 bugs resolved (463 tests):
 - **P1-2, P1-5 verified already fixed** in previous phases
 - 6 new tests (double-cancel ×3, sanitize pproxy/bare/hostname)
 
+### Production Safety Phase 5 (2026-02-19, commit f643e3e)
+GUI pre-flight proxy guards for safe 1000-account deployment:
+- **_preflight_check_proxies()** — blocks batch if any account has no proxy or dead proxy; shows Russian error with affected account names (truncated to 5)
+- **_quick_auto_assign()** — auto-assigns free DB proxies to accounts without proxy_id before preflight check
+- **Canary warning** — logs recommendation to start with 50 accounts via Migrate Selected when batch > 100
+- **_migrate_single no-proxy warning** — logs "[Warning] прокси не назначен" when single-account migrate has no proxy
+- Applied to both `_batch_migrate` and `_batch_fragment` paths
+- 14 new tests in test_gui_preflight.py (8 preflight + 6 auto-assign)
+
 ### Что НЕ работает / НЕ доделано
 - **FIX-005** - 2FA selector hardcoded (P2)
 - **P1-3** - Mixed local/UTC timestamps (cosmetic, timestamps used for display only)
@@ -183,7 +194,7 @@ Camoufox → fragment.com → Click "Log in"
 Browser ──HTTP──> pproxy (localhost:random) ──SOCKS5+auth──> Remote Proxy
 ```
 
-## File Structure (12488 строк src/, 457 тестов)
+## File Structure (12488 строк src/, 477 тестов)
 ```
 tg-web-auth/
 ├── accounts/                # Исходные session файлы (.gitignore)
@@ -212,10 +223,10 @@ tg-web-auth/
 │   ├── logger.py            # Logging setup + RotatingFileHandler (115 строк)
 │   ├── pproxy_wrapper.py    # pproxy process (dev mode only, 23 строк)
 │   └── gui/
-│       ├── app.py           # DearPyGui main window + diagnostics (1999 строк)
+│       ├── app.py           # DearPyGui main window + diagnostics (2205 строк)
 │       ├── controllers.py   # GUI business logic (299 строк)
 │       └── theme.py         # Hacker dark green theme (99 строк)
-├── tests/                   # 463 теста
+├── tests/                   # 477 тестов
 │   ├── test_telegram_auth.py
 │   ├── test_fragment_auth.py
 │   ├── test_browser_manager.py
@@ -304,7 +315,7 @@ python -m src.gui.app                                  # Запуск GUI
 
 ### Тесты
 ```bash
-pytest                    # Все 457 тестов
+pytest                    # Все 477 тестов
 pytest -v                 # Verbose
 pytest tests/test_proxy_manager.py -v  # Конкретный файл
 ```
@@ -361,7 +372,7 @@ operation_log (id, account_id, operation, success, error_message,
 ## Quality Gates
 
 ### Перед завершением любой задачи
-1. [ ] `pytest` проходит без ошибок (457 тестов)
+1. [ ] `pytest` проходит без ошибок (477 тестов)
 2. [ ] Self-review на типичные ошибки
 3. [ ] Нет секретов в логах
 4. [ ] Все ресурсы закрываются (async with, try/finally)
