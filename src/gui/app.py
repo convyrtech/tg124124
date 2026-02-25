@@ -1733,13 +1733,19 @@ class TGWebAuthApp:
 
         self._schedule_ui(lambda: self._set_batch_buttons_enabled(False))
         try:
+            from ..resource_monitor import ResourceMonitor
             from ..worker_pool import MigrationWorkerPool
+
+            monitor = ResourceMonitor()
+            num_workers = min(monitor.recommended_concurrency(), 5)
+            self._log(f"[Migrate] Воркеров: {num_workers} (RAM: {monitor.get_current()['memory_available_gb']:.1f}GB свободно)")
 
             pool = MigrationWorkerPool(
                 db=self._controller.db,
-                num_workers=5,
+                num_workers=num_workers,
                 batch_pause_every=50,
                 password_2fa=self._2fa_password,
+                resource_monitor=monitor,
                 on_progress=lambda completed, total, result: self._throttled_refresh(completed, total),
                 on_log=lambda msg: self._log(msg),
             )
@@ -1836,13 +1842,19 @@ class TGWebAuthApp:
 
         self._schedule_ui(lambda: self._set_batch_buttons_enabled(False))
         try:
+            from ..resource_monitor import ResourceMonitor
             from ..worker_pool import MigrationWorkerPool
+
+            monitor = ResourceMonitor()
+            num_workers = min(monitor.recommended_concurrency(), 5)
+            self._log(f"[Fragment] Воркеров: {num_workers} (RAM: {monitor.get_current()['memory_available_gb']:.1f}GB свободно)")
 
             pool = MigrationWorkerPool(
                 db=self._controller.db,
-                num_workers=5,
+                num_workers=num_workers,
                 batch_pause_every=50,
                 password_2fa=self._2fa_password,
+                resource_monitor=monitor,
                 on_progress=lambda completed, total, result: self._throttled_refresh(completed, total),
                 on_log=lambda msg: self._log(msg),
                 mode="fragment",

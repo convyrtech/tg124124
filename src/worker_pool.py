@@ -159,6 +159,12 @@ class MigrationWorkerPool:
         # for 1000 ints. Backpressure is naturally regulated by worker count.
         self._queue: asyncio.Queue[int] = asyncio.Queue()
 
+        # Track active browser launches to guarantee at least 1 runs.
+        # Lock ensures atomic check+increment so all 5 workers can't bypass
+        # the resource check simultaneously (classic TOCTOU race in asyncio).
+        self._active_browsers = 0
+        self._active_browsers_lock = asyncio.Lock()
+
         # Shared counter for completed items
         self._completed_count = 0
         # Lock to prevent race condition on _completed_count + batch pause check
@@ -434,18 +440,32 @@ class MigrationWorkerPool:
             else:
                 probe_acquired = True
 
-        # Check resource availability
-        if not self._resource_monitor.can_launch_more():
+        # Check resource availability atomically — always allow at least 1 browser
+        # to prevent total stall when system is under load (client: "0 OK, 10 skipped"
+        # because all workers blocked by resources simultaneously).
+        # Lock prevents TOCTOU: without it, all 5 workers read _active_browsers == 0
+        # at the same time and all bypass the resource check in the same event loop tick.
+        _browser_slot_acquired = False
+        async with self._active_browsers_lock:
+            if self._active_browsers == 0 or self._resource_monitor.can_launch_more():
+                self._active_browsers += 1
+                _browser_slot_acquired = True
+
+        if not _browser_slot_acquired:
             self._log(f"[W{worker_id}] Resources exhausted, waiting 30s for {name}...")
             await self._interruptible_sleep(30.0)
-            if not self._resource_monitor.can_launch_more():
+            async with self._active_browsers_lock:
+                if self._active_browsers == 0 or self._resource_monitor.can_launch_more():
+                    self._active_browsers += 1
+                    _browser_slot_acquired = True
+            if not _browser_slot_acquired:
                 if probe_acquired:
                     self._circuit_breaker.release_half_open_probe()
-                return AccountResult(
-                    account_id=account_id,
-                    account_name=name,
-                    success=False,
-                    error="SKIP: Resources exhausted after wait",
+                # RETRY instead of SKIP — resource exhaustion is transient
+                return await self._maybe_retry(
+                    account_id, name,
+                    "Resources exhausted (waiting for other browsers to finish)",
+                    self._retry_counts.get(account_id, 0),
                 )
 
         # Build proxy string + validate proxy availability
@@ -464,6 +484,7 @@ class MigrationWorkerPool:
                 logger.warning("DB update failed for %s: %s", name, exc)
             if probe_acquired:
                 self._circuit_breaker.release_half_open_probe()
+            self._active_browsers = max(0, self._active_browsers - 1)
             return AccountResult(
                 account_id=account_id,
                 account_name=name,
@@ -484,6 +505,7 @@ class MigrationWorkerPool:
                 logger.warning("DB update failed for %s: %s", name, exc)
             if probe_acquired:
                 self._circuit_breaker.release_half_open_probe()
+            self._active_browsers = max(0, self._active_browsers - 1)
             return AccountResult(
                 account_id=account_id,
                 account_name=name,
@@ -503,6 +525,7 @@ class MigrationWorkerPool:
                 logger.warning("DB start_migration failed for %s: %s", name, exc)
                 if probe_acquired:
                     self._circuit_breaker.release_half_open_probe()
+                self._active_browsers = max(0, self._active_browsers - 1)
                 return AccountResult(
                     account_id=account_id,
                     account_name=name,
@@ -521,7 +544,6 @@ class MigrationWorkerPool:
 
         def status_cb(msg: str) -> None:
             self._log(f"[W{worker_id}] {name} — {msg}")
-
         try:
             auth_result: AuthResult = await asyncio.wait_for(
                 migrate_fn(
@@ -535,6 +557,7 @@ class MigrationWorkerPool:
                 timeout=self._task_timeout,
             )
         except TimeoutError:
+            self._active_browsers = max(0, self._active_browsers - 1)
             error_msg = f"Timeout after {self._task_timeout:.0f}s"
             self._log(f"[W{worker_id}] {name} - TIMEOUT")
             if migration_id is not None:
@@ -548,6 +571,7 @@ class MigrationWorkerPool:
                 self._circuit_breaker.release_half_open_probe()
             return await self._maybe_retry(account_id, name, error_msg, retries)
         except Exception as exc:
+            self._active_browsers = max(0, self._active_browsers - 1)
             error_msg = sanitize_error(str(exc))
             self._log(f"[W{worker_id}] {name} - ERROR: {humanize_error(error_msg)}")
             if migration_id is not None:
@@ -563,10 +587,13 @@ class MigrationWorkerPool:
                 self._circuit_breaker.release_half_open_probe()
             return await self._maybe_retry(account_id, name, error_msg, retries)
         except BaseException:
+            self._active_browsers = max(0, self._active_browsers - 1)
             # CancelledError/KeyboardInterrupt — release probe before propagating
             if probe_acquired:
                 self._circuit_breaker.release_half_open_probe()
             raise
+
+        self._active_browsers = max(0, self._active_browsers - 1)
 
         # Process result
         if auth_result.success:

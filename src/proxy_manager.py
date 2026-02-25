@@ -161,11 +161,12 @@ class ProxyManager:
 
             session_path_str = to_relative_path(session_file)
             try:
-                account_id = await self.db.add_account(
+                account_id, created = await self.db.add_account(
                     name=name,
                     session_path=session_path_str,
                 )
-                counters["created"] += 1
+                if created:
+                    counters["created"] += 1
             except sqlite3.IntegrityError:
                 # Already exists — find it
                 accounts = await self.db.list_accounts(search=name)

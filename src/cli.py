@@ -410,7 +410,7 @@ def migrate(
                             await db.add_account(
                                 name=d.name,
                                 session_path=to_relative_path(d / "session.session"),
-                            )
+                            )  # Returns (id, created) — we don't need the result here
                         except sqlite3.IntegrityError:
                             pass  # Account already exists (unique session_path)
 

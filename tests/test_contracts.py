@@ -47,7 +47,7 @@ class TestWebMigrationDBContract:
 
         try:
             # Insert a test account
-            account_id = await db.add_account("test_user", session_path="accounts/test/session.session")
+            account_id, _ = await db.add_account("test_user", session_path="accounts/test/session.session")
 
             # Simulate what worker_pool does after successful web migration
             utc_now = datetime.now(timezone.utc).isoformat()
@@ -93,7 +93,7 @@ class TestSessionPathPortability:
 
         try:
             # Even if we pass a relative path
-            account_id = await db.add_account("test_user", session_path="accounts/test/session.session")
+            account_id, _ = await db.add_account("test_user", session_path="accounts/test/session.session")
             account = await db.get_account(account_id)
             path = account.session_path
             assert not Path(path).is_absolute(), f"session_path must be relative, got: {path}"
@@ -121,7 +121,7 @@ class TestConcurrentDBAccess:
             # Add 20 accounts
             ids = []
             for i in range(20):
-                aid = await db.add_account(f"user_{i}", session_path=f"accounts/user_{i}/session.session")
+                aid, _ = await db.add_account(f"user_{i}", session_path=f"accounts/user_{i}/session.session")
                 ids.append(aid)
 
             # 8 concurrent tasks updating different accounts
@@ -169,7 +169,7 @@ class TestMigrationCleanup:
 
         try:
             # Simulate a crash: account left in 'migrating' state
-            account_id = await db.add_account("crash_victim", session_path="accounts/crash/session.session")
+            account_id, _ = await db.add_account("crash_victim", session_path="accounts/crash/session.session")
             # Must use start_migration() to create a migration record (not just update_account)
             await db.start_migration(account_id)
 
@@ -207,7 +207,7 @@ class TestDBPortability:
 
         try:
             # Store relative path
-            aid = await db.add_account("user1", session_path="accounts/user1/session.session")
+            aid, _ = await db.add_account("user1", session_path="accounts/user1/session.session")
         finally:
             await db.close()
 
@@ -256,7 +256,7 @@ class TestStartMigrationGuard:
         await db.connect()
 
         try:
-            aid = await db.add_account("user1", session_path="accounts/user1/session.session")
+            aid, _ = await db.add_account("user1", session_path="accounts/user1/session.session")
 
             # First call: should set to migrating
             mid1 = await db.start_migration(aid)

@@ -40,7 +40,7 @@ class TestDBStress:
             # Add accounts
             ids = []
             for i in range(50):
-                aid = await db.add_account(f"stress_{i}", session_path=f"accounts/stress_{i}/session.session")
+                aid, _ = await db.add_account(f"stress_{i}", session_path=f"accounts/stress_{i}/session.session")
                 ids.append(aid)
 
             errors = []
@@ -160,7 +160,7 @@ class TestBatchStress:
             # Create 100 accounts
             ids = []
             for i in range(100):
-                aid = await db.add_account(f"batch_{i}", session_path=f"accounts/batch_{i}/session.session")
+                aid, _ = await db.add_account(f"batch_{i}", session_path=f"accounts/batch_{i}/session.session")
                 ids.append(aid)
 
             # Simulate duplicate injection
@@ -185,7 +185,7 @@ class TestBatchStress:
             # Create accounts first (start_batch requires existing accounts)
             names = [f"user_{i}" for i in range(100)]
             for name in names:
-                await db.add_account(name, session_path=f"accounts/{name}/session.session")
+                await db.add_account(name, session_path=f"accounts/{name}/session.session")  # return ignored
 
             batch_id = await db.start_batch(names)
             assert batch_id is not None

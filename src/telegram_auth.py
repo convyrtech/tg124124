@@ -768,15 +768,10 @@ class TelegramAuth:
         # Improved diagnostics: include proxy info (host:port only, no credentials)
         proxy_info = ""
         if proxy and isinstance(proxy, list | tuple) and len(proxy) >= 3:
-            proxy_info = f" [proxy: {proxy[1]}:{proxy[2]}]"
-            # Warn if port looks like HTTP but used as SOCKS5
-            _HTTP_PORTS = {80, 8080, 8888, 3128, 3129}
-            if proxy[2] in _HTTP_PORTS:
-                logger.warning(
-                    "Proxy %s:%s uses port %s which is typically HTTP, not SOCKS5. "
-                    "This may cause authentication failures.",
-                    proxy[1], proxy[2], proxy[2],
-                )
+            import socks as _socks
+
+            proxy_type_name = {_socks.SOCKS5: "SOCKS5", _socks.SOCKS4: "SOCKS4", _socks.HTTP: "HTTP"}.get(proxy[0], "?")
+            proxy_info = f" [proxy: {proxy_type_name} {proxy[1]}:{proxy[2]}]"
         elif not proxy:
             proxy_info = " [no proxy]"
 

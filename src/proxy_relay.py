@@ -334,17 +334,22 @@ class ProxyRelayManager:
 
 def needs_relay(proxy_str: str) -> bool:
     """
-    Проверяет, нужен ли proxy relay для данного прокси.
-    Нужен если: SOCKS5 + username/password.
+    Check if a proxy relay is needed.
 
-    Firefox/Camoufox НЕ поддерживает SOCKS5 с аутентификацией напрямую,
-    поэтому нужен локальный HTTP relay.
+    A local pproxy relay (browser → HTTP localhost → remote) is required for any
+    proxy with authentication credentials, regardless of protocol:
+    - SOCKS5 with auth: browsers don't support SOCKS5 RFC-1929 auth natively
+    - HTTP with auth: some HTTP proxies return 407 in headless/automated context;
+      pproxy relay avoids browser-level auth dialogs entirely
+
+    Proxies without credentials (SOCKS5 no-auth, HTTP no-auth) are passed
+    directly to the browser without a relay.
     """
     if not proxy_str:
         return False
 
     config = ProxyConfig.parse(proxy_str)
-    return config.protocol.lower() in ("socks5", "socks4") and config.has_auth
+    return config.has_auth
 
 
 async def test_relay():

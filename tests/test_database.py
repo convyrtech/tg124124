@@ -38,7 +38,7 @@ class TestDatabase:
 
         try:
             # Add account
-            account_id = await db.add_account(
+            account_id, _ = await db.add_account(
                 name="Test Account",
                 session_path="/path/to/session.session",
                 phone="+1234567890"
@@ -65,9 +65,9 @@ class TestDatabase:
         await db.connect()
 
         try:
-            await db.add_account(name="Account 1", session_path="/a.session", status="healthy")
-            await db.add_account(name="Account 2", session_path="/b.session", status="error")
-            await db.add_account(name="Account 3", session_path="/c.session", status="healthy")
+            await db.add_account(name="Account 1", session_path="/a.session", status="healthy")  # return ignored
+            await db.add_account(name="Account 2", session_path="/b.session", status="error")  # return ignored
+            await db.add_account(name="Account 3", session_path="/c.session", status="healthy")  # return ignored
 
             all_accounts = await db.list_accounts()
             assert len(all_accounts) == 3
@@ -96,7 +96,7 @@ class TestDatabase:
             assert proxy_id > 0
 
             # Add account
-            account_id = await db.add_account(
+            account_id, _ = await db.add_account(
                 name="Test",
                 session_path="/test.session"
             )
@@ -132,7 +132,7 @@ class TestDatabase:
             assert free.id in [p1, p2]
 
             # Assign it
-            acc = await db.add_account(name="A", session_path="/a.session")
+            acc, _ = await db.add_account(name="A", session_path="/a.session")
             await db.assign_proxy(acc, free.id)
 
             # Get another free proxy
@@ -153,7 +153,7 @@ class TestDatabase:
 
         try:
             # Add account
-            account_id = await db.add_account(
+            account_id, _ = await db.add_account(
                 name="Test Account",
                 session_path="/test.session"
             )
@@ -190,7 +190,7 @@ class TestDatabase:
         await db.connect()
 
         try:
-            account_id = await db.add_account(
+            account_id, _ = await db.add_account(
                 name="Failing Account",
                 session_path="/fail.session"
             )
@@ -223,7 +223,7 @@ class TestDatabase:
 
         try:
             # Create account and start migration (don't complete)
-            account_id = await db.add_account(
+            account_id, _ = await db.add_account(
                 name="Interrupted",
                 session_path="/interrupted.session"
             )
@@ -258,7 +258,7 @@ class TestDatabase:
         await db.connect()
 
         try:
-            account_id = await db.add_account(
+            account_id, _ = await db.add_account(
                 name="Test",
                 session_path="/test.session"
             )
@@ -309,10 +309,10 @@ class TestDatabase:
 
         try:
             # Add accounts with various statuses
-            await db.add_account(name="A1", session_path="/a1.session", status="pending")
-            await db.add_account(name="A2", session_path="/a2.session", status="healthy")
-            await db.add_account(name="A3", session_path="/a3.session", status="healthy")
-            await db.add_account(name="A4", session_path="/a4.session", status="error")
+            await db.add_account(name="A1", session_path="/a1.session", status="pending")  # return ignored
+            await db.add_account(name="A2", session_path="/a2.session", status="healthy")  # return ignored
+            await db.add_account(name="A3", session_path="/a3.session", status="healthy")  # return ignored
+            await db.add_account(name="A4", session_path="/a4.session", status="error")  # return ignored
 
             stats = await db.get_migration_stats()
 
@@ -402,9 +402,9 @@ class TestDatabase:
 
         try:
             # Create accounts first
-            await db.add_account(name="Acc1", session_path="/acc1.session")
-            await db.add_account(name="Acc2", session_path="/acc2.session")
-            await db.add_account(name="Acc3", session_path="/acc3.session")
+            await db.add_account(name="Acc1", session_path="/acc1.session")  # return ignored
+            await db.add_account(name="Acc2", session_path="/acc2.session")  # return ignored
+            await db.add_account(name="Acc3", session_path="/acc3.session")  # return ignored
 
             # Start batch
             batch_id = await db.start_batch(["Acc1", "Acc2", "Acc3"])
@@ -463,8 +463,8 @@ class TestDatabase:
             assert status is None
 
             # Create accounts and batch
-            await db.add_account(name="X1", session_path="/x1.session")
-            await db.add_account(name="X2", session_path="/x2.session")
+            await db.add_account(name="X1", session_path="/x1.session")  # return ignored
+            await db.add_account(name="X2", session_path="/x2.session")  # return ignored
             await db.start_batch(["X1", "X2"])
 
             status = await db.get_batch_status()
@@ -497,7 +497,7 @@ class TestDatabase:
         await db.connect()
 
         try:
-            acc_id = await db.add_account(name="LogTest", session_path="/log.session")
+            acc_id, _ = await db.add_account(name="LogTest", session_path="/log.session")
 
             # Log success
             await db.log_operation(acc_id, "qr_login", True, details="token=abc")
@@ -541,7 +541,7 @@ class TestDatabase:
         await db.connect()
 
         try:
-            acc_id = await db.add_account(name="FragTest", session_path="/frag.session")
+            acc_id, _ = await db.add_account(name="FragTest", session_path="/frag.session")
 
             # Update fragment_status
             await db.update_account(acc_id, fragment_status="authorized")
@@ -659,7 +659,7 @@ class TestDatabase:
         await db.connect()
 
         try:
-            acc_id = await db.add_account(name="ProxyTest", session_path="/s.session")
+            acc_id, _ = await db.add_account(name="ProxyTest", session_path="/s.session")
             proxy_id = await db.add_proxy(host="10.0.0.1", port=1080)
             await db.assign_proxy(acc_id, proxy_id)
 
@@ -703,8 +703,8 @@ class TestDatabase:
         await db.connect()
 
         try:
-            await db.add_account(name="test_user", session_path="/t1.session")
-            await db.add_account(name="testXuser", session_path="/t2.session")
+            await db.add_account(name="test_user", session_path="/t1.session")  # return ignored
+            await db.add_account(name="testXuser", session_path="/t2.session")  # return ignored
 
             # Search for literal underscore — should NOT match "testXuser"
             results = await db.list_accounts(search="test_user")

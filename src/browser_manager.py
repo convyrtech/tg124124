@@ -639,7 +639,7 @@ class BrowserManager:
                         logger.warning("Could not remove lock file %s: %s", lock_file, e)
 
         if profile.proxy and needs_relay(profile.proxy):
-            logger.info("SOCKS5 with auth detected - starting proxy relay...")
+            logger.info("Proxy with auth detected - starting relay (HTTP localhost → remote)...")
             proxy_relay = ProxyRelay(profile.proxy)
             await proxy_relay.start()
 

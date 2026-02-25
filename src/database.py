@@ -260,14 +260,19 @@ class Database:
         username: str | None = None,
         proxy_id: int | None = None,
         status: str = "pending",
-    ) -> int:
-        """Add new account, return ID. Skips if name already exists."""
+    ) -> tuple[int, bool]:
+        """Add new account, return (ID, created).
+
+        Returns:
+            Tuple of (account_id, was_created). If account with this name
+            already exists, returns (existing_id, False).
+        """
         async with self._db_lock:
             # Check for existing account to prevent duplicates
             async with self._connection.execute("SELECT id FROM accounts WHERE name = ? LIMIT 1", (name,)) as cursor:
                 existing = await cursor.fetchone()
                 if existing:
-                    return existing[0]
+                    return existing[0], False
             async with self._connection.execute(
                 """
                 INSERT INTO accounts (name, session_path, phone, username, proxy_id, status)
@@ -276,7 +281,7 @@ class Database:
                 (name, session_path, phone, username, proxy_id, status),
             ) as cursor:
                 await self._commit_with_retry()
-                return cursor.lastrowid
+                return cursor.lastrowid, True
 
     async def account_exists(self, name: str) -> bool:
         """Check if account with exact name exists. O(1) via index."""
@@ -534,36 +539,53 @@ class Database:
                 )
             return None
 
-    async def assign_proxy(self, account_id: int, proxy_id: int) -> None:
-        """Assign proxy to account (1:1 binding).
+    async def assign_proxy(self, account_id: int, proxy_id: int, *, allow_shared: bool = False) -> None:
+        """Assign proxy to account.
+
+        By default enforces 1:1 binding (dedicated proxies). With allow_shared=True,
+        multiple accounts can share the same proxy (for rotating/residential proxies).
 
         Uses atomic check-and-update to prevent TOCTOU race where
         two accounts could get the same proxy assigned.
 
         BUG-2 FIX: Wrapped in _db_lock to prevent interleaving.
 
+        Args:
+            account_id: Account to assign proxy to.
+            proxy_id: Proxy to assign.
+            allow_shared: If True, skip exclusivity check (rotating proxies).
+
         Raises:
-            ValueError: If proxy is already assigned to a different account.
+            ValueError: If proxy is already assigned to a different account
+                        (only when allow_shared=False).
         """
         async with self._db_lock:
-            # FIX-P1: Atomic check-and-update — only assigns if unassigned
-            # or already assigned to this same account
-            async with self._connection.execute(
-                """UPDATE proxies
-                   SET assigned_account_id = ?
-                   WHERE id = ?
-                     AND (assigned_account_id IS NULL OR assigned_account_id = ?)""",
-                (account_id, proxy_id, account_id),
-            ) as cursor:
-                if cursor.rowcount == 0:
-                    # Either proxy doesn't exist or is assigned to another account
-                    async with self._connection.execute(
-                        "SELECT assigned_account_id FROM proxies WHERE id = ?", (proxy_id,)
-                    ) as check:
-                        row = await check.fetchone()
-                        if row is None:
-                            raise ValueError(f"Proxy {proxy_id} not found")
-                        raise ValueError(f"Proxy {proxy_id} already assigned to account {row[0]}")
+            if allow_shared:
+                # Just verify proxy exists
+                async with self._connection.execute(
+                    "SELECT id FROM proxies WHERE id = ?", (proxy_id,)
+                ) as check:
+                    if await check.fetchone() is None:
+                        raise ValueError(f"Proxy {proxy_id} not found")
+            else:
+                # FIX-P1: Atomic check-and-update — only assigns if unassigned
+                # or already assigned to this same account
+                async with self._connection.execute(
+                    """UPDATE proxies
+                       SET assigned_account_id = ?
+                       WHERE id = ?
+                         AND (assigned_account_id IS NULL OR assigned_account_id = ?)""",
+                    (account_id, proxy_id, account_id),
+                ) as cursor:
+                    if cursor.rowcount == 0:
+                        # Either proxy doesn't exist or is assigned to another account
+                        async with self._connection.execute(
+                            "SELECT assigned_account_id FROM proxies WHERE id = ?", (proxy_id,)
+                        ) as check:
+                            row = await check.fetchone()
+                            if row is None:
+                                raise ValueError(f"Proxy {proxy_id} not found")
+                            raise ValueError(f"Proxy {proxy_id} already assigned to account {row[0]}")
 
             await self._connection.execute("UPDATE accounts SET proxy_id = ? WHERE id = ?", (proxy_id, account_id))
             await self._commit_with_retry()

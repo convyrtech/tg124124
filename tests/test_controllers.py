@@ -72,7 +72,7 @@ def controller(tmp_data_dir, tmp_sessions_dir):
     # Mock database
     ctrl.db = AsyncMock()
     ctrl.db.list_accounts = AsyncMock(return_value=[])
-    ctrl.db.add_account = AsyncMock(side_effect=lambda **kw: 1)  # return account_id=1
+    ctrl.db.add_account = AsyncMock(side_effect=lambda **kw: (1, True))  # return (account_id, created)
     ctrl.db.assign_proxy = AsyncMock()
     ctrl.db.find_proxy_by_host_port = AsyncMock(return_value=None)
     ctrl.db.add_proxy = AsyncMock(return_value=1)
@@ -166,7 +166,7 @@ class TestImportSessions:
 
         async def _add_account(**kw):
             account_id_counter[0] += 1
-            return account_id_counter[0]
+            return (account_id_counter[0], True)
 
         controller.db.add_account.side_effect = _add_account
 
@@ -228,7 +228,7 @@ class TestImportSessions:
         account_id_counter = [0]
         async def _add_account(**kw):
             account_id_counter[0] += 1
-            return account_id_counter[0]
+            return (account_id_counter[0], True)
         controller.db.add_account.side_effect = _add_account
 
         imported, skipped = await controller.import_sessions(tmp_source_dir, on_progress=on_progress)
@@ -237,6 +237,52 @@ class TestImportSessions:
         assert len(progress_calls) == 2
         # All progress calls should have total=2
         assert all(t == 2 for _, t, _ in progress_calls)
+
+    @pytest.mark.asyncio
+    async def test_import_corrects_existing_proxy_protocol(self, controller, tmp_source_dir):
+        """When existing proxy has wrong protocol (socks5 on port 80), it gets corrected to http."""
+        from src.database import ProxyRecord
+
+        # Proxy already in DB as socks5 (wrong)
+        controller.db.find_proxy_by_host_port = AsyncMock(return_value=99)
+        existing_proxy = ProxyRecord(
+            id=99, host="p.webshare.io", port=80,
+            username="user", password="pass",
+            protocol="socks5",  # wrong — should be http
+            status="active",
+            assigned_account_id=None, last_check=None, created_at=None,
+        )
+        controller.db.get_proxy = AsyncMock(return_value=existing_proxy)
+        controller.db.update_proxy = AsyncMock()
+
+        _create_session_file(tmp_source_dir, "acc1",
+                             proxy="socks5:p.webshare.io:80:user:pass")
+        await controller.import_sessions(tmp_source_dir)
+
+        # update_proxy should be called to fix the protocol
+        controller.db.update_proxy.assert_called_once_with(99, protocol="http")
+
+    @pytest.mark.asyncio
+    async def test_import_correct_protocol_not_updated(self, controller, tmp_source_dir):
+        """When existing proxy already has correct protocol, update_proxy is NOT called."""
+        from src.database import ProxyRecord
+
+        controller.db.find_proxy_by_host_port = AsyncMock(return_value=5)
+        existing_proxy = ProxyRecord(
+            id=5, host="1.2.3.4", port=1080,
+            username="user", password="pass",
+            protocol="socks5",  # correct
+            status="active",
+            assigned_account_id=None, last_check=None, created_at=None,
+        )
+        controller.db.get_proxy = AsyncMock(return_value=existing_proxy)
+        controller.db.update_proxy = AsyncMock()
+
+        _create_session_file(tmp_source_dir, "acc1",
+                             proxy="socks5:1.2.3.4:1080:user:pass")
+        await controller.import_sessions(tmp_source_dir)
+
+        controller.db.update_proxy.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_import_corrupt_config_still_imports(self, controller, tmp_source_dir):

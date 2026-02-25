@@ -25,9 +25,9 @@ class ResourceLimits:
         memory_per_browser_gb: Estimated memory per Camoufox instance in GB
     """
 
-    max_memory_percent: float = 80.0
-    max_cpu_percent: float = 90.0
-    min_memory_available_gb: float = 2.0
+    max_memory_percent: float = 85.0
+    max_cpu_percent: float = 95.0
+    min_memory_available_gb: float = 0.5
     memory_per_browser_gb: float = 0.5
 
 
@@ -43,15 +43,15 @@ class ResourceMonitor:
     """
 
     def __init__(
-        self, max_memory_percent: float = 80.0, max_cpu_percent: float = 90.0, min_memory_available_gb: float = 2.0
+        self, max_memory_percent: float = 85.0, max_cpu_percent: float = 95.0, min_memory_available_gb: float = 0.5
     ) -> None:
         """
         Initialize resource monitor with limits.
 
         Args:
-            max_memory_percent: Stop launching if memory > this percent (default 80)
-            max_cpu_percent: Stop launching if CPU > this percent (default 90)
-            min_memory_available_gb: Minimum free memory in GB (default 2.0)
+            max_memory_percent: Stop launching if memory > this percent (default 85)
+            max_cpu_percent: Stop launching if CPU > this percent (default 95)
+            min_memory_available_gb: Minimum free memory in GB (default 0.5)
         """
         self.limits = ResourceLimits(
             max_memory_percent=max_memory_percent,

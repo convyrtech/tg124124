@@ -339,8 +339,8 @@ class TestCheckAssignedProxies:
         # Create accounts with proxies
         pid1 = await db.add_proxy(host="alive.com", port=1080)
         pid2 = await db.add_proxy(host="dead.com", port=1080)
-        aid1 = await db.add_account(name="acc1", session_path="/s1")
-        aid2 = await db.add_account(name="acc2", session_path="/s2")
+        aid1, _ = await db.add_account(name="acc1", session_path="/s1")
+        aid2, _ = await db.add_account(name="acc2", session_path="/s2")
         await db.assign_proxy(aid1, pid1)
         await db.assign_proxy(aid2, pid2)
 
@@ -358,7 +358,7 @@ class TestCheckAssignedProxies:
 
     @pytest.mark.asyncio
     async def test_accounts_without_proxy(self, db):
-        await db.add_account(name="no_proxy", session_path="/s1")
+        await db.add_account(name="no_proxy", session_path="/s1")  # return ignored
 
         manager = ProxyManager(db)
         with patch("src.proxy_manager.check_proxy_smart", new_callable=AsyncMock, return_value=(True, None)):
@@ -373,7 +373,7 @@ class TestGenerateReplacementPlan:
     async def test_plan_with_free_proxies(self, db):
         # Dead proxy assigned to account
         pid_dead = await db.add_proxy(host="dead.com", port=1080)
-        aid = await db.add_account(name="acc1", session_path="/s1")
+        aid, _ = await db.add_account(name="acc1", session_path="/s1")
         await db.assign_proxy(aid, pid_dead)
         await db.update_proxy(pid_dead, status="dead")
 
@@ -396,8 +396,8 @@ class TestGenerateReplacementPlan:
         # 2 dead proxies, only 1 free
         pid1 = await db.add_proxy(host="dead1.com", port=1080)
         pid2 = await db.add_proxy(host="dead2.com", port=1081)
-        aid1 = await db.add_account(name="acc1", session_path="/s1")
-        aid2 = await db.add_account(name="acc2", session_path="/s2")
+        aid1, _ = await db.add_account(name="acc1", session_path="/s1")
+        aid2, _ = await db.add_account(name="acc2", session_path="/s2")
         await db.assign_proxy(aid1, pid1)
         await db.assign_proxy(aid2, pid2)
         await db.update_proxy(pid1, status="dead")
@@ -434,7 +434,7 @@ class TestExecuteReplacements:
         # DB setup
         pid_old = await db.add_proxy(host="dead.com", port=1080, username="u", password="p")
         pid_new = await db.add_proxy(host="fresh.com", port=2080, username="nu", password="np")
-        aid = await db.add_account(name="acc1", session_path="/s1")
+        aid, _ = await db.add_account(name="acc1", session_path="/s1")
         await db.assign_proxy(aid, pid_old)
         await db.update_proxy(pid_old, status="dead")
         await db.update_proxy(pid_new, status="reserved")
@@ -478,7 +478,7 @@ class TestExecuteReplacements:
     async def test_execute_logs_operations(self, db, tmp_path):
         pid_old = await db.add_proxy(host="dead.com", port=1080)
         pid_new = await db.add_proxy(host="fresh.com", port=1080)
-        aid = await db.add_account(name="acc1", session_path="/s1")
+        aid, _ = await db.add_account(name="acc1", session_path="/s1")
         await db.assign_proxy(aid, pid_old)
         await db.update_proxy(pid_new, status="reserved")
 
@@ -519,7 +519,7 @@ class TestExecuteReplacements:
 
         pid_old = await db.add_proxy(host="dead.com", port=1080, username="u", password="p")
         pid_new = await db.add_proxy(host="fresh.com", port=2080, username="nu", password="np")
-        aid = await db.add_account(name="acc1", session_path="/s1")
+        aid, _ = await db.add_account(name="acc1", session_path="/s1")
         await db.assign_proxy(aid, pid_old)
         await db.update_proxy(pid_new, status="reserved")
 
@@ -551,7 +551,7 @@ class TestExecuteReplacements:
         """If account has no ___config.json, DB update should still succeed."""
         pid_old = await db.add_proxy(host="dead.com", port=1080)
         pid_new = await db.add_proxy(host="fresh.com", port=1080)
-        aid = await db.add_account(name="no_config_acc", session_path="/s1")
+        aid, _ = await db.add_account(name="no_config_acc", session_path="/s1")
         await db.assign_proxy(aid, pid_old)
         await db.update_proxy(pid_new, status="reserved")
 
@@ -582,7 +582,7 @@ class TestExecuteReplacements:
 
         pid_old = await db.add_proxy(host="dead.com", port=1080)
         pid_new = await db.add_proxy(host="fresh.com", port=1080)
-        aid = await db.add_account(name="rollback_acc", session_path="/s1")
+        aid, _ = await db.add_account(name="rollback_acc", session_path="/s1")
         await db.assign_proxy(aid, pid_old)
         await db.update_proxy(pid_new, status="reserved")
 

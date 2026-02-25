@@ -232,7 +232,7 @@ class AppController:
                 from ..paths import to_relative_path
 
                 try:
-                    account_id = await self.db.add_account(name=name, session_path=to_relative_path(dest_session))
+                    account_id, created = await self.db.add_account(name=name, session_path=to_relative_path(dest_session))
                 except Exception:
                     # Rollback: remove copied files to prevent orphaned dirs
                     try:
@@ -240,6 +240,12 @@ class AppController:
                     except Exception:
                         pass
                     raise
+
+                if not created:
+                    skipped += 1
+                    if on_progress:
+                        on_progress(i + 1, total, f"skip (exists in DB): {name}")
+                    continue
 
                 # Track in dedup sets for this batch
                 existing_names.add(name)
@@ -251,7 +257,13 @@ class AppController:
                     try:
                         proxy_id = await self._find_or_create_proxy(proxy_str)
                         if proxy_id:
-                            await self.db.assign_proxy(account_id, proxy_id)
+                            try:
+                                await self.db.assign_proxy(account_id, proxy_id)
+                            except ValueError:
+                                # Proxy already assigned to another account — allow sharing
+                                # (rotating/residential proxies are shared by design)
+                                await self.db.assign_proxy(account_id, proxy_id, allow_shared=True)
+                                logger.info("Shared proxy %d assigned to %s (rotating proxy)", proxy_id, name)
                             proxy_ok = True
                     except Exception as proxy_err:
                         logger.warning(
@@ -286,15 +298,24 @@ class AppController:
 
             # Warn if port suggests HTTP proxy but protocol defaulted to socks5
             if port in self._HTTP_PROXY_PORTS and protocol == "socks5":
-                logger.warning(
-                    "Proxy %s:%d looks like HTTP (port %d) but will be used as SOCKS5. "
-                    "If migration fails, specify protocol explicitly: http:%s:%d:user:pass",
-                    host, port, port, host, port,
+                logger.info(
+                    "Proxy %s:%d auto-corrected from SOCKS5 to HTTP (port %d is typically HTTP)",
+                    host, port, port,
                 )
+                protocol = "http"
 
             # O(1) lookup via UNIQUE(host, port) index
             existing_id = await self.db.find_proxy_by_host_port(host, port)
             if existing_id is not None:
+                # Update protocol if it was corrected (e.g., socks5 on port 80 → http).
+                # Existing proxy may have been imported before auto-correction was added.
+                existing = await self.db.get_proxy(existing_id)
+                if existing and existing.protocol != protocol:
+                    logger.info(
+                        "Proxy %s:%d: correcting stored protocol %s→%s",
+                        host, port, existing.protocol, protocol,
+                    )
+                    await self.db.update_proxy(existing_id, protocol=protocol)
                 return existing_id
 
             # Create new proxy — retry lookup on UNIQUE constraint violation

@@ -79,7 +79,7 @@ class TestDBConcurrentAccess:
         await db.connect()
 
         async def write_account(i: int) -> None:
-            await db.add_account(
+            await db.add_account(  # return ignored
                 name=f"account_{i}",
                 session_path=str(tmp_path / f"session_{i}.session"),
             )

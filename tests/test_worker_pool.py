@@ -290,11 +290,12 @@ class TestResourceMonitor:
 
     @pytest.mark.asyncio
     async def test_resource_monitor_blocks(self, tmp_path):
-        """can_launch_more=False -> account skipped after wait."""
+        """can_launch_more=False -> first account still runs (guarantee min 1 browser),
+        but second account gets retried/skipped when resources stay exhausted."""
         d = tmp_path / "account_1"
         d.mkdir()
         (d / "session.session").touch()
-        accounts = {1: _make_account(1, name="Blocked", session_dir=d)}
+        accounts = {1: _make_account(1, name="First", session_dir=d)}
 
         db = _mock_db(accounts)
         monitor = MagicMock(spec=ResourceMonitor)
@@ -314,9 +315,46 @@ class TestResourceMonitor:
             )
             result = await pool.run([1])
 
-        # Should be skipped because resources exhausted
-        assert result.skipped_count == 1
-        assert mock_migrate.call_count == 0
+        # First account must run even when resources exhausted (min 1 browser guarantee)
+        assert result.success_count == 1
+        assert mock_migrate.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_resource_monitor_blocks_second_account(self, tmp_path):
+        """When 1 browser active + resources exhausted, 2nd account retries not skips."""
+        d1 = tmp_path / "account_1"
+        d1.mkdir()
+        (d1 / "session.session").touch()
+        d2 = tmp_path / "account_2"
+        d2.mkdir()
+        (d2 / "session.session").touch()
+        accounts = {
+            1: _make_account(1, name="First", session_dir=d1),
+            2: _make_account(2, name="Second", session_dir=d2),
+        }
+
+        db = _mock_db(accounts)
+        monitor = MagicMock(spec=ResourceMonitor)
+        monitor.can_launch_more = MagicMock(return_value=False)
+        logs = []
+
+        with patch("src.worker_pool.migrate_account", new_callable=AsyncMock) as mock_migrate:
+            mock_migrate.return_value = _make_auth_result(success=True)
+
+            pool = MigrationWorkerPool(
+                db=db,
+                num_workers=2,
+                cooldown_range=(0.0, 0.01),
+                batch_pause_every=0,
+                resource_monitor=monitor,
+                on_log=logs.append,
+                max_retries=0,  # No retries to simplify test
+            )
+            result = await pool.run([1, 2])
+
+        # Both should run — first bypasses resource check, second runs after first finishes
+        assert mock_migrate.call_count >= 1
+        assert result.success_count >= 1
 
 
 class TestDBStatusUpdates:

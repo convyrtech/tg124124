@@ -83,10 +83,26 @@ class TestNeedsRelay:
         """SOCKS5 without auth doesn't need relay"""
         assert needs_relay("socks5:host:1080") is False
 
-    def test_http_with_auth_no_relay(self):
-        """HTTP proxy doesn't need relay (browser handles auth)"""
-        # HTTP proxies support basic auth in browsers
-        assert needs_relay("http:host:8080:user:pass") is False
+    def test_http_with_auth_needs_relay(self):
+        """HTTP proxy with credentials requires relay.
+
+        pproxy relay avoids browser-level 407/auth-dialog issues in headless
+        mode. All proxies with credentials go through the relay regardless
+        of protocol.
+        """
+        assert needs_relay("http:host:8080:user:pass") is True
+
+    def test_http_without_auth_no_relay(self):
+        """HTTP proxy without auth doesn't need relay"""
+        assert needs_relay("http:host:8080") is False
+
+    def test_socks4_with_auth_needs_relay(self):
+        """SOCKS4 with auth requires relay"""
+        assert needs_relay("socks4:host:1080:user:pass") is True
+
+    def test_socks4_without_auth_no_relay(self):
+        """SOCKS4 without auth doesn't need relay"""
+        assert needs_relay("socks4:host:1080") is False
 
     def test_empty_string_no_relay(self):
         """Empty string doesn't need relay"""
