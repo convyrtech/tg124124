@@ -300,33 +300,20 @@ class TestParseTelethonProxy:
         assert result[1] == "proxy.com"
         assert result[2] == 1080
 
-    def test_http_proxy_with_auth(self):
-        """HTTP proxy must map to socks.HTTP."""
-        import socks
-
+    def test_http_proxy_with_auth_returns_none(self):
+        """HTTP proxy skipped for Telethon — can't tunnel MTProto."""
         result = parse_telethon_proxy("http:proxy.com:8080:user:pass")
-        assert result is not None
-        assert result[0] == socks.HTTP
-        assert result[1] == "proxy.com"
-        assert result[2] == 8080
-        assert result[4] == "user"
+        assert result is None
 
-    def test_http_proxy_no_auth(self):
-        """HTTP proxy without auth."""
-        import socks
-
+    def test_http_proxy_no_auth_returns_none(self):
+        """HTTP proxy without auth also skipped for Telethon."""
         result = parse_telethon_proxy("http:proxy.com:3128")
-        assert result is not None
-        assert result[0] == socks.HTTP
-        assert result[2] == 3128
+        assert result is None
 
-    def test_https_proxy(self):
-        """HTTPS proxy maps to socks.HTTP (HTTP CONNECT)."""
-        import socks
-
+    def test_https_proxy_returns_none(self):
+        """HTTPS proxy also skipped for Telethon (not SOCKS)."""
         result = parse_telethon_proxy("https:proxy.com:443:user:pass")
-        assert result is not None
-        assert result[0] == socks.HTTP
+        assert result is None
 
     def test_socks5_explicit_type(self):
         """Verify socks5 still maps correctly after refactor."""

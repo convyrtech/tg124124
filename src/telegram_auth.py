@@ -69,6 +69,19 @@ try:
 except ImportError as e:
     raise ImportError("telethon not installed. Run: pip install telethon") from e
 
+# FIX: Telethon + python-socks TypeError on Python 3.12+
+# Telethon monkey-patches python_socks._errors.ProxyError = ConnectionError,
+# but python-socks creates errors with keyword arguments (error_code=...)
+# that ConnectionError rejects on Python 3.12+:
+#   TypeError: ConnectionError() takes no keyword arguments
+# Force PySocks fallback (sync but functional) by disabling python-socks in Telethon.
+try:
+    import telethon.network.connection.connection as _telethon_conn
+    _telethon_conn.python_socks = None
+    logger.debug("Disabled python-socks in Telethon (PySocks fallback for Python 3.12+ compat)")
+except (ImportError, AttributeError):
+    pass
+
 from .browser_manager import BrowserManager
 from .utils import sanitize_error
 
@@ -636,9 +649,14 @@ def extract_token_from_tg_url(url_str: str) -> bytes | None:
 
 def parse_telethon_proxy(proxy_str: str) -> tuple | None:
     """
-    Конвертирует прокси в формат Telethon.
+    Конвертирует прокси в формат Telethon (PySocks).
+
     Input: socks5:host:port:user:pass (password may contain colons)
-    Output: (socks.SOCKS5, host, port, True, user, pass)
+    Output: (socks.SOCKS5, host, port, True, user, pass) or None
+
+    HTTP proxies are skipped — they can't reliably tunnel MTProto (TCP)
+    traffic via CONNECT, especially rotating proxies. The browser uses
+    its own proxy path (via pproxy relay), so Telethon connects directly.
     """
     if not proxy_str:
         return None
@@ -647,6 +665,19 @@ def parse_telethon_proxy(proxy_str: str) -> tuple | None:
 
     # Split with maxsplit=4 to handle passwords containing colons
     parts = proxy_str.split(":", 4)
+    if not parts:
+        return None
+
+    # Skip HTTP proxies for Telethon — MTProto requires TCP tunneling
+    # which HTTP CONNECT proxies (especially rotating ones) don't support reliably
+    proto = parts[0].lower()
+    if "socks5" not in proto and "socks4" not in proto:
+        logger.info(
+            "Skipping %s proxy for Telethon (HTTP can't tunnel MTProto); "
+            "Telethon will connect directly, browser uses proxy via relay",
+            parts[0],
+        )
+        return None
 
     def _resolve_proxy_type(proto_str: str) -> int:
         """Map protocol string to PySocks constant."""
@@ -655,19 +686,19 @@ def parse_telethon_proxy(proxy_str: str) -> tuple | None:
             return socks.SOCKS5
         if "socks4" in p:
             return socks.SOCKS4
-        # http, https, or anything else → HTTP CONNECT
+        # Should not reach here (HTTP filtered above), but just in case
         return socks.HTTP
 
     try:
         if len(parts) == 5:
-            proto, host, port, user, pwd = parts
-            return (_resolve_proxy_type(proto), host, int(port), True, user, pwd)
+            proto_raw, host, port, user, pwd = parts
+            return (_resolve_proxy_type(proto_raw), host, int(port), True, user, pwd)
         elif len(parts) == 4:
-            proto, host, port, user = parts
-            return (_resolve_proxy_type(proto), host, int(port), True, user, "")
+            proto_raw, host, port, user = parts
+            return (_resolve_proxy_type(proto_raw), host, int(port), True, user, "")
         elif len(parts) == 3:
-            proto, host, port = parts
-            return (_resolve_proxy_type(proto), host, int(port))
+            proto_raw, host, port = parts
+            return (_resolve_proxy_type(proto_raw), host, int(port))
     except (ValueError, AttributeError):
         return None
 
