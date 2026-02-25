@@ -70,17 +70,35 @@ except ImportError as e:
     raise ImportError("telethon not installed. Run: pip install telethon") from e
 
 # FIX: Telethon + python-socks TypeError on Python 3.12+
-# Telethon monkey-patches python_socks._errors.ProxyError = ConnectionError,
-# but python-socks creates errors with keyword arguments (error_code=...)
-# that ConnectionError rejects on Python 3.12+:
+#
+# Telethon monkey-patches python_socks._errors.ProxyError = ConnectionError
+# inside _proxy_connect(), then lazily imports _proxy.py which binds local
+# references to the (now-broken) ConnectionError.  python-socks internally
+# raises ProxyError(e, error_code=e.error_code) — keyword arg that builtin
+# ConnectionError rejects on Python 3.12+:
 #   TypeError: ConnectionError() takes no keyword arguments
-# Force PySocks fallback (sync but functional) by disabling python-socks in Telethon.
+#
+# Fix: replace error classes with a ConnectionError subclass that accepts
+# keyword args, then force-import _proxy.py so its local references bind
+# to our compat class BEFORE Telethon overwrites the module attributes.
 try:
-    import telethon.network.connection.connection as _telethon_conn
-    _telethon_conn.python_socks = None
-    logger.debug("Disabled python-socks in Telethon (PySocks fallback for Python 3.12+ compat)")
-except (ImportError, AttributeError):
-    pass
+    import python_socks._errors as _ps_errors
+
+    class _CompatConnectionError(ConnectionError):
+        """ConnectionError subclass that accepts keyword arguments."""
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args)
+            self.error_code = kwargs.get('error_code')
+
+    _ps_errors.ProxyError = _CompatConnectionError
+    _ps_errors.ProxyConnectionError = _CompatConnectionError
+    _ps_errors.ProxyTimeoutError = _CompatConnectionError
+
+    # Force lazy module to import now, binding local refs to compat classes
+    from python_socks.async_.asyncio import Proxy as _Proxy  # noqa: F401
+    logger.debug("Patched python-socks error classes for Python 3.12+ compat")
+except ImportError:
+    logger.debug("python_socks not available, skipping compat patch")
 
 from .browser_manager import BrowserManager
 from .utils import sanitize_error
@@ -649,14 +667,14 @@ def extract_token_from_tg_url(url_str: str) -> bytes | None:
 
 def parse_telethon_proxy(proxy_str: str) -> tuple | None:
     """
-    Конвертирует прокси в формат Telethon (PySocks).
+    Конвертирует прокси в формат Telethon.
 
     Input: socks5:host:port:user:pass (password may contain colons)
-    Output: (socks.SOCKS5, host, port, True, user, pass) or None
+    Output: (socks.SOCKS5, host, port, True, user, pass)
 
-    HTTP proxies are skipped — they can't reliably tunnel MTProto (TCP)
-    traffic via CONNECT, especially rotating proxies. The browser uses
-    its own proxy path (via pproxy relay), so Telethon connects directly.
+    Supports SOCKS5, SOCKS4, and HTTP CONNECT proxies.
+    python-socks compat patch (see module-level _CompatConnectionError)
+    ensures all proxy types work on Python 3.12+.
     """
     if not proxy_str:
         return None
@@ -665,19 +683,6 @@ def parse_telethon_proxy(proxy_str: str) -> tuple | None:
 
     # Split with maxsplit=4 to handle passwords containing colons
     parts = proxy_str.split(":", 4)
-    if not parts:
-        return None
-
-    # Skip HTTP proxies for Telethon — MTProto requires TCP tunneling
-    # which HTTP CONNECT proxies (especially rotating ones) don't support reliably
-    proto = parts[0].lower()
-    if "socks5" not in proto and "socks4" not in proto:
-        logger.info(
-            "Skipping %s proxy for Telethon (HTTP can't tunnel MTProto); "
-            "Telethon will connect directly, browser uses proxy via relay",
-            parts[0],
-        )
-        return None
 
     def _resolve_proxy_type(proto_str: str) -> int:
         """Map protocol string to PySocks constant."""
@@ -686,19 +691,19 @@ def parse_telethon_proxy(proxy_str: str) -> tuple | None:
             return socks.SOCKS5
         if "socks4" in p:
             return socks.SOCKS4
-        # Should not reach here (HTTP filtered above), but just in case
+        # http, https, or anything else → HTTP CONNECT
         return socks.HTTP
 
     try:
         if len(parts) == 5:
-            proto_raw, host, port, user, pwd = parts
-            return (_resolve_proxy_type(proto_raw), host, int(port), True, user, pwd)
+            proto, host, port, user, pwd = parts
+            return (_resolve_proxy_type(proto), host, int(port), True, user, pwd)
         elif len(parts) == 4:
-            proto_raw, host, port, user = parts
-            return (_resolve_proxy_type(proto_raw), host, int(port), True, user, "")
+            proto, host, port, user = parts
+            return (_resolve_proxy_type(proto), host, int(port), True, user, "")
         elif len(parts) == 3:
-            proto_raw, host, port = parts
-            return (_resolve_proxy_type(proto_raw), host, int(port))
+            proto, host, port = parts
+            return (_resolve_proxy_type(proto), host, int(port))
     except (ValueError, AttributeError):
         return None
 
