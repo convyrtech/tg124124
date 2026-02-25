@@ -76,19 +76,21 @@ def find_free_port() -> int:
 
 class ProxyRelay:
     """
-    Локальный HTTP прокси-relay для SOCKS5 с авторизацией.
+    Локальный HTTP прокси-relay для прокси с авторизацией.
 
     Использует pproxy для создания цепочки:
-    Browser → localhost:PORT (HTTP, no auth) → SOCKS5:PORT (with auth)
+    Browser → localhost:PORT (HTTP, no auth) → remote:PORT (with auth)
+
+    Поддерживаемые протоколы: socks5, socks4, http (любой с credentials).
     """
 
-    def __init__(self, socks5_proxy: str, local_host: str = "127.0.0.1"):
+    def __init__(self, proxy_str: str, local_host: str = "127.0.0.1"):
         """
         Args:
-            socks5_proxy: Строка прокси в формате socks5:host:port:user:pass
+            proxy_str: Строка прокси в формате protocol:host:port:user:pass
             local_host: Хост для локального прокси (default: 127.0.0.1)
         """
-        self.config = ProxyConfig.parse(socks5_proxy)
+        self.config = ProxyConfig.parse(proxy_str)
         self.local_host = local_host
         self.local_port: int | None = None
         self._process: asyncio.subprocess.Process | None = None
@@ -298,7 +300,7 @@ class ProxyRelayManager:
         self._relays: dict[str, ProxyRelay] = {}
         self._lock = asyncio.Lock()
 
-    async def get_or_create(self, socks5_proxy: str) -> ProxyRelay:
+    async def get_or_create(self, proxy_str: str) -> ProxyRelay:
         """
         Получает существующий relay или создаёт новый.
         Кэширует по proxy строке для переиспользования.
@@ -308,14 +310,14 @@ class ProxyRelayManager:
         Uses asyncio.Lock to prevent duplicate relay creation under concurrency.
         """
         async with self._lock:
-            existing = self._relays.get(socks5_proxy)
+            existing = self._relays.get(proxy_str)
             if existing and existing._started:
                 return existing
 
             # Create new relay (replace stopped one in cache)
-            relay = ProxyRelay(socks5_proxy)
+            relay = ProxyRelay(proxy_str)
             await relay.start()
-            self._relays[socks5_proxy] = relay
+            self._relays[proxy_str] = relay
 
             return relay
 

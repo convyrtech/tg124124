@@ -211,6 +211,11 @@ class MigrationWorkerPool:
         self._shutdown_event.clear()
         self._completed_count = 0
         self._retry_counts.clear()
+        # Reset browser counter — CancelledError during a previous run may have
+        # left it non-zero if it bypassed the finally decrements.
+        # Safe to reset here: all workers from the previous run are joined before
+        # run() returns (they're awaited in the finally block).
+        self._active_browsers = 0
         # Recreate queue to ensure clean state (unlimited — see __init__ comment)
         self._queue = asyncio.Queue()
         # FIX #5: Reset batch pause event to running state
