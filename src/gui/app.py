@@ -120,8 +120,8 @@ class TGWebAuthApp:
 
             # Keep loop running
             self._loop.run_forever()
-        except Exception as e:
-            logger.critical("Async loop init failed: %s", e, exc_info=True)
+        except BaseException as e:
+            logger.critical("Async loop died: %s", e, exc_info=True)
             self._async_init_error = str(e)
             self._async_ready.set()  # Unblock main thread even on failure
 
@@ -137,19 +137,41 @@ class TGWebAuthApp:
                 self._active_pool = False
                 self._busy_ops.clear()
 
-    def _run_async(self, coro) -> None:
-        """Schedule coroutine on async loop."""
+    def _run_async(self, coro) -> bool:
+        """Schedule coroutine on async loop.
+
+        Returns True if successfully scheduled, False if dropped.
+        Callers that set _busy_ops BEFORE this call MUST check the return
+        value and clean up if False — the coroutine's finally block won't run.
+        """
+        # Auto-recover stale state from any dead async thread
+        self._recover_stale_pool()
+
         if self._shutting_down.is_set() or not self._loop or self._loop.is_closed():
             reason = (
                 "shutting_down" if self._shutting_down.is_set()
                 else "no_loop" if not self._loop
                 else "loop_closed"
             )
-            logger.error("_run_async: dropping coroutine %s (reason=%s)", coro.__qualname__, reason)
+            logger.error("_run_async: dropping %s (reason=%s)", coro.__qualname__, reason)
             self._log(f"[Error] Async loop unavailable ({reason}), action skipped")
-            return
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        future.add_done_callback(self._on_async_done)
+            return False
+
+        # Thread liveness check: loop exists but thread died → loop is stopped
+        if self._async_thread and not self._async_thread.is_alive():
+            logger.error("_run_async: dropping %s (async thread dead)", coro.__qualname__)
+            self._log("[Error] Async thread dead, action skipped")
+            return False
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            future.add_done_callback(self._on_async_done)
+            return True
+        except RuntimeError as e:
+            # loop.is_running() == False between run_forever() calls
+            logger.error("_run_async: RuntimeError scheduling %s: %s", coro.__qualname__, e)
+            self._log(f"[Error] Cannot schedule task: {_se(str(e))}")
+            return False
 
     def _on_async_done(self, future) -> None:
         """Handle completion of async tasks - log errors only.
@@ -499,7 +521,8 @@ class TGWebAuthApp:
             return
         self._busy_ops.add("collect_diagnostics")
         self._schedule_ui(lambda: dpg.set_value("diagnostics_status", "Collecting..."))
-        self._run_async(self._collect_diagnostics_async())
+        if not self._run_async(self._collect_diagnostics_async()):
+            self._busy_ops.discard("collect_diagnostics")
 
     async def _collect_diagnostics_async(self) -> None:
         """Async wrapper: offloads heavy I/O (rglob, DB copy) to executor."""
@@ -524,9 +547,11 @@ class TGWebAuthApp:
                     log_file = LOGS_DIR / "app.log"
                     if log_file.exists():
                         try:
-                            lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
-                            sanitized_lines = [sanitize_error(line) for line in lines[-5000:]]
-                            zf.writestr("app.log", "\n".join(sanitized_lines))
+                            raw_text = log_file.read_text(encoding="utf-8", errors="replace")
+                            # Sanitize entire text at once (not per-line) — 7 regex on 1 string
+                            # instead of 7 regex × 5000 lines = 35000 regex ops
+                            truncated = "\n".join(raw_text.splitlines()[-5000:])
+                            zf.writestr("app.log", sanitize_error(truncated))
                         except Exception as e:
                             logger.warning("Diagnostics: failed to collect app.log: %s", e)
                             zf.writestr("app.log.error", f"Could not include app.log: {_se(str(e))}")
@@ -536,9 +561,9 @@ class TGWebAuthApp:
                         rotated = LOGS_DIR / f"app.log.{i}"
                         if rotated.exists():
                             try:
-                                rot_lines = rotated.read_text(encoding="utf-8", errors="replace").splitlines()
-                                sanitized_rot = [sanitize_error(line) for line in rot_lines[-5000:]]
-                                zf.writestr(f"app.log.{i}", "\n".join(sanitized_rot))
+                                rot_text = rotated.read_text(encoding="utf-8", errors="replace")
+                                rot_truncated = "\n".join(rot_text.splitlines()[-5000:])
+                                zf.writestr(f"app.log.{i}", sanitize_error(rot_truncated))
                             except Exception as e:
                                 logger.warning("Diagnostics: failed to collect app.log.%d: %s", i, e)
 
@@ -564,11 +589,13 @@ class TGWebAuthApp:
                             # Use SQLite backup API instead of file copy:
                             # - handles WAL mode correctly (no WinError 32)
                             # - produces a consistent snapshot even with active connections
-                            src_conn = sqlite3.connect(db_file, timeout=5)
+                            src_conn = sqlite3.connect(str(db_file), timeout=5)
                             dst_conn = sqlite3.connect(tmp_path)
                             try:
                                 try:
-                                    src_conn.backup(dst_conn)
+                                    # pages=5, sleep=0.1: copy in small batches, yield lock between pages
+                                    # prevents blocking if migration workers hold DB lock
+                                    src_conn.backup(dst_conn, pages=5, sleep=0.1)
                                 finally:
                                     src_conn.close()
                                 # Sanitize proxy credentials (table may not exist if DB is fresh)
@@ -826,7 +853,8 @@ class TGWebAuthApp:
                 finally:
                     self._busy_ops.discard("import_sessions")
 
-            self._run_async(do_import())
+            if not self._run_async(do_import()):
+                self._busy_ops.discard("import_sessions")
 
         except Exception as e:
             logger.exception("Import dialog error: %s", e)
@@ -1113,7 +1141,8 @@ class TGWebAuthApp:
             finally:
                 self._busy_ops.discard(op_key)
 
-        self._run_async(do_open())
+        if not self._run_async(do_open()):
+            self._busy_ops.discard(op_key)
 
     def _migrate_single(self, sender, app_data, user_data) -> None:
         """Migrate single account."""
@@ -1215,7 +1244,8 @@ class TGWebAuthApp:
             finally:
                 self._busy_ops.discard(op_key)
 
-        self._run_async(do_migrate())
+        if not self._run_async(do_migrate()):
+            self._busy_ops.discard(op_key)
 
     def _fragment_single(self, sender, app_data, user_data) -> None:
         """Authorize single account on fragment.com."""
@@ -1307,7 +1337,8 @@ class TGWebAuthApp:
             finally:
                 self._busy_ops.discard(op_key)
 
-        self._run_async(do_fragment())
+        if not self._run_async(do_fragment()):
+            self._busy_ops.discard(op_key)
 
     async def _build_proxy_string(self, account: AccountRecord) -> str | None:
         """Build proxy string from DB ProxyRecord for migrate_account()."""
@@ -1992,7 +2023,8 @@ class TGWebAuthApp:
             finally:
                 self._busy_ops.discard("auto_assign")
 
-        self._run_async(do_assign())
+        if not self._run_async(do_assign()):
+            self._busy_ops.discard("auto_assign")
 
     def _show_proxy_import_dialog(self, sender=None, app_data=None) -> None:
         """Show proxy import - select file directly."""
@@ -2034,7 +2066,8 @@ class TGWebAuthApp:
                 finally:
                     self._busy_ops.discard("import_proxies")
 
-            self._run_async(do_import())
+            if not self._run_async(do_import()):
+                self._busy_ops.discard("import_proxies")
 
         except Exception as e:
             logger.exception("Show proxy import dialog error: %s", e)
@@ -2093,7 +2126,8 @@ class TGWebAuthApp:
             finally:
                 self._busy_ops.discard("check_proxies")
 
-        self._run_async(do_check())
+        if not self._run_async(do_check()):
+            self._busy_ops.discard("check_proxies")
 
     def _replace_dead_proxies(self, sender=None, app_data=None) -> None:
         """Delete dead proxies from database, unlinking accounts first."""
@@ -2137,7 +2171,8 @@ class TGWebAuthApp:
             finally:
                 self._busy_ops.discard("replace_dead")
 
-        self._run_async(do_replace())
+        if not self._run_async(do_replace()):
+            self._busy_ops.discard("replace_dead")
 
 
 def _startup_health_check() -> None:
