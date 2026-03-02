@@ -305,9 +305,9 @@ class TestPreflightCommand:
 class TestQRTuning:
     """Fix 6.1-6.2: QR retries and backoff."""
 
-    def test_qr_max_retries_increased(self):
-        """QR_MAX_RETRIES should be >= 8."""
-        assert TelegramAuth.QR_MAX_RETRIES >= 8
+    def test_qr_max_retries_reasonable(self):
+        """QR_MAX_RETRIES should be >= 5."""
+        assert TelegramAuth.QR_MAX_RETRIES >= 5
 
     def test_exponential_backoff_in_source(self):
         """Verify exponential backoff in retry loop."""

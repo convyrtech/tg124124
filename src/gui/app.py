@@ -125,9 +125,28 @@ class TGWebAuthApp:
             self._async_init_error = str(e)
             self._async_ready.set()  # Unblock main thread even on failure
 
+    def _recover_stale_pool(self) -> None:
+        """Clear stale _active_pool and _busy_ops if async thread died."""
+        if self._async_thread and not self._async_thread.is_alive():
+            if self._active_pool or self._busy_ops:
+                logger.warning(
+                    "Async thread dead — clearing stale _active_pool=%s, _busy_ops=%s",
+                    self._active_pool, self._busy_ops,
+                )
+                self._log("[Recovery] Async thread died, resetting operation state")
+                self._active_pool = False
+                self._busy_ops.clear()
+
     def _run_async(self, coro) -> None:
         """Schedule coroutine on async loop."""
         if self._shutting_down.is_set() or not self._loop or self._loop.is_closed():
+            reason = (
+                "shutting_down" if self._shutting_down.is_set()
+                else "no_loop" if not self._loop
+                else "loop_closed"
+            )
+            logger.error("_run_async: dropping coroutine %s (reason=%s)", coro.__qualname__, reason)
+            self._log(f"[Error] Async loop unavailable ({reason}), action skipped")
             return
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         future.add_done_callback(self._on_async_done)
@@ -545,7 +564,7 @@ class TGWebAuthApp:
                             # Use SQLite backup API instead of file copy:
                             # - handles WAL mode correctly (no WinError 32)
                             # - produces a consistent snapshot even with active connections
-                            src_conn = sqlite3.connect(db_file)
+                            src_conn = sqlite3.connect(db_file, timeout=5)
                             dst_conn = sqlite3.connect(tmp_path)
                             try:
                                 try:
@@ -598,7 +617,7 @@ class TGWebAuthApp:
                         system_info += "Camoufox: unknown\n"
                     zf.writestr("system_info.txt", system_info)
 
-                    # Profiles summary (count + sizes, no sensitive data)
+                    # Profiles summary (count + names only, no rglob/stat to avoid hang on large dirs)
                     try:
                         from ..paths import PROFILES_DIR
 
@@ -606,8 +625,7 @@ class TGWebAuthApp:
                         if PROFILES_DIR.exists():
                             for p in sorted(PROFILES_DIR.iterdir()):
                                 if p.is_dir():
-                                    size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
-                                    prof_lines.append(f"  {p.name}: {size // 1024} KB")
+                                    prof_lines.append(f"  {p.name}")
                         header = f"Total profiles: {len(prof_lines)}\n"
                         zf.writestr("profiles_info.txt", header + "\n".join(prof_lines))
                     except Exception as e:
@@ -638,7 +656,9 @@ class TGWebAuthApp:
                 return zip_name, str(zip_path)
 
             loop = asyncio.get_running_loop()
-            zip_name, zip_path_str = await loop.run_in_executor(None, _build_zip)
+            zip_name, zip_path_str = await asyncio.wait_for(
+                loop.run_in_executor(None, _build_zip), timeout=30
+            )
 
             self._log(f"[Diagnostics] Created: {zip_path_str}")
             self._schedule_ui(lambda: dpg.set_value("diagnostics_status", f"Saved: {zip_name}"))
@@ -1007,6 +1027,7 @@ class TGWebAuthApp:
 
     def _open_profile(self, sender, app_data, user_data) -> None:
         """Open browser profile for account."""
+        self._recover_stale_pool()
         # Guard: prevent double-click launching two browsers for same profile
         if self._active_pool:
             self._log("[Open] Batch in progress, please wait")
@@ -1040,8 +1061,12 @@ class TGWebAuthApp:
                     acfg = AccountConfig.load(account_dir)
                     profile_name = acfg.name
                 except Exception:
-                    # Fallback to DB name if config is missing
-                    profile_name = account.name
+                    # Fallback to DB name if config is missing.
+                    # DB stores composite "573189007843 (Kamila)" — extract "Kamila"
+                    import re
+
+                    m = re.search(r"\((.+)\)", account.name)
+                    profile_name = m.group(1) if m else account.name
                 self._log(f"[Open] Launching browser for {profile_name}...")
 
                 # Use BrowserManager directly (not CLI!)
@@ -1092,6 +1117,7 @@ class TGWebAuthApp:
 
     def _migrate_single(self, sender, app_data, user_data) -> None:
         """Migrate single account."""
+        self._recover_stale_pool()
         # Fix #9: Guard against concurrent session use during batch ops
         if self._active_pool:
             self._log("[Migrate] Batch in progress, please wait")
@@ -1193,6 +1219,7 @@ class TGWebAuthApp:
 
     def _fragment_single(self, sender, app_data, user_data) -> None:
         """Authorize single account on fragment.com."""
+        self._recover_stale_pool()
         # Fix #9: Guard against concurrent session use during batch ops
         if self._active_pool:
             self._log("[Fragment] Batch in progress, please wait")
@@ -1460,6 +1487,7 @@ class TGWebAuthApp:
 
     def _migrate_selected(self, sender=None, app_data=None) -> None:
         """Migrate all selected accounts."""
+        self._recover_stale_pool()
         if self._active_pool:
             self._log("[Migrate] Migration already in progress")
             return
@@ -1497,6 +1525,7 @@ class TGWebAuthApp:
 
     def _migrate_all(self, sender=None, app_data=None) -> None:
         """Migrate all pending accounts."""
+        self._recover_stale_pool()
         # FIX-F: Guard against double-click creating orphaned pool → OOM
         if self._active_pool:
             self._log("[Migrate] Migration already in progress")
@@ -1546,6 +1575,7 @@ class TGWebAuthApp:
 
     def _retry_failed(self, sender=None, app_data=None) -> None:
         """Retry all accounts with status='error'."""
+        self._recover_stale_pool()
         if self._active_pool:
             self._log("[Retry] Migration already in progress")
             return
@@ -1777,6 +1807,7 @@ class TGWebAuthApp:
 
     def _fragment_all(self, sender=None, app_data=None) -> None:
         """Start fragment.com auth for all healthy (migrated) accounts."""
+        self._recover_stale_pool()
         if self._active_pool:
             self._log("[Fragment] Migration already in progress")
             return

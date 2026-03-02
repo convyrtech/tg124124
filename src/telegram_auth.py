@@ -22,6 +22,7 @@ import random
 import sqlite3
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -111,7 +112,7 @@ if TYPE_CHECKING:
 # Kills browser process tree via threading.Timer if authorize() hangs.
 # Independent of asyncio event loop — works even when Playwright pipe I/O
 # blocks the Windows ProactorEventLoop (observed with Camoufox headless).
-BROWSER_WATCHDOG_TIMEOUT = 240  # 4 minutes
+BROWSER_WATCHDOG_TIMEOUT = 120  # 2 minutes
 
 
 class BrowserWatchdog:
@@ -718,7 +719,7 @@ class TelegramAuth:
     TELEGRAM_WEB_URL = "https://web.telegram.org/k/"
     QR_WAIT_TIMEOUT = 30  # секунд ждать появления QR
     AUTH_WAIT_TIMEOUT = 120  # секунд ждать завершения авторизации
-    QR_MAX_RETRIES = 8  # FIX-6.1: Increased from 5 to 8 for 1000-account reliability
+    QR_MAX_RETRIES = 5  # 5 retries sufficient, reduces per-account time
     QR_RETRY_DELAY = 5  # секунд между retry
 
     def __init__(
@@ -1285,8 +1286,8 @@ class TelegramAuth:
                     if not bbox or bbox["width"] < 10 or bbox["height"] < 10:
                         continue  # Canvas not visible yet, retry next iteration
 
-                    # Ждём полной отрисовки QR
-                    await asyncio.sleep(2)
+                    # Ждём полной отрисовки QR (0.5s enough for canvas paint)
+                    await asyncio.sleep(0.5)
 
                     # FIX-1.2: Screenshot of canvas element only, not full page
                     # Full page = 1280x720, QR = ~200x200 = 3% pixels → decoders fail
@@ -1396,7 +1397,7 @@ class TelegramAuth:
                     logger.warning(f"Page reload warning: {e}")
 
                 # FIX-2.2: Check page state after reload (may show 2FA, error, already-authorized)
-                await asyncio.sleep(3)
+                await asyncio.sleep(1)
                 try:
                     post_reload_state = await self._check_page_state(page)
                     if post_reload_state == "2fa_required":
@@ -1765,6 +1766,7 @@ class TelegramAuth:
         client = None
         browser_ctx = None
         watchdog = None
+        _t0 = time.monotonic()
 
         try:
             # 1. Подключаем Telethon client
@@ -1773,6 +1775,8 @@ class TelegramAuth:
             self._client = client
 
             # 2. Запускаем браузер с синхронизированной ОС
+            _t1 = time.monotonic()
+            logger.info("[Timing] [1/6] Telethon connect: %.1fs", _t1 - _t0)
             self._status("[2/6] Launching browser...")
             # FIX #3: Передаём os_list для консистентности
             browser_extra_args = {
@@ -1801,6 +1805,8 @@ class TelegramAuth:
             await page.set_viewport_size({"width": 1280, "height": 800})
 
             # 3. Открываем Telegram Web
+            _t2 = time.monotonic()
+            logger.info("[Timing] [2/6] Browser launch: %.1fs", _t2 - _t1)
             self._status("[3/6] Opening Telegram Web...")
             try:
                 await page.goto(self.TELEGRAM_WEB_URL, wait_until="domcontentloaded", timeout=60000)
@@ -1833,7 +1839,7 @@ class TelegramAuth:
                         logger.debug(f"Page loaded after {i + 1}s")
                         break
 
-            await asyncio.sleep(3)  # Дополнительная пауза для рендеринга
+            await asyncio.sleep(1)  # Brief pause for page rendering
 
             # Проверяем текущее состояние страницы с повторными попытками
             # Возможно профиль уже авторизован или требует 2FA
@@ -1924,7 +1930,7 @@ class TelegramAuth:
                         wait_until="domcontentloaded",
                         timeout=30000,
                     )
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(1)
                     current_state = await self._check_page_state(page)
                     logger.info("Page state after recovery reload: %s", current_state)
                     if current_state == "dead":
@@ -1984,6 +1990,8 @@ class TelegramAuth:
                     logger.warning("Recovery reload failed (will proceed to QR): %s", e)
 
             # 4. Ждём и декодируем QR (FIX #4: с retry)
+            _t3 = time.monotonic()
+            logger.info("[Timing] [3/6] Page load + state check: %.1fs", _t3 - _t2)
             self._status("[4/6] Extracting QR token...")
             token = await self._extract_qr_token_with_retry(page)
 
@@ -2015,6 +2023,8 @@ class TelegramAuth:
                 )
 
             # 5. Подтверждаем токен через Telethon
+            _t4 = time.monotonic()
+            logger.info("[Timing] [4/6] QR extract: %.1fs", _t4 - _t3)
             self._status("[5/6] Accepting login token...")
             accepted, accept_error = await self._accept_token(client, token)
 
@@ -2026,7 +2036,7 @@ class TelegramAuth:
                 )
 
             # Обновляем страницу чтобы браузер увидел авторизацию
-            await asyncio.sleep(2)  # Даём время на синхронизацию
+            await asyncio.sleep(1)  # Brief sync pause
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=30000)
             except Exception as e:
@@ -2052,8 +2062,13 @@ class TelegramAuth:
                     success, _ = await self._wait_for_auth_complete(page)
 
             # FIX #2: Проверяем что Telethon сессия жива после авторизации браузера
+            _t5 = time.monotonic()
+            logger.info("[Timing] [5/6] Accept token + reload + auth wait: %.1fs", _t5 - _t4)
             self._status("[6/6] Verifying session...")
             telethon_alive = await self._verify_telethon_session(client)
+            _t6 = time.monotonic()
+            logger.info("[Timing] [6/6] Verify session: %.1fs", _t6 - _t5)
+            logger.info("[Timing] Total authorize(): %.1fs", _t6 - _t0)
 
             if success:
                 await self._set_authorization_ttl(client)
