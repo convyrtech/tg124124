@@ -1547,7 +1547,9 @@ class TGWebAuthApp:
                 return
             self._log(f"[Migrate] Starting migration of {len(selected_ids)} selected accounts...")
 
-            self._run_async(self._batch_migrate(selected_ids))
+            if not self._run_async(self._batch_migrate(selected_ids)):
+                self._active_pool = None
+                self._set_batch_buttons_enabled(True)
         except Exception as e:
             logger.exception("Migrate selected error: %s", e)
             self._log(f"[Error] Migrate: {_se(str(e))}")
@@ -1585,7 +1587,9 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
                 self._schedule_ui(lambda: self._reset_stop_button())
 
-        self._run_async(get_pending_ids())
+        if not self._run_async(get_pending_ids()):
+            self._active_pool = None
+            self._set_batch_buttons_enabled(True)
 
     def _set_batch_buttons_enabled(self, enabled: bool) -> None:
         """Enable/disable batch AND per-row action buttons to prevent double-click.
@@ -1637,7 +1641,9 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
                 self._schedule_ui(lambda: self._reset_stop_button())
 
-        self._run_async(get_error_ids())
+        if not self._run_async(get_error_ids()):
+            self._active_pool = None
+            self._set_batch_buttons_enabled(True)
 
     def _stop_migration(self, sender=None, app_data=None) -> None:
         """Stop ongoing migration."""
@@ -1869,7 +1875,9 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._set_batch_buttons_enabled(True))
                 self._schedule_ui(lambda: self._reset_stop_button())
 
-        self._run_async(get_healthy_ids())
+        if not self._run_async(get_healthy_ids()):
+            self._active_pool = None
+            self._set_batch_buttons_enabled(True)
 
     async def _batch_fragment(self, account_ids: list) -> None:
         """Batch fragment auth using parallel worker pool."""
