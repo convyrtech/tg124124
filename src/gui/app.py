@@ -157,9 +157,9 @@ class TGWebAuthApp:
             self._log(f"[Error] Async loop unavailable ({reason}), action skipped")
             return False
 
-        # Thread liveness check: loop exists but thread died → loop is stopped
-        if self._async_thread and not self._async_thread.is_alive():
-            logger.error("_run_async: dropping %s (async thread dead)", coro.__qualname__)
+        # Thread liveness check: loop exists but thread died/missing → loop is stopped
+        if not self._async_thread or not self._async_thread.is_alive():
+            logger.error("_run_async: dropping %s (async thread dead/missing)", coro.__qualname__)
             self._log("[Error] Async thread dead, action skipped")
             return False
 
@@ -516,6 +516,7 @@ class TGWebAuthApp:
 
     def _collect_diagnostics(self, sender=None, app_data=None) -> None:
         """Collect logs + system info into a ZIP for support (runs async to avoid GUI freeze)."""
+        self._recover_stale_pool()
         if "collect_diagnostics" in self._busy_ops:
             self._log("[Diagnostics] Already collecting...")
             return
@@ -817,6 +818,7 @@ class TGWebAuthApp:
     # Import dialog
     def _show_import_dialog(self, sender=None, app_data=None) -> None:
         """Show file dialog to select sessions folder."""
+        self._recover_stale_pool()
         if "import_sessions" in self._busy_ops:
             self._log("[Import] Import already in progress")
             return
@@ -1957,6 +1959,7 @@ class TGWebAuthApp:
 
     def _auto_assign_proxies(self, sender=None, app_data=None) -> None:
         """Auto-assign free proxies to accounts without proxies or with dead proxies."""
+        self._recover_stale_pool()
         if "auto_assign" in self._busy_ops:
             self._log("[Proxies] Auto-assign already in progress")
             return
@@ -2036,6 +2039,7 @@ class TGWebAuthApp:
 
     def _show_proxy_import_dialog(self, sender=None, app_data=None) -> None:
         """Show proxy import - select file directly."""
+        self._recover_stale_pool()
         if "import_proxies" in self._busy_ops:
             self._log("[Import] Proxy import already in progress")
             return
@@ -2084,6 +2088,7 @@ class TGWebAuthApp:
 
     def _check_all_proxies(self, sender=None, app_data=None) -> None:
         """Check all proxies status."""
+        self._recover_stale_pool()
         if "check_proxies" in self._busy_ops:
             self._log("[Proxies] Check already in progress")
             return
@@ -2139,6 +2144,7 @@ class TGWebAuthApp:
 
     def _replace_dead_proxies(self, sender=None, app_data=None) -> None:
         """Delete dead proxies from database, unlinking accounts first."""
+        self._recover_stale_pool()
         if "replace_dead" in self._busy_ops:
             self._log("[Proxies] Replace already in progress")
             return
