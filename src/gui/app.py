@@ -126,15 +126,15 @@ class TGWebAuthApp:
             self._async_ready.set()  # Unblock main thread even on failure
 
     def _recover_stale_pool(self) -> None:
-        """Clear stale _active_pool and _busy_ops if async thread died."""
-        if self._async_thread and not self._async_thread.is_alive():
+        """Clear stale _active_pool and _busy_ops if async thread died or never started."""
+        if not self._async_thread or not self._async_thread.is_alive():
             if self._active_pool or self._busy_ops:
                 logger.warning(
                     "Async thread dead — clearing stale _active_pool=%s, _busy_ops=%s",
                     self._active_pool, self._busy_ops,
                 )
                 self._log("[Recovery] Async thread died, resetting operation state")
-                self._active_pool = False
+                self._active_pool = None
                 self._busy_ops.clear()
 
     def _run_async(self, coro) -> bool:
