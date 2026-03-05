@@ -1695,18 +1695,22 @@ class TGWebAuthApp:
 
         no_proxy: list[str] = []
         dead_proxy: list[str] = []
+        http_proxy: list[str] = []
 
         for a in batch_accounts:
             if a.proxy_id is None:
                 no_proxy.append(a.name)
             elif a.proxy_id in proxy_map:
-                if proxy_map[a.proxy_id].status == "dead":
+                p = proxy_map[a.proxy_id]
+                if p.status == "dead":
                     dead_proxy.append(a.name)
+                elif mode == "Migrate" and p.protocol == "http":
+                    http_proxy.append(a.name)
             else:
                 # proxy_id references missing proxy record
                 no_proxy.append(a.name)
 
-        if not no_proxy and not dead_proxy:
+        if not no_proxy and not dead_proxy and not http_proxy:
             return True
 
         if no_proxy:
@@ -1723,7 +1727,20 @@ class TGWebAuthApp:
                 f"[{mode}] ОСТАНОВЛЕНО: {len(dead_proxy)} аккаунтов с мёртвым прокси: {names_preview}{suffix}"
             )
 
-        self._log(f"[{mode}] Нажмите 'Auto-Assign Proxies' или импортируйте прокси перед запуском")
+        if http_proxy:
+            names_preview = ", ".join(http_proxy[:5])
+            suffix = f" и ещё {len(http_proxy) - 5}" if len(http_proxy) > 5 else ""
+            self._log(
+                f"[{mode}] ОСТАНОВЛЕНО: {len(http_proxy)} аккаунтов с HTTP прокси (нужен SOCKS5): "
+                f"{names_preview}{suffix}"
+            )
+            self._log(
+                f"[{mode}] Telethon не поддерживает HTTP прокси. "
+                "Назначьте SOCKS5 прокси через 'Auto-Assign Proxies'"
+            )
+
+        if not http_proxy:
+            self._log(f"[{mode}] Нажмите 'Auto-Assign Proxies' или импортируйте прокси перед запуском")
         return False
 
     async def _quick_auto_assign(self, account_ids: list[int], mode: str = "Migrate") -> int:
@@ -1740,9 +1757,22 @@ class TGWebAuthApp:
             Number of proxies assigned.
         """
         all_accounts = await self._controller.db.list_accounts()
+        all_proxies = await self._controller.db.list_proxies()
+        proxy_map = {p.id: p for p in all_proxies}
         batch_set = set(account_ids)
 
-        needs_proxy = [a for a in all_accounts if a.id in batch_set and a.proxy_id is None]
+        def _needs_reassign(a) -> bool:
+            if a.id not in batch_set:
+                return False
+            if a.proxy_id is None:
+                return True
+            # For Migrate mode, HTTP proxies don't work with Telethon
+            if mode == "Migrate" and a.proxy_id in proxy_map:
+                if proxy_map[a.proxy_id].protocol == "http":
+                    return True
+            return False
+
+        needs_proxy = [a for a in all_accounts if _needs_reassign(a)]
         if not needs_proxy:
             return 0
 

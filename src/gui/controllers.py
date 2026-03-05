@@ -260,10 +260,19 @@ class AppController:
                             try:
                                 await self.db.assign_proxy(account_id, proxy_id)
                             except ValueError:
-                                # Proxy already assigned to another account — allow sharing
-                                # (rotating/residential proxies are shared by design)
-                                await self.db.assign_proxy(account_id, proxy_id, allow_shared=True)
-                                logger.info("Shared proxy %d assigned to %s (rotating proxy)", proxy_id, name)
+                                # Proxy already assigned to another account.
+                                # Try to find a free dedicated proxy first before sharing.
+                                free_proxy = await self.db.get_free_proxy()
+                                if free_proxy:
+                                    await self.db.assign_proxy(account_id, free_proxy.id)
+                                    logger.info(
+                                        "Free proxy %s:%d assigned to %s (config proxy was busy)",
+                                        free_proxy.host, free_proxy.port, name,
+                                    )
+                                else:
+                                    # No free proxies — share the rotating/residential proxy
+                                    await self.db.assign_proxy(account_id, proxy_id, allow_shared=True)
+                                    logger.info("Shared proxy %d assigned to %s (rotating proxy)", proxy_id, name)
                             proxy_ok = True
                     except Exception as proxy_err:
                         logger.warning(
@@ -296,13 +305,14 @@ class AppController:
             if not host or not port:
                 return None
 
-            # Warn if port suggests HTTP proxy but protocol defaulted to socks5
+            # Warn if port suggests HTTP proxy but user specified socks5.
+            # Do NOT auto-correct — respect the user's config. Log a warning only.
             if port in self._HTTP_PROXY_PORTS and protocol == "socks5":
-                logger.info(
-                    "Proxy %s:%d auto-corrected from SOCKS5 to HTTP (port %d is typically HTTP)",
+                logger.warning(
+                    "Proxy %s:%d specified as SOCKS5 but port %d is typically HTTP. "
+                    "Keeping SOCKS5 as configured. If connection fails, check proxy protocol.",
                     host, port, port,
                 )
-                protocol = "http"
 
             # O(1) lookup via UNIQUE(host, port) index
             existing_id = await self.db.find_proxy_by_host_port(host, port)
