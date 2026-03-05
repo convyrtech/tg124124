@@ -1328,7 +1328,7 @@ class TGWebAuthApp:
                 self._schedule_ui(lambda: self._refresh_table_async())
 
             except Exception as e:
-                logger.exception("Fragment error for %s: %s", account.name, e)
+                logger.exception("Fragment error for %s: %s", account.name, _se(str(e)))
                 self._log(f"[Error] Fragment: {_se(str(e))}")
                 try:
                     await self._controller.db.update_account(
@@ -1353,8 +1353,9 @@ class TGWebAuthApp:
             self._log(f"[Warning] Proxy {proxy.host}:{proxy.port} is dead for {account.name}")
             return None
         # Format: socks5:host:port:user:pass or socks5:host:port
-        if proxy.username and proxy.password:
-            return f"{proxy.protocol}:{proxy.host}:{proxy.port}:{proxy.username}:{proxy.password}"
+        if proxy.username:
+            password = proxy.password or ""
+            return f"{proxy.protocol}:{proxy.host}:{proxy.port}:{proxy.username}:{password}"
         return f"{proxy.protocol}:{proxy.host}:{proxy.port}"
 
     def _update_status_cells(self, accounts: list[AccountRecord]) -> None:
@@ -1704,13 +1705,26 @@ class TGWebAuthApp:
                 p = proxy_map[a.proxy_id]
                 if p.status == "dead":
                     dead_proxy.append(a.name)
-                elif mode == "Migrate" and p.protocol == "http":
+                elif p.protocol == "http":
                     http_proxy.append(a.name)
             else:
                 # proxy_id references missing proxy record
                 no_proxy.append(a.name)
 
         if not no_proxy and not dead_proxy and not http_proxy:
+            return True
+
+        # HTTP proxies: warn but do NOT block — Telethon supports HTTP CONNECT via PySocks
+        if http_proxy:
+            names_preview = ", ".join(http_proxy[:5])
+            suffix = f" и ещё {len(http_proxy) - 5}" if len(http_proxy) > 5 else ""
+            self._log(
+                f"[{mode}] [Warning] {len(http_proxy)} аккаунтов с HTTP прокси "
+                f"(SOCKS5 рекомендуется): {names_preview}{suffix}"
+            )
+
+        # no_proxy and dead_proxy are blocking errors
+        if not no_proxy and not dead_proxy:
             return True
 
         if no_proxy:
@@ -1727,20 +1741,7 @@ class TGWebAuthApp:
                 f"[{mode}] ОСТАНОВЛЕНО: {len(dead_proxy)} аккаунтов с мёртвым прокси: {names_preview}{suffix}"
             )
 
-        if http_proxy:
-            names_preview = ", ".join(http_proxy[:5])
-            suffix = f" и ещё {len(http_proxy) - 5}" if len(http_proxy) > 5 else ""
-            self._log(
-                f"[{mode}] ОСТАНОВЛЕНО: {len(http_proxy)} аккаунтов с HTTP прокси (нужен SOCKS5): "
-                f"{names_preview}{suffix}"
-            )
-            self._log(
-                f"[{mode}] Telethon не поддерживает HTTP прокси. "
-                "Назначьте SOCKS5 прокси через 'Auto-Assign Proxies'"
-            )
-
-        if not http_proxy:
-            self._log(f"[{mode}] Нажмите 'Auto-Assign Proxies' или импортируйте прокси перед запуском")
+        self._log(f"[{mode}] Нажмите 'Auto-Assign Proxies' или импортируйте прокси перед запуском")
         return False
 
     async def _quick_auto_assign(self, account_ids: list[int], mode: str = "Migrate") -> int:
@@ -1766,10 +1767,6 @@ class TGWebAuthApp:
                 return False
             if a.proxy_id is None:
                 return True
-            # For Migrate mode, HTTP proxies don't work with Telethon
-            if mode == "Migrate" and a.proxy_id in proxy_map:
-                if proxy_map[a.proxy_id].protocol == "http":
-                    return True
             return False
 
         needs_proxy = [a for a in all_accounts if _needs_reassign(a)]

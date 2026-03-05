@@ -806,8 +806,9 @@ class MigrationWorkerPool:
                 f"[Pool] Proxy {proxy.host}:{proxy.port} is dead for {account.name} — run 'proxy-refresh' to replace"
             )
             return None
-        if proxy.username and proxy.password:
-            return f"{proxy.protocol}:{proxy.host}:{proxy.port}:{proxy.username}:{proxy.password}"
+        if proxy.username:
+            password = proxy.password or ""
+            return f"{proxy.protocol}:{proxy.host}:{proxy.port}:{proxy.username}:{password}"
         return f"{proxy.protocol}:{proxy.host}:{proxy.port}"
 
     async def _cooldown(

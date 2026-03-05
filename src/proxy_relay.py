@@ -197,7 +197,8 @@ class ProxyRelay:
             if self._server_handle:
                 await self._server_handle.wait_closed()
         except Exception as e:
-            logger.exception("In-process pproxy server crashed: %s", e)
+            from .utils import sanitize_error
+            logger.exception("In-process pproxy server crashed: %s", sanitize_error(str(e)))
             # Don't let it propagate to the event loop
 
     async def _start_subprocess(self, listen_uri: str, remote_uri: str) -> None:

@@ -421,7 +421,7 @@ class ProxyManager:
 
             except Exception as e:
                 counters["errors"] += 1
-                logger.exception("Failed to replace proxy for %s: %s", account_name, e)
+                logger.exception("Failed to replace proxy for %s: %s", account_name, sanitize_error(str(e)))
                 await self.db.log_operation(
                     account_id=account_id,
                     operation="proxy_replace",

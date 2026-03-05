@@ -830,7 +830,7 @@ class FragmentAuth:
             logger.exception("FloodWait: %ds", e.seconds)
             return FragmentResult(success=False, account_name=self.account.name, error=f"FloodWait: {e.seconds}s")
         except Exception as e:
-            logger.error("Fragment auth error: %s", e, exc_info=True)
+            logger.error("Fragment auth error: %s", sanitize_error(str(e)), exc_info=True)
             return FragmentResult(success=False, account_name=self.account.name, error=sanitize_error(str(e)))
         finally:
             # Restore original exception handler only when last worker finishes
