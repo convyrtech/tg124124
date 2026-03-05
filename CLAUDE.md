@@ -1,5 +1,8 @@
 # TG Web Auth Migration Tool
 
+## Latest Build
+**Download**: https://gofile.io/d/ecLDeA (v0.1.0, 706MB, commit 72823a6)
+
 ## MANDATORY: Read Before ANY Work
 **Step 1**: Activate Serena project: `activate_project("tg-web-auth")`
 **Step 2**: Read Serena memory `session-state` — contains CURRENT task, git state, what to do next
